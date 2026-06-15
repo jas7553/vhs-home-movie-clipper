@@ -5,6 +5,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://developer.apple.com/macos/)
+[![ffmpeg](https://img.shields.io/badge/made%20with-ffmpeg-green.svg)](https://ffmpeg.org/)
 
 Repeatable pipeline for splitting VHS-ripped home video files into logical clips
 using burned-in camcorder timestamps, Apple Vision OCR, and ffmpeg stream copy.
