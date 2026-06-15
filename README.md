@@ -1,6 +1,10 @@
 # vhs-home-movie-clipper
 
+[![CI](https://github.com/jas7553/vhs-home-movie-clipper/actions/workflows/ci.yml/badge.svg)](https://github.com/jas7553/vhs-home-movie-clipper/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jas7553/vhs-home-movie-clipper/graph/badge.svg)](https://codecov.io/gh/jas7553/vhs-home-movie-clipper)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Repeatable pipeline for splitting VHS-ripped home video files into logical clips
 using burned-in camcorder timestamps, Apple Vision OCR, and ffmpeg stream copy.
