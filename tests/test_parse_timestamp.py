@@ -29,9 +29,9 @@ class TestCanonicalFormats:
     def test_lowercase_ampm(self):
         assert parse_timestamp("3:15 pm\n6/ 7/88") == datetime(1988, 6, 7, 15, 15)
 
-    def test_spaced_date_separators(self):
-        # OCR sometimes reads "/" as " " — the pattern allows whitespace separators
-        assert parse_timestamp("5:01 PM\n 1  4 90") == datetime(1990, 1, 4, 17, 1)
+    def test_spaced_date_separators_with_slashes(self):
+        # spaces around "/" are fine: "1 / 4/90" still has the required slash
+        assert parse_timestamp("5:01 PM\n 1 / 4/90") == datetime(1990, 1, 4, 17, 1)
 
 
 class TestNoonAndMidnight:
@@ -58,6 +58,12 @@ class TestYearNormalization:
         assert parse_timestamp(text).year == expected_year  # type: ignore[union-attr]
 
 
+class TestInvalidDateCombination:
+    def test_feb_30_returns_none(self):
+        # Passes month/day range checks but datetime() raises ValueError
+        assert parse_timestamp("5:01 PM\n2/30/90") is None
+
+
 @pytest.mark.parametrize("text", [
     "",
     "blurry static ~~~",
@@ -69,6 +75,9 @@ class TestYearNormalization:
     "5:01 PM\n1/ 1/2006", # 4-digit year above range
     "5:01 PM\n1/ 1/79",   # 79 → 2079, outside 1985–2005
     "5:01 PM\n1/ 1/84",   # 84 → 1984, just below range floor
+    "5:01 PM\n 1  4 90",  # space-only date separators (no "/") — misread, reject
+    "7:14\n 1/ 4/90",     # missing AM/PM — ambiguous, reject
+    "11 5/90",            # month misread: space before first "/" only, no leading slash
 ])
 def test_rejected(text: str):
     assert parse_timestamp(text) is None

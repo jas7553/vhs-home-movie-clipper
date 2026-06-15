@@ -50,7 +50,7 @@ FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote →
 # ------------------------------------------------------------------ #
 
 DATE_PATTERN = re.compile(
-    r"(\d{1,2})[/\s]+(\d{1,2})[/\s]+(\d{2,4})"
+    r"(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{2,4})"
 )
 TIME_PATTERN = re.compile(
     r"(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?", re.IGNORECASE
@@ -80,6 +80,8 @@ def parse_timestamp(text: str) -> datetime | None:
         return None
     hour, minute = int(time_m.group(1)), int(time_m.group(2))
     ampm = (time_m.group(3) or "").upper()
+    if not ampm:
+        return None
     if ampm == "PM" and hour != 12:
         hour += 12
     elif ampm == "AM" and hour == 12:
