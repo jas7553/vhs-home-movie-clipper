@@ -35,6 +35,8 @@ DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
 
 OCR_BIN = Path(__file__).parent / "ocr_timestamp"
 VIDEO_TIMESCALE = 29970  # matches source tbn; same on all segs/concat to prevent PTS mis-scaling
+MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fps≈0.033s)
+                         # produce zero video frames and corrupt the concat — skip them.
 
 # ------------------------------------------------------------------ #
 # Timestamp parsing
@@ -408,27 +410,30 @@ def cut_clip_with_boundary_encode(
     with tempfile.TemporaryDirectory() as tmpdir:
         segs: list[str] = []
 
-        # Leading boundary: re-encode [exact_start, kf_after]
+        # Leading boundary: re-encode [exact_start, kf_after].
+        # Body always starts on kf_after (a keyframe) so its stream-copy is clean.
         body_start = start
         if exact_start is not None:
             kf_after = snap_to_keyframe_forward(video, exact_start)
-            if kf_after > exact_start:
+            body_start = kf_after
+            if kf_after - exact_start >= MIN_BOUNDARY_SEG:
                 seg = os.path.join(tmpdir, "seg_0_lead.mp4")
                 _ffmpeg_encode_seg(video, exact_start, kf_after, seg, crf)
                 segs.append(seg)
-                body_start = kf_after
-            # exact_start == kf_after: already on keyframe, skip B1
+            # else: sub-frame gap — re-encoding it yields ZERO video frames
+            # (libx264 over <1 frame), which corrupts the concat. Drop the
+            # <1-frame remainder; body starts on the keyframe.
 
-        # Trailing boundary: compute kf_before and reserve trail segment
+        # Trailing boundary: re-encode [kf_before, exact_end]; body ends on kf_before.
         body_end = end
         trail_seg: str | None = None
         if exact_end is not None:
             kf_before = snap_to_keyframe(video, exact_end)
-            if kf_before < exact_end:
-                body_end = kf_before
+            body_end = kf_before
+            if exact_end - kf_before >= MIN_BOUNDARY_SEG:
                 trail_seg = os.path.join(tmpdir, "seg_2_trail.mp4")
                 _ffmpeg_encode_seg(video, kf_before, exact_end, trail_seg, crf)
-            # exact_end == kf_before: already on keyframe, skip A2
+            # else: sub-frame gap — skip (same zero-frame hazard as above).
 
         # Body: stream copy [body_start, body_end]
         if body_end > body_start:
@@ -474,6 +479,14 @@ def split_video(video: str, splits: list[float], out_dir: str, filtered: list[tu
     os.makedirs(out_dir, exist_ok=True)
     duration = get_duration(video)
     stem = Path(video).stem
+
+    # Remove this stem's clips from a prior run. Labels are derived from OCR, so a
+    # re-run can rename clips; without this, renamed outputs orphan the old files.
+    stale = glob.glob(os.path.join(out_dir, f"{stem}_clip*.mp4"))
+    for old in stale:
+        os.remove(old)
+    if stale:
+        print(f"  (removed {len(stale)} clip(s) from a previous run)")
 
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration

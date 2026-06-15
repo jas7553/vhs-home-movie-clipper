@@ -11,6 +11,8 @@ false time-jumps that trigger spurious clip splits.
 """
 from datetime import datetime
 
+import pytest
+
 from split_homevideo import parse_timestamp
 
 
@@ -45,52 +47,28 @@ class TestNoonAndMidnight:
 class TestYearNormalization:
     """Two-digit years: >= 80 → 1900s, < 80 → 2000s (VHS era heuristic)."""
 
-    def test_90s(self):
-        assert parse_timestamp("1:00 PM\n1/ 1/90").year == 1990  # type: ignore[union-attr]
-
-    def test_earliest_valid_85(self):
-        assert parse_timestamp("1:00 PM\n1/ 1/85").year == 1985  # type: ignore[union-attr]
-
-    def test_2000s_two_digit(self):
-        assert parse_timestamp("1:00 PM\n1/ 1/01").year == 2001  # type: ignore[union-attr]
-
-    def test_latest_valid_05(self):
-        assert parse_timestamp("1:00 PM\n1/ 1/05").year == 2005  # type: ignore[union-attr]
-
-    def test_four_digit_year_in_range(self):
-        assert parse_timestamp("1:00 PM\n1/ 1/1990").year == 1990  # type: ignore[union-attr]
+    @pytest.mark.parametrize("text,expected_year", [
+        ("1:00 PM\n1/ 1/90", 1990),
+        ("1:00 PM\n1/ 1/85", 1985),   # floor of valid range
+        ("1:00 PM\n1/ 1/01", 2001),
+        ("1:00 PM\n1/ 1/05", 2005),   # ceiling of valid range
+        ("1:00 PM\n1/ 1/1990", 1990), # four-digit passthrough
+    ])
+    def test_year(self, text: str, expected_year: int):
+        assert parse_timestamp(text).year == expected_year  # type: ignore[union-attr]
 
 
-class TestRejectedInputs:
-    def test_empty_string(self):
-        assert parse_timestamp("") is None
-
-    def test_noise_only(self):
-        assert parse_timestamp("blurry static ~~~") is None
-
-    def test_date_without_time(self):
-        # Reject: defaulting to 00:00 would cause false forward jumps
-        assert parse_timestamp("1/ 4/90") is None
-
-    def test_time_without_date(self):
-        assert parse_timestamp("5:01 PM") is None
-
-    def test_month_gt_12(self):
-        assert parse_timestamp("5:01 PM\n13/ 4/90") is None
-
-    def test_day_gt_31(self):
-        assert parse_timestamp("5:01 PM\n 1/32/90") is None
-
-    def test_year_before_range_4digit(self):
-        assert parse_timestamp("5:01 PM\n1/ 1/1984") is None
-
-    def test_year_after_range_4digit(self):
-        assert parse_timestamp("5:01 PM\n1/ 1/2006") is None
-
-    def test_two_digit_year_79_maps_to_2079(self):
-        # 79 → 2079, which is outside 1985–2005
-        assert parse_timestamp("5:01 PM\n1/ 1/79") is None
-
-    def test_two_digit_year_84_maps_to_1984(self):
-        # 84 → 1984, just below the range floor
-        assert parse_timestamp("5:01 PM\n1/ 1/84") is None
+@pytest.mark.parametrize("text", [
+    "",
+    "blurry static ~~~",
+    "1/ 4/90",          # date without time — 00:00 default would cause false jumps
+    "5:01 PM",          # time without date
+    "5:01 PM\n13/ 4/90",  # month > 12
+    "5:01 PM\n 1/32/90",  # day > 31
+    "5:01 PM\n1/ 1/1984", # 4-digit year below range
+    "5:01 PM\n1/ 1/2006", # 4-digit year above range
+    "5:01 PM\n1/ 1/79",   # 79 → 2079, outside 1985–2005
+    "5:01 PM\n1/ 1/84",   # 84 → 1984, just below range floor
+])
+def test_rejected(text: str):
+    assert parse_timestamp(text) is None

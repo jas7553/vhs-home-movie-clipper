@@ -1,3 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+
 # Video source files and output — not part of the tool
 *.mp4
 *_clips/
