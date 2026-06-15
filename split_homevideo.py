@@ -406,7 +406,7 @@ def _ffmpeg_encode_seg(video: str, seg_start: float, seg_end: float, out: str, c
         "-t", f"{seg_end - seg_start:.3f}",
         "-map", "0:v:0", "-map", "0:a:0",
         "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
-        "-c:a", "copy",
+        "-c:a", "aac", "-b:a", "128k",
         "-video_track_timescale", str(VIDEO_TIMESCALE),
         "-avoid_negative_ts", "make_zero",
         "-y", out,
