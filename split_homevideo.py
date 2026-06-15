@@ -40,8 +40,9 @@ MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fp
                          # produce zero video frames and corrupt the concat — skip them.
 
 # OCR preprocessing filter chain (applied after fps filter in bulk scan, standalone in refinement).
-# yadif: deinterlaces VHS comb artifacts; scale 3×: Vision needs larger glyphs; eq: harden contrast.
-_VF_PREPROCESS = "yadif,scale=iw*3:ih*3:flags=lanczos,eq=contrast=1.5"
+# yadif: deinterlaces VHS comb artifacts; format=gray: removes color noise Vision ignores anyway;
+# scale 4×: more glyph detail than 3×; unsharp: crisp edges post-scale; eq: harden contrast.
+_VF_PREPROCESS = "yadif,format=gray,scale=iw*4:ih*4:flags=lanczos,unsharp=5:5:2.0,eq=contrast=2.0:brightness=0.05"
 FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote → fewer misreads
 
 # ------------------------------------------------------------------ #

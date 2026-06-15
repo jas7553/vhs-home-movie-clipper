@@ -9,36 +9,52 @@ guard CommandLine.arguments.count > 1 else {
 
 let paths = Array(CommandLine.arguments.dropFirst())
 
-let request = VNRecognizeTextRequest()
-request.recognitionLevel = .accurate
-request.usesLanguageCorrection = false
-request.recognitionLanguages = ["en-US"]
+// One output line per path; index matches paths so stdout stays ordered.
+var results = Array(repeating: "", count: paths.count)
+let lock = NSLock()
 
-for path in paths {
+DispatchQueue.concurrentPerform(iterations: paths.count) { i in
+    let path = paths[i]
+
     guard let image = NSImage(contentsOfFile: path),
           let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        lock.lock()
         fputs("Failed to load image: \(path)\n", stderr)
-        print("\(path)\t")
-        continue
+        lock.unlock()
+        results[i] = "\(path)\t"
+        return
     }
+
+    // Each iteration needs its own request + handler — VNRecognizeTextRequest is not thread-safe
+    // when shared across concurrent handlers.
+    let req = VNRecognizeTextRequest()
+    req.recognitionLevel = .accurate
+    req.usesLanguageCorrection = false
+    req.recognitionLanguages = ["en-US"]
 
     let handler = VNImageRequestHandler(cgImage: cgImage)
     do {
-        try handler.perform([request])
+        try handler.perform([req])
     } catch {
+        lock.lock()
         fputs("OCR error for \(path): \(error)\n", stderr)
-        print("\(path)\t")
-        continue
+        lock.unlock()
+        results[i] = "\(path)\t"
+        return
     }
 
     var lines: [String] = []
-    if let results = request.results {
-        for obs in results {
-            if let candidate = obs.topCandidates(1).first {
+    if let obs = req.results {
+        for o in obs {
+            if let candidate = o.topCandidates(1).first {
                 lines.append(candidate.string)
             }
         }
     }
     // Join with space — parse_timestamp normalizes whitespace, so equivalent to \n
-    print("\(path)\t\(lines.joined(separator: " "))")
+    results[i] = "\(path)\t\(lines.joined(separator: " "))"
+}
+
+for line in results {
+    print(line)
 }
