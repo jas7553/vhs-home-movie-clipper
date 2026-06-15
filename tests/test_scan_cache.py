@@ -18,7 +18,14 @@ _INTERVAL = 10
 def _write_cache(path: str, interval=_INTERVAL, crop=_CROP, samples=None):
     samples = samples or []
     with open(path, "w") as f:
-        json.dump({"interval": interval, "crop": crop, "samples": samples}, f)
+        from split_homevideo import _VF_PREPROCESS, FRAMES_PER_SAMPLE
+        json.dump({
+            "interval": interval,
+            "crop": crop,
+            "vf_preprocess": _VF_PREPROCESS,
+            "frames_per_sample": FRAMES_PER_SAMPLE,
+            "samples": samples
+        }, f)
 
 
 class TestCacheHit:
