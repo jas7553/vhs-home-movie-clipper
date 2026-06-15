@@ -1,5 +1,7 @@
 # vhs-home-movie-clipper
 
+[![codecov](https://codecov.io/gh/jas7553/vhs-home-movie-clipper/graph/badge.svg)](https://codecov.io/gh/jas7553/vhs-home-movie-clipper)
+
 Repeatable pipeline for splitting VHS-ripped home video files into logical clips
 using burned-in camcorder timestamps, Apple Vision OCR, and ffmpeg stream copy.
 
