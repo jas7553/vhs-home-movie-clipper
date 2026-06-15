@@ -1,0 +1,13 @@
+# Video source files and output — not part of the tool
+*.mp4
+*_clips/
+*_ocr_cache.json
+
+# Compiled binary — build from ocr_timestamp.swift
+ocr_timestamp
+
+# macOS
+.DS_Store
+
+# Claude Code project settings
+.claude/
