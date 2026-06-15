@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # --- defaults ---
@@ -34,6 +34,7 @@ DEFAULT_GAP = 300              # 5-minute gap = new clip
 DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
 
 OCR_BIN = Path(__file__).parent / "ocr_timestamp"
+VIDEO_TIMESCALE = 29970  # matches source tbn; same on all segs/concat to prevent PTS mis-scaling
 
 # ------------------------------------------------------------------ #
 # Timestamp parsing
@@ -118,7 +119,9 @@ def extract_all_frames(video: str, interval: int, crop: str, tmpdir: str) -> lis
 
 
 def frame_index(path: str) -> int:
-    return int(re.search(r"frame_(\d+)\.bmp", os.path.basename(path)).group(1))
+    m = re.search(r"frame_(\d+)\.bmp", os.path.basename(path))
+    assert m is not None, f"unexpected frame filename: {path}"
+    return int(m.group(1))
 
 
 def ocr_batch(paths: list[str]) -> dict[str, str]:
@@ -215,7 +218,7 @@ def filter_ocr_outliers(
     if len(valid) < 3:
         return valid
 
-    def drift(t_a, dt_a, t_b, dt_b) -> float:
+    def drift(t_a: float, dt_a: datetime, t_b: float, dt_b: datetime) -> float:
         cam_adv = (dt_b - dt_a).total_seconds()
         vid_adv = t_b - t_a
         return abs(cam_adv - vid_adv)
@@ -245,10 +248,10 @@ def find_splits(
     """
     clean = filter_ocr_outliers(samples)
     splits: list[tuple[float, float | None, datetime | None]] = [(0.0, None, None)]
-    prev_t: float | None = None
-    prev_dt: datetime | None = None
+    prev: tuple[float, datetime] | None = None
     for t, dt in clean:
-        if prev_dt is not None:
+        if prev is not None:
+            prev_t, prev_dt = prev
             video_advance = t - prev_t
             cam_advance = (dt - prev_dt).total_seconds()
             # Forward jump: camera ran much faster than real time (was paused/off)
@@ -257,8 +260,7 @@ def find_splits(
             jumped_backward = cam_advance < -1800
             if jumped_forward or jumped_backward:
                 splits.append((t, prev_t, prev_dt))
-        prev_t = t
-        prev_dt = dt
+        prev = (t, dt)
     return splits
 
 
@@ -294,7 +296,7 @@ def refine_split(
         for future in as_completed(future_to_t):
             paths[future_to_t[future]] = future.result()
 
-    valid_paths = [paths[t] for t in window if paths.get(t) is not None]
+    valid_paths = [p for t in window if (p := paths.get(t)) is not None]
     ocr_results = ocr_batch(valid_paths)
 
     last_old_t: float = prev_t
@@ -367,7 +369,9 @@ def _ffmpeg_copy_seg(video: str, seg_start: float, seg_end: float, out: str):
         "-ss", f"{seg_start:.3f}",
         "-i", video,
         "-t", f"{seg_end - seg_start:.3f}",
+        "-map", "0:v:0", "-map", "0:a:0",
         "-c", "copy",
+        "-video_track_timescale", str(VIDEO_TIMESCALE),
         "-avoid_negative_ts", "make_zero",
         "-y", out,
     ], check=True)
@@ -379,8 +383,10 @@ def _ffmpeg_encode_seg(video: str, seg_start: float, seg_end: float, out: str, c
         "-ss", f"{seg_start:.3f}",
         "-i", video,
         "-t", f"{seg_end - seg_start:.3f}",
+        "-map", "0:v:0", "-map", "0:a:0",
         "-c:v", "libx264", "-crf", str(crf), "-preset", "fast",
         "-c:a", "copy",
+        "-video_track_timescale", str(VIDEO_TIMESCALE),
         "-avoid_negative_ts", "make_zero",
         "-y", out,
     ], check=True)
@@ -450,27 +456,28 @@ def cut_clip_with_boundary_encode(
             "-f", "concat", "-safe", "0",
             "-i", list_path,
             "-c", "copy",
+            "-video_track_timescale", str(VIDEO_TIMESCALE),
+            "-fflags", "+genpts",
             "-y", out_path,
         ], check=True)
 
 
-def split_video(video: str, splits: list[float], out_dir: str, samples: list[tuple[float, datetime | None]]):
+def _label_for(filtered: list[tuple[float, datetime]], start: float) -> str:
+    """Return a date/time label string for the clip starting at `start` seconds."""
+    for t, dt in filtered:
+        if t >= start:
+            return dt.strftime("%Y-%m-%d_%H%M")
+    return f"{int(start):05d}s"
+
+
+def split_video(video: str, splits: list[float], out_dir: str, filtered: list[tuple[float, datetime]]):
     os.makedirs(out_dir, exist_ok=True)
     duration = get_duration(video)
     stem = Path(video).stem
 
-    # Map each split point to a date label using nearest OCR reading
-    def label_for(start: float) -> str:
-        best = None
-        for t, dt in samples:
-            if t >= start and dt is not None:
-                best = dt
-                break
-        return best.strftime("%Y-%m-%d_%H%M") if best else f"{int(start):05d}s"
-
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
-        label = label_for(start)
+        label = _label_for(filtered, start)
         out_path = os.path.join(out_dir, f"{stem}_clip{idx+1:02d}_{label}.mp4")
         exact_start = start if idx > 0 else None
         exact_end = splits[idx + 1] if idx + 1 < len(splits) else None
@@ -527,18 +534,13 @@ def main():
             print(f"  coarse={coarse_t:.0f}s → refined={refined_t:.0f}s  (saved {saved:.0f}s)")
             splits.append(refined_t)
 
+    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
+
     print(f"\nFound {len(splits)} clip(s):")
-
-    def label_for(start: float) -> str:
-        for t, dt in samples:
-            if t >= start and dt is not None:
-                return dt.strftime("%Y-%m-%d_%H%M")
-        return f"{int(start):05d}s"
-
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
         dur = end - start
-        label = label_for(start)
+        label = _label_for(filtered, start)
         print(f"  {idx+1:3d}. {start:7.0f}s → {end:7.0f}s  ({dur/60:5.1f} min)  {label}")
 
     if args.dry_run:
@@ -552,7 +554,7 @@ def main():
         return
 
     print(f"\nCutting into {out_dir}/")
-    split_video(video, splits, out_dir, samples)
+    split_video(video, splits, out_dir, filtered)
     print("Done.")
 
 
