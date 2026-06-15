@@ -1,7 +1,6 @@
 """
 extract_frame(), extract_all_frames(), and frame_index().
 """
-import os
 import unittest.mock as mock
 
 import pytest

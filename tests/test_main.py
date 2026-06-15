@@ -54,14 +54,13 @@ class TestMainDryRun:
     def test_dry_run_does_not_call_split_video(self, tmp_path):
         video = tmp_path / "vid.mp4"
         video.touch()
-        patches = _base_patches(str(video))
         with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]):
             with mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
                  mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
                  mock.patch("split_homevideo.find_splits", return_value=[(0.0, None, None)]), \
                  mock.patch("split_homevideo.refine_split", return_value=99.0), \
                  mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-                 mock.patch("split_homevideo.get_duration", return_value=200.0) as m_dur, \
+                 mock.patch("split_homevideo.get_duration", return_value=200.0), \
                  mock.patch("split_homevideo.split_video") as m_sv, \
                  mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0), \
                  mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5):

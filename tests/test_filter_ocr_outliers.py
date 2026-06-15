@@ -118,3 +118,30 @@ class TestClipBoundaryPreservation:
 
         assert (120.0, dt(14, 0)) not in noise_result
         assert (120.0, dt(14, 0)) in boundary_result
+
+
+class TestConsecutiveBoundaries:
+    def test_reading_between_two_consecutive_boundaries_kept(self):
+        # A: 6:56 PM, B: 11:44 AM next day (fails prev: overnight jump, fails next: 96-min jump),
+        # C: 1:20 PM same day as B, D: same session as C.
+        # B should be KEPT because prev (A) and next (C) are also mutually inconsistent.
+        a_t, a_dt = 0.0,   datetime(1990, 1, 4, 18, 56)
+        b_t, b_dt = 60.0,  datetime(1990, 1, 5, 11, 44)
+        c_t, c_dt = 120.0, datetime(1990, 1, 5, 13, 20)
+        d_t, d_dt = 180.0, datetime(1990, 1, 5, 13, 22)
+        samples = [(a_t, a_dt), (b_t, b_dt), (c_t, c_dt), (d_t, d_dt)]
+        result = filter_ocr_outliers(samples)
+        assert (b_t, b_dt) in result
+
+    def test_isolated_outlier_still_dropped(self):
+        # Middle reading jumps 4 hours then reverts — prev and next are mutually consistent
+        # so the middle is noise and must be dropped.
+        samples = [
+            (0.0,   dt(10, 0)),
+            (60.0,  dt(10, 2)),
+            (120.0, dt(14, 0)),  # outlier: big jump both ways
+            (180.0, dt(10, 6)),  # reverts; prev(60) and next(180) are consistent
+            (240.0, dt(10, 8)),
+        ]
+        result = filter_ocr_outliers(samples)
+        assert (120.0, dt(14, 0)) not in result

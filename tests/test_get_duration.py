@@ -3,6 +3,8 @@ get_duration() wraps ffprobe; parses float from stdout.
 """
 import unittest.mock as mock
 
+import pytest
+
 from split_homevideo import get_duration
 
 
@@ -21,6 +23,3 @@ class TestGetDuration:
         with mock.patch("subprocess.run", return_value=proc):
             result = get_duration("vid.mp4")
         assert result == 100.0
-
-
-import pytest

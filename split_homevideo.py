@@ -253,6 +253,12 @@ def filter_ocr_outliers(
         ok_next = drift(t, dt, *valid[i + 1]) < max_drift_s
         if ok_prev or ok_next:
             kept.append((t, dt))
+        else:
+            # Neither neighbor consistent. Keep if prev+next are also mutually
+            # inconsistent — two consecutive boundaries, not isolated noise.
+            ok_skip = drift(*valid[i - 1], *valid[i + 1]) < max_drift_s
+            if not ok_skip:
+                kept.append((t, dt))
     kept.append(valid[-1])
     return kept
 

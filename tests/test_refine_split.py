@@ -36,8 +36,6 @@ class TestRefineSplit:
         # All frames confirm old session (small cam advance) → return coarse_t
         path = "/tmp/frame_15.000.bmp"
         # cam_advance = (17:00:10 - 17:00:00).total_seconds() = 10; video_advance = 15-10=5; 10 < 5+300
-        dt_old = datetime(1990, 1, 4, 17, 0, 10)
-        ts_old = "5:00 PM\n 1/ 4/90"  # close enough — parse gives 17:00 but still within gap
         result = _run(
             coarse_t=20.0, prev_t=10.0,
             extract_side_effect=lambda v, t, c, d: path if t == 15 else None,
@@ -63,8 +61,10 @@ class TestRefineSplit:
         path15 = "/tmp/frame_15.000.bmp"
 
         def extract(v, t, c, d):
-            if t == 14: return path14
-            if t == 15: return path15
+            if t == 14:
+                return path14
+            if t == 15:
+                return path15
             return None
 
         result = _run(

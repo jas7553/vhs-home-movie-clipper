@@ -1,10 +1,7 @@
 """
 cut_clip_with_boundary_encode(): boundary re-encode + stream-copy + concat logic.
 """
-import shutil
 import unittest.mock as mock
-
-import pytest
 
 from split_homevideo import MIN_BOUNDARY_SEG, cut_clip_with_boundary_encode
 
