@@ -9,6 +9,7 @@ Arguments:
     --interval  Seconds between sampled frames (default: 10)
     --gap       Time gap (seconds) between consecutive timestamps that
                 triggers a new clip, even on the same date (default: 300)
+    --mode      Clip grouping mode: scene, session (default), or daily
     --out-dir   Output directory for clips (default: <input>_clips/)
     --crop      ffmpeg crop string "w:h:x:y" for timestamp region
                 (default tuned for 640x480 with bottom-right overlay)
@@ -26,6 +27,7 @@ import sys
 import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +35,10 @@ from pathlib import Path
 DEFAULT_INTERVAL = 10          # sample every N seconds
 DEFAULT_GAP = 300              # 5-minute gap = new clip
 DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
+DEFAULT_MODE = "session"
+
+_CACHE_FORMAT = 2              # increment when cache schema changes; forces re-scan on old caches
+_MIN_GAP_S = 60               # minimum camera-time jump to emit a boundary (internal, not user-tunable)
 
 OCR_BIN = Path(__file__).parent / "ocr_timestamp"
 VIDEO_TIMESCALE = 29970  # matches source tbn; same on all segs/concat to prevent PTS mis-scaling
@@ -44,6 +50,21 @@ MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fp
 # scale 4×: more glyph detail than 3×; unsharp: crisp edges post-scale; eq: harden contrast.
 _VF_PREPROCESS = "yadif,format=gray,scale=iw*4:ih*4:flags=lanczos,unsharp=5:5:2.0,eq=contrast=2.0:brightness=0.05"
 FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote → fewer misreads
+
+# ------------------------------------------------------------------ #
+# Boundary detection types
+# ------------------------------------------------------------------ #
+
+@dataclass
+class Boundary:
+    video_t:    float               # video-file position of boundary
+    type:       str                 # 'gap' | 'large_gap'
+    cam_before: datetime | None     # last valid timestamp before boundary
+    cam_after:  datetime | None     # first valid timestamp after boundary
+    cam_jump_s: float               # (cam_after - cam_before).total_seconds(); negative = backward
+    prev_t:     float | None        # video_t of last valid sample before (for refine_split)
+    prev_dt:    datetime | None     # datetime of last valid sample before (for refine_split)
+
 
 # ------------------------------------------------------------------ #
 # Timestamp parsing
@@ -175,13 +196,15 @@ def scan(
     if cache_path and os.path.exists(cache_path):
         with open(cache_path) as f:
             cached = json.load(f)
-        if (cached.get("interval") == interval and cached.get("crop") == crop
+        if (cached.get("cache_format") == _CACHE_FORMAT
+                and cached.get("interval") == interval
+                and cached.get("crop") == crop
                 and cached.get("vf_preprocess") == _VF_PREPROCESS
                 and cached.get("frames_per_sample", 1) == FRAMES_PER_SAMPLE):
             print(f"  (loaded from cache: {cache_path})")
             return [
-                (float(t), datetime.fromisoformat(dt) if dt else None)
-                for t, dt in cached["samples"]
+                (float(t), parse_timestamp(text) if text else None)
+                for t, text in cached["samples"]
             ]
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -200,26 +223,33 @@ def scan(
             t = float((frame_index(path) // FRAMES_PER_SAMPLE) * interval)
             interval_frames.setdefault(t, []).append(path)
 
-        results: dict[float, datetime | None] = {}
+        # (t, datetime|None, raw_text|None) — raw_text is stored in cache so
+        # parse_timestamp fixes propagate without re-scanning.
+        results: dict[float, tuple[datetime | None, str | None]] = {}
         for t, paths in interval_frames.items():
-            readings = [parse_timestamp(ocr_results.get(p, "")) for p in paths]
-            valid = [r for r in readings if r is not None]
+            frame_data = [(p, ocr_results.get(p, "")) for p in paths]
+            parsed = [(p, text, parse_timestamp(text)) for p, text in frame_data]
+            valid = [(p, text, dt) for p, text, dt in parsed if dt is not None]
             if not valid:
-                results[t] = None
+                results[t] = (None, None)
             else:
-                results[t] = Counter(valid).most_common(1)[0][0]
+                winner_dt = Counter(dt for _, _, dt in valid).most_common(1)[0][0]
+                winner_text = next(text for _, text, dt in valid if dt == winner_dt)
+                results[t] = (winner_dt, winner_text)
 
-    samples = sorted(results.items())
+    sorted_results = sorted(results.items())
+    samples = [(t, dt) for t, (dt, _) in sorted_results]
 
     if cache_path:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         with open(cache_path, "w") as f:
             json.dump({
+                "cache_format": _CACHE_FORMAT,
                 "interval": interval,
                 "crop": crop,
                 "vf_preprocess": _VF_PREPROCESS,
                 "frames_per_sample": FRAMES_PER_SAMPLE,
-                "samples": [(t, dt.isoformat() if dt else None) for t, dt in samples],
+                "samples": [(t, text) for t, (_, text) in sorted_results],
             }, f)
         print(f"  (scan cached to {cache_path})")
 
@@ -291,6 +321,67 @@ def find_splits(
                 splits.append((t, prev_t, prev_dt))
         prev = (t, dt)
     return splits
+
+
+def find_all_boundaries(
+    samples: list[tuple[float, datetime | None]],
+    min_gap_s: int = _MIN_GAP_S,
+    gap_s: int = DEFAULT_GAP,
+) -> list["Boundary"]:
+    """
+    Stage 1: emit every candidate boundary at a low detection floor (min_gap_s).
+
+    Returns Boundary objects sorted by video_t. Type 'large_gap' when the camera
+    jump exceeds gap_s or is backward; 'gap' for smaller detected pauses.
+    """
+    clean = filter_ocr_outliers(samples)
+    boundaries: list[Boundary] = []
+    prev: tuple[float, datetime] | None = None
+    for t, dt in clean:
+        if prev is not None:
+            prev_t, prev_dt = prev
+            video_advance = t - prev_t
+            cam_advance = (dt - prev_dt).total_seconds()
+            jumped_forward = cam_advance > video_advance + min_gap_s
+            jumped_backward = cam_advance < -1800
+            if jumped_forward or jumped_backward:
+                is_large = cam_advance > video_advance + gap_s or jumped_backward
+                boundaries.append(Boundary(
+                    video_t=t,
+                    type="large_gap" if is_large else "gap",
+                    cam_before=prev_dt,
+                    cam_after=dt,
+                    cam_jump_s=cam_advance,
+                    prev_t=prev_t,
+                    prev_dt=prev_dt,
+                ))
+        prev = (t, dt)
+    return boundaries
+
+
+def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[float]:
+    """
+    Stage 2: decide which boundaries become cut points based on mode.
+
+    Returns list[float] of video_t values with 0.0 prepended.
+      scene   — all boundaries (gap + large_gap)
+      session — large_gap only
+      daily   — only date changes, unknown dates, or backward jumps
+    """
+    cuts = [0.0]
+    for b in boundaries:
+        if mode == "scene":
+            cuts.append(b.video_t)
+        elif mode == "session":
+            if b.type == "large_gap":
+                cuts.append(b.video_t)
+        elif mode == "daily":
+            is_backward = b.cam_jump_s < -1800
+            no_date = b.cam_before is None or b.cam_after is None
+            date_change = (not no_date) and b.cam_before.date() != b.cam_after.date()
+            if no_date or is_backward or date_change:
+                cuts.append(b.video_t)
+    return cuts
 
 
 def refine_split(
@@ -494,15 +585,19 @@ def cut_clip_with_boundary_encode(
         ], check=True)
 
 
-def _label_for(filtered: list[tuple[float, datetime]], start: float) -> str:
-    """Return a date/time label string for the clip starting at `start` seconds."""
+def _label_for(filtered: list[tuple[float, datetime]], start: float, mode: str = "session") -> str:
+    """Return a label string for the clip starting at `start` seconds."""
     for t, dt in filtered:
         if t >= start:
+            if mode == "daily":
+                return dt.strftime("%Y-%m-%d")
             return dt.strftime("%Y-%m-%d_%H%M")
     return f"{int(start):05d}s"
 
 
-def split_video(video: str, splits: list[float], out_dir: str, filtered: list[tuple[float, datetime]]):
+def split_video(
+    video: str, splits: list[float], out_dir: str, filtered: list[tuple[float, datetime]], mode: str = "session"
+):
     os.makedirs(out_dir, exist_ok=True)
     duration = get_duration(video)
     stem = Path(video).stem
@@ -517,7 +612,7 @@ def split_video(video: str, splits: list[float], out_dir: str, filtered: list[tu
 
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
-        label = _label_for(filtered, start)
+        label = _label_for(filtered, start, mode)
         out_path = os.path.join(out_dir, f"{stem}_clip{idx+1:02d}_{label}.mp4")
         exact_start = start if idx > 0 else None
         exact_end = splits[idx + 1] if idx + 1 < len(splits) else None
@@ -533,6 +628,8 @@ def main():
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
     ap.add_argument("--gap", type=int, default=DEFAULT_GAP,
                     help="Camera timestamp gap (seconds) that triggers a new clip")
+    ap.add_argument("--mode", choices=["scene", "session", "daily"], default=DEFAULT_MODE,
+                    help="Clip grouping mode (default: session)")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--crop", default=DEFAULT_CROP,
                     help="ffmpeg crop 'w:h:x:y' for timestamp region")
@@ -554,7 +651,7 @@ def main():
         sys.exit(f"ocr_timestamp binary not found at {OCR_BIN}. Run: swiftc -O ocr_timestamp.swift -o ocr_timestamp")
 
     print(f"Scanning: {video}")
-    print(f"  interval={args.interval}s  gap={args.gap}s  crop={args.crop}")
+    print(f"  interval={args.interval}s  gap={args.gap}s  mode={args.mode}  crop={args.crop}")
     samples = scan(video, args.interval, args.crop, cache_path=cache)
 
     valid = [(t, dt) for t, dt in samples if dt]
@@ -562,17 +659,26 @@ def main():
     if valid:
         print(f"  date range: {valid[0][1].date()} → {valid[-1][1].date()}")
 
-    split_contexts = find_splits(samples, args.gap)
+    boundaries = find_all_boundaries(samples, gap_s=args.gap)
+    cut_ts = group_clips(boundaries, args.mode, args.gap)
     duration = get_duration(video)
 
-    print(f"\nRefining {len(split_contexts) - 1} split boundary(ies) at 1s resolution...")
+    # Build lookup: video_t → Boundary for refinement decisions
+    boundary_map = {b.video_t: b for b in boundaries}
+
+    large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
+    print(f"\nRefining {large_gap_count} large_gap boundary(ies) at 1s resolution...")
     with tempfile.TemporaryDirectory() as tmpdir:
         splits: list[float] = [0.0]
-        for coarse_t, prev_t, prev_dt in split_contexts[1:]:
-            refined_t = refine_split(video, coarse_t, prev_t, prev_dt, args.gap, args.crop, tmpdir)
-            saved = coarse_t - refined_t
-            print(f"  coarse={coarse_t:.0f}s → refined={refined_t:.0f}s  (saved {saved:.0f}s)")
-            splits.append(refined_t)
+        for vt in cut_ts[1:]:
+            b = boundary_map.get(vt)
+            if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
+                refined_t = refine_split(video, vt, b.prev_t, b.prev_dt, args.gap, args.crop, tmpdir)
+                saved = vt - refined_t
+                print(f"  coarse={vt:.0f}s → refined={refined_t:.0f}s  (saved {saved:.0f}s)")
+                splits.append(refined_t)
+            else:
+                splits.append(vt)
 
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
 
@@ -580,7 +686,7 @@ def main():
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
         dur = end - start
-        label = _label_for(filtered, start)
+        label = _label_for(filtered, start, args.mode)
         print(f"  {idx+1:3d}. {start:7.0f}s → {end:7.0f}s  ({dur/60:5.1f} min)  {label}")
 
     if args.dry_run:
@@ -594,7 +700,7 @@ def main():
         return
 
     print(f"\nCutting into {out_dir}/")
-    split_video(video, splits, out_dir, filtered)
+    split_video(video, splits, out_dir, filtered, args.mode)
     print("Done.")
 
 

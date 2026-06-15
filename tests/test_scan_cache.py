@@ -18,8 +18,9 @@ _INTERVAL = 10
 def _write_cache(path: str, interval=_INTERVAL, crop=_CROP, samples=None):
     samples = samples or []
     with open(path, "w") as f:
-        from split_homevideo import _VF_PREPROCESS, FRAMES_PER_SAMPLE
+        from split_homevideo import _CACHE_FORMAT, _VF_PREPROCESS, FRAMES_PER_SAMPLE
         json.dump({
+            "cache_format": _CACHE_FORMAT,
             "interval": interval,
             "crop": crop,
             "vf_preprocess": _VF_PREPROCESS,
@@ -31,7 +32,7 @@ def _write_cache(path: str, interval=_INTERVAL, crop=_CROP, samples=None):
 class TestCacheHit:
     def test_returns_cached_data(self, tmp_path):
         cache_path = str(tmp_path / "cache.json")
-        _write_cache(cache_path, samples=[(0.0, "1990-01-04T17:01:00"), (10.0, None)])
+        _write_cache(cache_path, samples=[(0.0, "5:01 PM 1/ 4/90"), (10.0, None)])
         with mock.patch("split_homevideo.extract_all_frames") as ext:
             result = scan("fake.mp4", _INTERVAL, _CROP, cache_path=cache_path)
         ext.assert_not_called()

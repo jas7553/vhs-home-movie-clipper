@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from split_homevideo import main
+from split_homevideo import Boundary, main
 
 _DT = datetime(1990, 1, 4, 17, 1)
 
@@ -15,6 +15,18 @@ def _mock_ocr_bin(exists=True):
     m = mock.Mock()
     m.exists.return_value = exists
     return m
+
+
+def _large_gap_boundary(video_t=100.0, prev_t=90.0, prev_dt=_DT):
+    return Boundary(
+        video_t=video_t,
+        type="large_gap",
+        cam_before=prev_dt,
+        cam_after=datetime(1990, 1, 4, 20, 0),
+        cam_jump_s=10800.0,
+        prev_t=prev_t,
+        prev_dt=prev_dt,
+    )
 
 
 class TestMainFileNotFound:
@@ -34,47 +46,32 @@ class TestMainOcrBinMissing:
                 main()
 
 
-def _base_patches(video_path, splits=None, duration=200.0):
-    splits = splits or [(0.0, None, None)]
-    dt = _DT
-    return [
-        mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin(exists=True)),
-        mock.patch("split_homevideo.scan", return_value=[(0.0, dt), (10.0, None)]),
-        mock.patch("split_homevideo.find_splits", return_value=splits),
-        mock.patch("split_homevideo.refine_split", return_value=99.0),
-        mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, dt)]),
-        mock.patch("split_homevideo.get_duration", return_value=duration),
-        mock.patch("split_homevideo.split_video"),
-        mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0),
-        mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5),
-    ]
-
-
 class TestMainDryRun:
     def test_dry_run_does_not_call_split_video(self, tmp_path):
         video = tmp_path / "vid.mp4"
         video.touch()
-        with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]):
-            with mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
-                 mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-                 mock.patch("split_homevideo.find_splits", return_value=[(0.0, None, None)]), \
-                 mock.patch("split_homevideo.refine_split", return_value=99.0), \
-                 mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-                 mock.patch("split_homevideo.get_duration", return_value=200.0), \
-                 mock.patch("split_homevideo.split_video") as m_sv, \
-                 mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0), \
-                 mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5):
-                main()
+        with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]), \
+             mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
+             mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
+             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
+             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
+             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
+             mock.patch("split_homevideo.get_duration", return_value=200.0), \
+             mock.patch("split_homevideo.split_video") as m_sv, \
+             mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0), \
+             mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5):
+            main()
         m_sv.assert_not_called()
 
     def test_dry_run_with_splits_calls_snap(self, tmp_path):
         video = tmp_path / "vid.mp4"
         video.touch()
-        two_splits = [(0.0, None, None), (100.0, 90.0, _DT)]
+        b = _large_gap_boundary(video_t=100.0, prev_t=90.0, prev_dt=_DT)
         with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_splits", return_value=two_splits), \
+             mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
+             mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
              mock.patch("split_homevideo.refine_split", return_value=99.0), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=200.0), \
@@ -93,8 +90,8 @@ class TestMainFullRun:
         with mock.patch("sys.argv", ["prog", str(video)]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_splits", return_value=[(0.0, None, None)]), \
-             mock.patch("split_homevideo.refine_split", return_value=99.0), \
+             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
+             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=200.0), \
              mock.patch("split_homevideo.split_video") as m_sv, \
@@ -113,8 +110,8 @@ class TestMainFullRun:
         with mock.patch("sys.argv", ["prog", str(video)]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", side_effect=fake_scan), \
-             mock.patch("split_homevideo.find_splits", return_value=[(0.0, None, None)]), \
-             mock.patch("split_homevideo.refine_split", return_value=0.0), \
+             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
+             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=100.0), \
              mock.patch("split_homevideo.split_video"), \

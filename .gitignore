@@ -8,6 +8,7 @@ __pycache__/
 *.mp4
 *_clips/
 *_ocr_cache.json
+!tests/fixtures/*_ocr_cache.json
 
 # Compiled binary — build from ocr_timestamp.swift
 ocr_timestamp
