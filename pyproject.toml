@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--tb=short -q"
+addopts = "--tb=short -q --cov-fail-under=90"
 
 [tool.ruff]
 line-length = 120
