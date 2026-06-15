@@ -142,7 +142,7 @@ The cut fix above reuses the cached scan. The OCR-quality work below requires a 
 (deletes/invalidates `Converse 1990_ocr_cache.json`) and ~minutes of compute — do it as a **separate
 follow-up**, not mixed into the cut fix.
 
-### Follow-up SPEC — raise OCR rate (currently 960/2128 = 44%)
+### Follow-up SPEC — raise OCR rate (currently 960/2128 = 44%) ✓ IMPLEMENTED
 
 Cause: VHS overlay is interlaced + low-contrast + spatially wobbly; `fps=1/N` samples a combed frame
 and Vision chokes on comb artifacts + small glyphs. The current `-vf` is just `crop=...` with no
@@ -167,6 +167,19 @@ test stale data.
 
 Verify OCR follow-up by the printed `OCR success: X/Y frames` line rising well above 44% (target 70%+),
 and by the date range / split count staying sane.
+
+### OCR improvement postmortem
+
+- **Result: 1393/2128 = 65.5%** (was 960/2128 = 44%). +21.5pp, 49% relative improvement.
+- All three filter-chain improvements were implemented (`yadif` + `scale=iw*3` + `eq=contrast=1.5`).
+- The "optional" 3-frames-per-interval consensus voting was also implemented; frames are grouped by
+  interval window and majority-voted via `Counter.most_common(1)`.
+- Cache key now includes `vf_preprocess` and `frames_per_sample` — stale caches auto-invalidate.
+- **Did not reach the 70% target.** The remaining ~4.5pp gap is likely from frames where the
+  timestamp overlay is partially off-screen, heavily ghosted, or fully absent. Further gains would
+  require `minimumTextHeight` tuning on the Swift side or sampling more than 3 frames per window.
+- **Side effect: 160 clips detected vs 133 before.** Better OCR reveals split points that were
+  previously invisible due to missing readings around real camera pauses.
 
 ---
 

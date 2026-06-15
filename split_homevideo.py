@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,11 @@ OCR_BIN = Path(__file__).parent / "ocr_timestamp"
 VIDEO_TIMESCALE = 29970  # matches source tbn; same on all segs/concat to prevent PTS mis-scaling
 MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fps≈0.033s)
                          # produce zero video frames and corrupt the concat — skip them.
+
+# OCR preprocessing filter chain (applied after fps filter in bulk scan, standalone in refinement).
+# yadif: deinterlaces VHS comb artifacts; scale 3×: Vision needs larger glyphs; eq: harden contrast.
+_VF_PREPROCESS = "yadif,scale=iw*3:ih*3:flags=lanczos,eq=contrast=1.5"
+FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote → fewer misreads
 
 # ------------------------------------------------------------------ #
 # Timestamp parsing
@@ -96,7 +102,7 @@ def extract_frame(video: str, t: float, crop: str, tmpdir: str) -> str | None:
         "-ss", str(t),
         "-i", video,
         "-vframes", "1",
-        "-vf", f"crop={crop}",
+        "-vf", f"crop={crop},{_VF_PREPROCESS}",
         "-update", "1",
         "-y", frame_path,
     ]
@@ -112,7 +118,7 @@ def extract_all_frames(video: str, interval: int, crop: str, tmpdir: str) -> lis
     cmd = [
         "ffmpeg", "-loglevel", "error",
         "-i", video,
-        "-vf", f"fps=1/{interval},crop={crop}",
+        "-vf", f"fps={FRAMES_PER_SAMPLE}/{interval},crop={crop},{_VF_PREPROCESS}",
         "-start_number", "0",
         "-y", out_pattern,
     ]
@@ -166,7 +172,9 @@ def scan(
     if cache_path and os.path.exists(cache_path):
         with open(cache_path) as f:
             cached = json.load(f)
-        if cached.get("interval") == interval and cached.get("crop") == crop:
+        if (cached.get("interval") == interval and cached.get("crop") == crop
+                and cached.get("vf_preprocess") == _VF_PREPROCESS
+                and cached.get("frames_per_sample", 1) == FRAMES_PER_SAMPLE):
             print(f"  (loaded from cache: {cache_path})")
             return [
                 (float(t), datetime.fromisoformat(dt) if dt else None)
@@ -175,7 +183,7 @@ def scan(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Phase 1: single-pass extraction
-        print(f"  Extracting frames (single pass, 1 frame/{interval}s)...", flush=True)
+        print(f"  Extracting frames (single pass, {FRAMES_PER_SAMPLE} frames/{interval}s)...", flush=True)
         frame_paths = extract_all_frames(video, interval, crop, tmpdir)
         print(f"  Extracted {len(frame_paths)} frames.", flush=True)
 
@@ -183,12 +191,20 @@ def scan(
         print(f"  Running OCR on {len(frame_paths)} frames (batch)...", flush=True)
         ocr_results = ocr_batch(frame_paths)
 
-        # Phase 3: build results keyed by float timestamp
-        results: dict[float, datetime | None] = {}
+        # Phase 3: group frames by interval window, majority-vote on OCR reading
+        interval_frames: dict[float, list[str]] = {}
         for path in frame_paths:
-            t = float(frame_index(path) * interval)
-            text = ocr_results.get(path, "")
-            results[t] = parse_timestamp(text) if text else None
+            t = float((frame_index(path) // FRAMES_PER_SAMPLE) * interval)
+            interval_frames.setdefault(t, []).append(path)
+
+        results: dict[float, datetime | None] = {}
+        for t, paths in interval_frames.items():
+            readings = [parse_timestamp(ocr_results.get(p, "")) for p in paths]
+            valid = [r for r in readings if r is not None]
+            if not valid:
+                results[t] = None
+            else:
+                results[t] = Counter(valid).most_common(1)[0][0]
 
     samples = sorted(results.items())
 
@@ -198,6 +214,8 @@ def scan(
             json.dump({
                 "interval": interval,
                 "crop": crop,
+                "vf_preprocess": _VF_PREPROCESS,
+                "frames_per_sample": FRAMES_PER_SAMPLE,
                 "samples": [(t, dt.isoformat() if dt else None) for t, dt in samples],
             }, f)
         print(f"  (scan cached to {cache_path})")
