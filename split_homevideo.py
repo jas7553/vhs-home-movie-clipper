@@ -372,10 +372,11 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
                 cuts.append(b.video_t)
         elif mode == "daily":
             is_backward = b.cam_jump_s < -1800
-            no_date = b.cam_before is None or b.cam_after is None
+            cam_before, cam_after = b.cam_before, b.cam_after
+            no_date = cam_before is None or cam_after is None
             date_change = (
-                b.cam_before is not None and b.cam_after is not None
-                and b.cam_before.date() != b.cam_after.date()
+                cam_before is not None and cam_after is not None
+                and cam_before.date() != cam_after.date()
             )
             if no_date or is_backward or date_change:
                 cuts.append(b.video_t)
