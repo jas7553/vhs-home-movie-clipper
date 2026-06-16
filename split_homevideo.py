@@ -298,36 +298,6 @@ def filter_ocr_outliers(
     return kept
 
 
-def find_splits(
-    samples: list[tuple[float, datetime | None]], gap_s: int
-) -> list[tuple[float, float | None, datetime | None]]:
-    """
-    Return list of (split_t, prev_t, prev_dt) where a new clip starts.
-    First entry is always (0.0, None, None). prev_t/prev_dt are the last
-    valid sample before the split — used for boundary refinement.
-
-    Split when camera time advanced MORE than expected (video advance + gap_s),
-    or when it went backwards by >30 min. Isolated OCR misreads are filtered
-    first; None samples are skipped throughout.
-    """
-    clean = filter_ocr_outliers(samples)
-    splits: list[tuple[float, float | None, datetime | None]] = [(0.0, None, None)]
-    prev: tuple[float, datetime] | None = None
-    for t, dt in clean:
-        if prev is not None:
-            prev_t, prev_dt = prev
-            video_advance = t - prev_t
-            cam_advance = (dt - prev_dt).total_seconds()
-            # Forward jump: camera ran much faster than real time (was paused/off)
-            jumped_forward = cam_advance > video_advance + gap_s
-            # Backward jump: only flag if large (>30 min) — small reversals are OCR noise
-            jumped_backward = cam_advance < -1800
-            if jumped_forward or jumped_backward:
-                splits.append((t, prev_t, prev_dt))
-        prev = (t, dt)
-    return splits
-
-
 def find_all_boundaries(
     samples: list[tuple[float, datetime | None]],
     min_gap_s: int = _MIN_GAP_S,
@@ -701,13 +671,61 @@ def cut_clip_with_boundary_encode(
         ], check=True)
 
 
+def _jumped(t_a: float, dt_a: datetime, t_b: float, dt_b: datetime) -> bool:
+    video_advance = t_b - t_a
+    cam_advance = (dt_b - dt_a).total_seconds()
+    return cam_advance > video_advance + _MIN_GAP_S or cam_advance < -1800
+
+
+def _reading_confirmed(filtered: list[tuple[float, datetime]], i: int) -> bool:
+    """
+    True unless filtered[i] is itself a misread: an isolated bad OCR reading
+    (e.g. one frame hallucinates a wrong date/year) creates a jump-in boundary
+    immediately followed by a revert-out boundary, while its neighbors on
+    either side remain consistent with each other. merge_short_clips()
+    collapses the resulting near-zero clip, but the bad reading can still be
+    the nearest valid sample to a clip's start — checking that it's sandwiched
+    between two mutually consistent neighbors catches this without re-touching
+    filter_ocr_outliers, which is tuned for boundary detection, not label
+    selection. A reading that jumps from its prior but is NOT later reverted
+    (a real session boundary) is left alone.
+
+    With no prior reading (i == 0) there's no "jump-in" to check. Forward
+    jumps are trusted by default (the common case: camera was paused/off,
+    a real session boundary). Backward jumps are treated as suspect even
+    without prior context — clocks don't normally run backward, so this is
+    more likely an OCR misread or clock reset than a legitimate boundary.
+    """
+    if i + 1 >= len(filtered):
+        return True
+    t, dt = filtered[i]
+    t_next, dt_next = filtered[i + 1]
+    if not _jumped(t, dt, t_next, dt_next):
+        return True
+    if i == 0:
+        return not (dt_next - dt).total_seconds() < -1800
+    t_prev, dt_prev = filtered[i - 1]
+    jumped_in = _jumped(t_prev, dt_prev, t, dt)
+    neighbors_consistent = not _jumped(t_prev, dt_prev, t_next, dt_next)
+    return not (jumped_in and neighbors_consistent)
+
+
 def _label_for(filtered: list[tuple[float, datetime]], start: float, mode: str = "session") -> str:
     """Return a label string for the clip starting at `start` seconds."""
-    for t, dt in filtered:
+    fallback: datetime | None = None
+    for i, (t, dt) in enumerate(filtered):
         if t >= start:
+            if fallback is None:
+                fallback = dt
+            if not _reading_confirmed(filtered, i):
+                continue
             if mode == "daily":
                 return dt.strftime("%Y-%m-%d")
             return dt.strftime("%Y-%m-%d_%H%M")
+    if fallback is not None:
+        if mode == "daily":
+            return fallback.strftime("%Y-%m-%d")
+        return fallback.strftime("%Y-%m-%d_%H%M")
     return f"{int(start):05d}s"
 
 

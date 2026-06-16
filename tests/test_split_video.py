@@ -27,6 +27,44 @@ class TestLabelFor:
     def test_empty_filtered_returns_fallback(self):
         assert _label_for([], 42.0) == "00042s"
 
+    def test_skips_isolated_misread_at_clip_start(self):
+        # 1040: hallucinated "1999-05-19" read, immediately reverted by the next
+        # sample — same pattern merge_short_clips collapses at the boundary level.
+        # The label must skip it and use the next (real) confirmed reading.
+        misread = datetime(1999, 5, 19, 10, 14)
+        real = datetime(1990, 1, 6, 10, 12)
+        filtered = [
+            (1020.0, datetime(1990, 1, 6, 10, 11)),
+            (1040.0, misread),
+            (1090.0, real),
+        ]
+        assert _label_for(filtered, 1040.0) == "1990-01-06_1012"
+
+    def test_daily_mode_skips_isolated_misread(self):
+        misread = datetime(1999, 5, 19, 10, 14)
+        real = datetime(1990, 1, 6, 10, 12)
+        filtered = [
+            (1020.0, datetime(1990, 1, 6, 10, 11)),
+            (1040.0, misread),
+            (1090.0, real),
+        ]
+        assert _label_for(filtered, 1040.0, mode="daily") == "1990-01-06"
+
+    def test_falls_back_to_unconfirmed_reading_if_nothing_else(self):
+        # Only candidate at/after start is unconfirmed (no next sample to check) —
+        # must still return something rather than the position-based fallback.
+        filtered = [(5.0, _DT)]
+        assert _label_for(filtered, 5.0) == "1990-01-04_1701"
+
+    def test_last_candidate_has_no_next_to_check_so_is_trusted(self):
+        # First candidate is an isolated misread (skipped); the second is the
+        # last entry overall, so there's nothing to disconfirm it against — it's
+        # trusted by default rather than treated as another misread.
+        a = datetime(1999, 1, 1, 0, 0)
+        b = datetime(1990, 1, 1, 0, 0)
+        filtered = [(10.0, a), (20.0, b)]
+        assert _label_for(filtered, 10.0) == b.strftime("%Y-%m-%d_%H%M")
+
 
 class TestSplitVideo:
     def test_creates_output_dir(self, tmp_path):
