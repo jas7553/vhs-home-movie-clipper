@@ -50,6 +50,12 @@ class TestLabelFor:
         ]
         assert _label_for(filtered, 1040.0, mode="daily") == "1990-01-06"
 
+    def test_falls_back_to_unconfirmed_reading_if_nothing_else(self):
+        # Only candidate at/after start is unconfirmed (no next sample to check) —
+        # must still return something rather than the position-based fallback.
+        filtered = [(5.0, _DT)]
+        assert _label_for(filtered, 5.0) == "1990-01-04_1701"
+
     def test_first_reading_forward_jump_trusted_by_default(self):
         # No "prev" exists for the first reading, so a forward jump (the common
         # case: camera was paused/off, a real session boundary) is trusted —
@@ -59,7 +65,7 @@ class TestLabelFor:
         filtered = [(10.0, early), (20.0, later)]
         assert _label_for(filtered, 10.0) == early.strftime("%Y-%m-%d_%H%M")
 
-    def test_first_reading_backward_jump_treated_as_suspect(self):
+    def test_last_candidate_has_no_next_to_check_so_is_trusted(self):
         # A backward jump at the very first reading has no prev to confirm it
         # was a real session boundary either — clocks don't normally run
         # backward, so it's treated as suspect even without sandwich context.
@@ -69,9 +75,9 @@ class TestLabelFor:
         assert _label_for(filtered, 10.0) == b.strftime("%Y-%m-%d_%H%M")
 
     def test_misread_with_real_sandwich_is_skipped(self):
-        # Same misread, but now flanked by a real "prev" reading too, so the
-        # sandwich check (jumped-in, jumped-out, prev/next mutually consistent)
-        # can actually fire — the misread is skipped in favor of the next entry.
+        # A misread flanked by a real "prev" reading too, so the sandwich check
+        # (jumped-in, prev/next mutually consistent) can fire — the misread is
+        # skipped in favor of the next entry.
         prev = datetime(1990, 1, 6, 10, 10)
         misread = datetime(1999, 1, 1, 0, 0)
         nxt = datetime(1990, 1, 6, 10, 11)
