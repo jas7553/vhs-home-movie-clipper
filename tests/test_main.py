@@ -54,6 +54,7 @@ class TestMainDryRun:
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
+             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
              mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=200.0), \
@@ -71,6 +72,7 @@ class TestMainDryRun:
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
+             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
              mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
              mock.patch("split_homevideo.refine_split", return_value=99.0), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
@@ -91,6 +93,7 @@ class TestMainFullRun:
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
+             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
              mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=200.0), \
@@ -111,6 +114,7 @@ class TestMainFullRun:
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
              mock.patch("split_homevideo.scan", side_effect=fake_scan), \
              mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
+             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
              mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=100.0), \

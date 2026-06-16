@@ -36,8 +36,13 @@ DEFAULT_INTERVAL = 10          # sample every N seconds
 DEFAULT_GAP = 300              # 5-minute gap = new clip
 DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
 DEFAULT_MODE = "session"
+DEFAULT_SCENE_THRESHOLD = 0.4
+DEFAULT_BLACK_MIN_DURATION = 0.1
+DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
+DEFAULT_MIN_CLIP_S = 5.0       # clips shorter than this are merged into the prior clip (see group_clips)
 
 _CACHE_FORMAT = 2              # increment when cache schema changes; forces re-scan on old caches
+_VISUAL_CACHE_FORMAT = 1
 _MIN_GAP_S = 60               # minimum camera-time jump to emit a boundary (internal, not user-tunable)
 
 OCR_BIN = Path(__file__).parent / "ocr_timestamp"
@@ -359,6 +364,26 @@ def find_all_boundaries(
     return boundaries
 
 
+def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S) -> list[float]:
+    """
+    Drop any cut that would produce a clip shorter than min_clip_s, merging it
+    into the prior clip.
+
+    A single hallucinated OCR reading (e.g. one bad frame reads "1999" or a
+    wrong date) creates a jump-in boundary immediately followed by a revert-out
+    boundary a few seconds later — both real per their own logic, but together
+    they bracket a near-zero-length spurious clip. This collapse is often only
+    visible after refine_split narrows each coarse boundary down to its precise
+    1s transition point, so this must run on final splits, not just coarse cuts.
+    """
+    merged = [cuts[0]]
+    for t in cuts[1:]:
+        if t - merged[-1] < min_clip_s:
+            continue
+        merged.append(t)
+    return merged
+
+
 def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[float]:
     """
     Stage 2: decide which boundaries become cut points based on mode.
@@ -382,6 +407,97 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
             if no_date or is_backward or date_change:
                 cuts.append(b.video_t)
     return cuts
+
+
+_SCENE_RE = re.compile(r"Parsed_showinfo.*pts_time:([\d.]+)")
+_BLACK_RE = re.compile(r"Parsed_blackdetect.*black_start:([\d.]+)")
+
+
+def detect_visual_boundaries(
+    video: str,
+    scene_threshold: float = DEFAULT_SCENE_THRESHOLD,
+    black_min_duration: float = DEFAULT_BLACK_MIN_DURATION,
+    cache_path: str | None = None,
+) -> tuple[list[float], list[float]]:
+    """
+    Single ffmpeg decode pass: detect scene cuts and black frames independent of OCR.
+
+    These are corroborating signals for fuse_boundaries() — an OCR-detected jump that
+    coincides with a real scene cut or black frame (camera off/on) is far more likely
+    to be a genuine boundary than an isolated OCR misread.
+
+    Returns (scene_cut_times, black_frame_times), both sorted lists of video_t.
+    """
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cached = json.load(f)
+        if (cached.get("cache_format") == _VISUAL_CACHE_FORMAT
+                and cached.get("scene_threshold") == scene_threshold
+                and cached.get("black_min_duration") == black_min_duration):
+            return cached["scene_cuts"], cached["black_frames"]
+
+    cmd = [
+        "ffmpeg", "-loglevel", "info",
+        "-i", video,
+        "-vf", f"blackdetect=d={black_min_duration}:pic_th=0.98,"
+               f"select='gt(scene,{scene_threshold})',showinfo",
+        "-f", "null", "-",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+
+    scene_cuts: list[float] = []
+    black_frames: list[float] = []
+    for line in r.stderr.splitlines():
+        m = _SCENE_RE.search(line)
+        if m:
+            scene_cuts.append(float(m.group(1)))
+            continue
+        m = _BLACK_RE.search(line)
+        if m:
+            black_frames.append(float(m.group(1)))
+
+    scene_cuts.sort()
+    black_frames.sort()
+
+    if cache_path:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump({
+                "cache_format": _VISUAL_CACHE_FORMAT,
+                "scene_threshold": scene_threshold,
+                "black_min_duration": black_min_duration,
+                "scene_cuts": scene_cuts,
+                "black_frames": black_frames,
+            }, f)
+
+    return scene_cuts, black_frames
+
+
+def fuse_boundaries(
+    boundaries: list["Boundary"],
+    scene_cuts: list[float],
+    black_frames: list[float],
+    window_s: float = DEFAULT_FUSE_WINDOW,
+) -> list["Boundary"]:
+    """
+    Two-of-three voting: an OCR-detected boundary is kept only if corroborated by an
+    independent visual signal (scene cut or black frame) somewhere in the actual
+    transition window. OCR-only boundaries with no visual corroboration are dropped
+    as likely misreads.
+
+    b.video_t is the first OCR sample AFTER the jump, not the transition point itself
+    — with OCR success well under 100%, the true cut can sit anywhere back to b.prev_t
+    (the last confirmed sample before the jump). Search [prev_t, video_t] padded by
+    window_s on both ends, rather than a fixed window around video_t alone.
+    """
+    visual_times = sorted(scene_cuts + black_frames)
+    confirmed = []
+    for b in boundaries:
+        lo = (b.prev_t if b.prev_t is not None else b.video_t - window_s) - window_s
+        hi = b.video_t + window_s
+        if any(lo <= vt <= hi for vt in visual_times):
+            confirmed.append(b)
+    return confirmed
 
 
 def refine_split(
@@ -635,6 +751,20 @@ def main():
                     help="ffmpeg crop 'w:h:x:y' for timestamp region")
     ap.add_argument("--cache", default=None,
                     help="JSON file to cache OCR scan results (saves time on re-runs)")
+    ap.add_argument("--visual-cache", default=None,
+                    help="JSON file to cache scene-cut/black-frame detection (saves time on re-runs)")
+    ap.add_argument("--enable-visual-fusion", action="store_true",
+                    help="Require scene-cut/black-frame corroboration for OCR boundaries (experimental: "
+                         "VHS pause/resume often has no visual discontinuity, so this can reject real "
+                         "boundaries — off by default)")
+    ap.add_argument("--fuse-window", type=float, default=DEFAULT_FUSE_WINDOW,
+                    help="Seconds of padding around [prev_t, video_t] to search for a corroborating visual signal")
+    ap.add_argument("--min-clip", type=float, default=DEFAULT_MIN_CLIP_S,
+                    help="Clips shorter than this (seconds) are merged into the prior clip")
+    ap.add_argument("--scene-threshold", type=float, default=DEFAULT_SCENE_THRESHOLD,
+                    help="ffmpeg scene-change detection threshold (0-1)")
+    ap.add_argument("--black-min-duration", type=float, default=DEFAULT_BLACK_MIN_DURATION,
+                    help="Minimum duration (s) of a black frame run to count as a boundary signal")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -646,6 +776,7 @@ def main():
     out_dir = os.path.abspath(out_dir)
 
     cache = args.cache or (Path(video).stem + "_ocr_cache.json")
+    visual_cache = args.visual_cache or (Path(video).stem + "_visual_cache.json")
 
     if not OCR_BIN.exists():
         sys.exit(f"ocr_timestamp binary not found at {OCR_BIN}. Run: swiftc -O ocr_timestamp.swift -o ocr_timestamp")
@@ -660,6 +791,20 @@ def main():
         print(f"  date range: {valid[0][1].date()} → {valid[-1][1].date()}")
 
     boundaries = find_all_boundaries(samples, gap_s=args.gap)
+
+    if args.enable_visual_fusion:
+        print("\nDetecting visual boundaries (scene cuts + black frames)...")
+        scene_cuts, black_frames = detect_visual_boundaries(
+            video, args.scene_threshold, args.black_min_duration, cache_path=visual_cache
+        )
+        print(f"  scene cuts: {len(scene_cuts)}  black frames: {len(black_frames)}")
+        before = len(boundaries)
+        boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, args.fuse_window)
+        print(
+            f"  confirmed {len(boundaries)}/{before} OCR boundary(ies) "
+            f"(visual corroboration within ±{args.fuse_window:.0f}s)"
+        )
+
     cut_ts = group_clips(boundaries, args.mode, args.gap)
     duration = get_duration(video)
 
@@ -679,6 +824,11 @@ def main():
                 splits.append(refined_t)
             else:
                 splits.append(vt)
+
+    before_merge = len(splits)
+    splits = merge_short_clips(splits, args.min_clip)
+    if len(splits) < before_merge:
+        print(f"\nMerged {before_merge - len(splits)} clip(s) shorter than {args.min_clip:.0f}s into their neighbor")
 
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
 
