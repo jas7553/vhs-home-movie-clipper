@@ -549,9 +549,9 @@ def refine_split(
     during the actual switch (camera motion, power-on noise) — those ambiguous
     frames belong to the old clip's tail, not the new clip's head.
 
-    If the entire window is an OCR dead zone (all None) and visual_times is
-    provided, falls back to the earliest visual signal (scene cut / black frame)
-    in [prev_t, coarse_t] as the anchor rather than returning coarse_t unchanged.
+    Splice Dead Zone (all-None window): anchors to the LAST visual event within
+    [prev_t, coarse_t) — end of the noise burst, not the start. Fallback when no
+    visual event exists in the span: coarse_t (end of None-span).
 
     Returns (refined_t, method) where method is 'ocr', 'visual', or 'coarse'.
     """
@@ -573,6 +573,7 @@ def refine_split(
     valid_paths = [p for t in window if (p := paths.get(t)) is not None]
     ocr_results = ocr_batch(valid_paths)
 
+    any_ocr = False
     last_old_t: float = prev_t
     for t in window:
         path = paths.get(t)
@@ -582,6 +583,7 @@ def refine_split(
         dt = parse_timestamp(text) if text else None
         if dt is None:
             continue
+        any_ocr = True
         cam_advance = (dt - prev_dt).total_seconds()
         video_advance = float(t) - prev_t
         if cam_advance > video_advance + gap_s or cam_advance < -1800:
@@ -589,13 +591,12 @@ def refine_split(
         else:
             last_old_t = t
 
-    # Dense scan found nothing (OCR dead zone). Fall back to the earliest visual
-    # signal in [prev_t, coarse_t] — VHS head-switch noise that killed OCR also
-    # typically produces a black frame or scene cut at the true boundary.
-    if visual_times:
-        anchors = [vt for vt in visual_times if prev_t <= vt <= coarse_t]
+    # Splice Dead Zone: entire window was all-None. Anchor to the LAST visual
+    # event within [prev_t, coarse_t) — end of noise burst, not start.
+    if not any_ocr and visual_times:
+        anchors = [vt for vt in visual_times if prev_t <= vt < coarse_t]
         if anchors:
-            return min(anchors), "visual"
+            return max(anchors), "visual"
 
     return coarse_t, "coarse"
 
@@ -848,11 +849,13 @@ def main():
                     help="JSON file to cache OCR scan results (saves time on re-runs)")
     ap.add_argument("--visual-cache", default=None,
                     help="JSON file to cache scene-cut/black-frame detection (saves time on re-runs)")
-    ap.add_argument("--enable-visual-fusion", action="store_true", default=True,
-                    help="Run visual boundary detection (scene cuts + black frames) to anchor cuts "
-                         "in OCR dead zones where every frame returns None (default: on)")
-    ap.add_argument("--no-visual-fusion", dest="enable_visual_fusion", action="store_false",
-                    help="Disable visual boundary detection (faster; may misplace cuts at VHS head-switch noise zones)")
+    ap.add_argument("--enable-visual-fusion", action="store_true", default=False,
+                    help="Drop OCR boundaries lacking visual corroboration (scene cut or black frame). "
+                         "Off by default — VHS pause/resume often has no visual discontinuity so "
+                         "this filter would delete real boundaries.")
+    ap.add_argument("--no-visual-anchor", action="store_true", default=False,
+                    help="Skip visual detection entirely (disables splice dead-zone anchoring; faster, "
+                         "but cuts at splice boundaries may be misplaced)")
     ap.add_argument("--fuse-window", type=float, default=DEFAULT_FUSE_WINDOW,
                     help="Seconds of padding around [prev_t, video_t] to search for a corroborating visual signal")
     ap.add_argument("--min-clip", type=float, default=DEFAULT_MIN_CLIP_S,
@@ -889,19 +892,20 @@ def main():
     boundaries = find_all_boundaries(samples, gap_s=args.gap)
 
     visual_times: list[float] = []
-    if args.enable_visual_fusion:
+    if not args.dry_run and not args.no_visual_anchor:
         print("\nDetecting visual boundaries (scene cuts + black frames)...")
         scene_cuts, black_frames = detect_visual_boundaries(
             video, args.scene_threshold, args.black_min_duration, cache_path=visual_cache
         )
         print(f"  scene cuts: {len(scene_cuts)}  black frames: {len(black_frames)}")
         visual_times = sorted(scene_cuts + black_frames)
-        before = len(boundaries)
-        boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, args.fuse_window)
-        print(
-            f"  confirmed {len(boundaries)}/{before} OCR boundary(ies) "
-            f"(visual corroboration within ±{args.fuse_window:.0f}s)"
-        )
+        if args.enable_visual_fusion:
+            before = len(boundaries)
+            boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, args.fuse_window)
+            print(
+                f"  confirmed {len(boundaries)}/{before} OCR boundary(ies) "
+                f"(visual corroboration within ±{args.fuse_window:.0f}s)"
+            )
 
     cut_ts = group_clips(boundaries, args.mode, args.gap)
     duration = get_duration(video)
