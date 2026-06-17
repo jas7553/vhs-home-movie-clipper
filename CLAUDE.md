@@ -22,10 +22,10 @@ python3 split_homevideo.py "YourFile.mp4" --dry-run
 python3 split_homevideo.py "YourFile.mp4"
 
 # Re-tune gap without re-scanning (cache hit):
-python3 split_homevideo.py "YourFile.mp4" --gap 900
+python3 split_homevideo.py "YourFile.mp4" --gap 3600
 ```
 
-Key flags: `--interval N` (OCR sample rate, default 10s), `--gap N` (camera-time jump threshold, default 300s), `--crop W:H:X:Y` (timestamp region), `--cache PATH`, `--out-dir DIR`.
+Key flags: `--interval N` (OCR sample rate, default 10s), `--gap N` (camera-time jump threshold, default 3600s), `--crop W:H:X:Y` (timestamp region), `--cache PATH`, `--out-dir DIR`.
 
 ## Architecture
 
@@ -37,7 +37,7 @@ Two-file project:
 
 1. **Scan** (`scan()`): Single-pass ffmpeg (`fps=1/N,crop=...`) extracts one frame every N seconds into a temp dir. `ocr_batch()` runs the binary once over all frames. Results cached to `<stem>_ocr_cache.json`.
 
-2. **Filter** (`filter_ocr_outliers()`): Removes isolated misreads. A reading is kept if it's consistent (within 900s drift) with its prior OR next valid neighbor. This preserves real clip boundaries while discarding single-frame OCR noise.
+2. **Filter** (`filter_ocr_outliers()`): Removes isolated misreads and consecutive misread runs. A reading is dropped if it's inconsistent with all neighbors within a `max_run`-step window in both directions. Real boundary readings are protected because subsequent same-date frames always pass the forward check.
 
 3. **Split detection** (`find_splits()`): Iterates filtered readings. Triggers a split when camera time jumps forward more than `video_advance + gap_s` (camera was paused/off) or backward by >30 min (new tape segment).
 
@@ -47,7 +47,7 @@ Two-file project:
 
 ## Key domain facts
 
-- **Camera clock runs ~2× real time** on this specific camcorder. `--gap 900` (15 camera-minutes) was the effective threshold used in practice, despite the default being 300.
+- **Camera clock runs ~2× real time** on this specific camcorder. `--gap 3600` (1 camera-hour) is the empirically validated threshold (F1=0.920 on 215-boundary golden set); prior default of 300 and field value of 900 both had unacceptable FP rates.
 - **OCR success rate ~44%** on a 5.9hr test file. The outlier filter and `None`-skipping make the pipeline robust to this.
 - **Timestamp format**: `M/ D/YY` (bottom line) and `H:MM AM/PM` (top line), with spaces instead of leading zeros. Years outside 1985–2005 are rejected as OCR hallucinations.
 - **Default crop** `250:110:385:370` is tuned for 640×480 source with bottom-right timestamp overlay.

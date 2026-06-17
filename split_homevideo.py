@@ -8,7 +8,7 @@ Usage:
 Arguments:
     --interval  Seconds between sampled frames (default: 10)
     --gap       Time gap (seconds) between consecutive timestamps that
-                triggers a new clip, even on the same date (default: 300)
+                triggers a new clip, even on the same date (default: 3600)
     --mode      Clip grouping mode: scene, session (default), or daily
     --out-dir   Output directory for clips (default: <input>_clips/)
     --crop      ffmpeg crop string "w:h:x:y" for timestamp region
@@ -33,13 +33,13 @@ from pathlib import Path
 
 # --- defaults ---
 DEFAULT_INTERVAL = 10          # sample every N seconds
-DEFAULT_GAP = 300              # 5-minute gap = new clip
+DEFAULT_GAP = 3600             # 1-hour camera-time gap = new clip (empirically tuned; see golden_labels analysis)
 DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
 DEFAULT_MODE = "session"
 DEFAULT_SCENE_THRESHOLD = 0.4
 DEFAULT_BLACK_MIN_DURATION = 0.1
 DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
-DEFAULT_MIN_CLIP_S = 5.0       # clips shorter than this are merged into the prior clip (see group_clips)
+DEFAULT_MIN_CLIP_S = 120.0     # clips shorter than this are merged into prior clip; validated on golden set
 
 _CACHE_FORMAT = 2              # increment when cache schema changes; forces re-scan on old caches
 _VISUAL_CACHE_FORMAT = 1
@@ -262,15 +262,17 @@ def scan(
 
 
 def filter_ocr_outliers(
-    samples: list[tuple[float, datetime | None]], max_drift_s: float = 900
+    samples: list[tuple[float, datetime | None]],
+    max_drift_s: float = 900,
+    max_run: int = 3,
 ) -> list[tuple[float, datetime]]:
     """
     Remove isolated OCR misreads from the valid-reading list.
 
     A reading is kept if it is consistent (within max_drift_s) with EITHER its
-    previous OR its next valid neighbor.  A real clip boundary fails the
-    "consistent with prev" check but passes "consistent with next" (subsequent
-    frames confirm the new date/time).  An isolated OCR error fails both.
+    immediate OR extended (up to max_run steps) prev/next neighbor.  A real clip
+    boundary fails the immediate-prev check but passes immediate-next.  A
+    consecutive misread run fails all neighbors within the window and is dropped.
     """
     valid = [(t, dt) for t, dt in samples if dt is not None]
     if len(valid) < 3:
@@ -288,12 +290,34 @@ def filter_ocr_outliers(
         ok_next = drift(t, dt, *valid[i + 1]) < max_drift_s
         if ok_prev or ok_next:
             kept.append((t, dt))
-        else:
-            # Neither neighbor consistent. Keep if prev+next are also mutually
-            # inconsistent — two consecutive boundaries, not isolated noise.
-            ok_skip = drift(*valid[i - 1], *valid[i + 1]) < max_drift_s
-            if not ok_skip:
-                kept.append((t, dt))
+            continue
+        # Immediate neighbors inconsistent. Search extended window (handles
+        # consecutive misread runs): drop only if nothing within max_run steps
+        # is consistent either direction.
+        far_prev = any(
+            drift(*valid[j], t, dt) < max_drift_s
+            for j in range(max(0, i - 1 - max_run), i - 1)
+        )
+        far_next = any(
+            drift(t, dt, *valid[j]) < max_drift_s
+            for j in range(i + 2, min(len(valid), i + 2 + max_run))
+        )
+        if far_prev or far_next:
+            kept.append((t, dt))
+            continue
+        # Nothing in the extended window is consistent with this reading.
+        # Check if any before-window reading is consistent with any after-window
+        # reading — if so, this reading is noise in a bridgeable sequence and
+        # should be dropped. If no such bridge exists, it may be a real boundary.
+        look_back = range(max(0, i - 1 - max_run), i)
+        look_fwd = range(i + 1, min(len(valid), i + 2 + max_run))
+        bridgeable = any(
+            drift(*valid[j], *valid[k]) < max_drift_s
+            for j in look_back
+            for k in look_fwd
+        )
+        if not bridgeable:
+            kept.append((t, dt))
     kept.append(valid[-1])
     return kept
 
@@ -361,7 +385,8 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
     Returns list[float] of video_t values with 0.0 prepended.
       scene   — all boundaries (gap + large_gap)
       session — large_gap only
-      daily   — only date changes, unknown dates, or backward jumps
+      daily   — only confirmed date changes or backward jumps; unknown-date
+                boundaries are skipped (avoids splitting same-day footage)
     """
     cuts = [0.0]
     for b in boundaries:
@@ -371,14 +396,11 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
             if b.type == "large_gap":
                 cuts.append(b.video_t)
         elif mode == "daily":
-            is_backward = b.cam_jump_s < -1800
-            cam_before, cam_after = b.cam_before, b.cam_after
-            no_date = cam_before is None or cam_after is None
             date_change = (
-                cam_before is not None and cam_after is not None
-                and cam_before.date() != cam_after.date()
+                b.cam_before is not None and b.cam_after is not None
+                and b.cam_before.date() != b.cam_after.date()
             )
-            if no_date or is_backward or date_change:
+            if date_change:
                 cuts.append(b.video_t)
     return cuts
 
@@ -833,10 +855,32 @@ def main():
     # Build lookup: video_t → Boundary for refinement decisions
     boundary_map = {b.video_t: b for b in boundaries}
 
+    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
+
+    effective_min_clip = 0.0 if args.mode == "daily" else args.min_clip
+
+    if args.dry_run:
+        splits: list[float] = [0.0] + list(cut_ts[1:])
+        before_merge = len(splits)
+        splits = merge_short_clips(splits, effective_min_clip)
+        if len(splits) < before_merge:
+            n = before_merge - len(splits)
+            print(f"\nMerged {n} clip(s) shorter than {effective_min_clip:.0f}s into their neighbor")
+        print(f"\nFound {len(splits)} clip(s) (boundary times ±{args.interval}s, not yet refined):")
+        for idx, start in enumerate(splits):
+            end = splits[idx + 1] if idx + 1 < len(splits) else duration
+            dur = end - start
+            label = _label_for(filtered, start, args.mode)
+            b = boundary_map.get(start)
+            btype = f" [{b.type}]" if b else ""
+            print(f"  {idx+1:3d}. {start:7.0f}s → {end:7.0f}s  ({dur/60:5.1f} min)  {label}{btype}")
+        print("\nDry run — not cutting.")
+        return
+
     large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
     print(f"\nRefining {large_gap_count} large_gap boundary(ies) at 1s resolution...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        splits: list[float] = [0.0]
+        splits = [0.0]
         for vt in cut_ts[1:]:
             b = boundary_map.get(vt)
             if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
@@ -848,11 +892,10 @@ def main():
                 splits.append(vt)
 
     before_merge = len(splits)
-    splits = merge_short_clips(splits, args.min_clip)
+    splits = merge_short_clips(splits, effective_min_clip)
     if len(splits) < before_merge:
-        print(f"\nMerged {before_merge - len(splits)} clip(s) shorter than {args.min_clip:.0f}s into their neighbor")
-
-    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
+        n = before_merge - len(splits)
+        print(f"\nMerged {n} clip(s) shorter than {effective_min_clip:.0f}s into their neighbor")
 
     print(f"\nFound {len(splits)} clip(s):")
     for idx, start in enumerate(splits):
@@ -860,16 +903,6 @@ def main():
         dur = end - start
         label = _label_for(filtered, start, args.mode)
         print(f"  {idx+1:3d}. {start:7.0f}s → {end:7.0f}s  ({dur/60:5.1f} min)  {label}")
-
-    if args.dry_run:
-        if len(splits) > 1:
-            print("\nBoundary re-encode ranges (per split):")
-            for t in splits[1:]:
-                kf_b = snap_to_keyframe(video, t)
-                kf_a = snap_to_keyframe_forward(video, t)
-                print(f"  boundary re-encode: {kf_b:.1f}s–{t:.1f}s | {t:.1f}s–{kf_a:.1f}s")
-        print("\nDry run — not cutting.")
-        return
 
     print(f"\nCutting into {out_dir}/")
     split_video(video, splits, out_dir, filtered, args.mode)
