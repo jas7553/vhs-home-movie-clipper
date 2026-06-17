@@ -29,85 +29,92 @@ python3 split_homevideo.py "YourFile.mp4" --dry-run
 python3 split_homevideo.py "YourFile.mp4"
 
 # Re-tune gap without re-scanning (uses cache):
-python3 split_homevideo.py "YourFile.mp4" --gap 1800
+python3 split_homevideo.py "YourFile.mp4" --gap 3600
 
 # Key flags:
-#   --interval N   Seconds between OCR samples (default: 10)
-#   --gap N        Camera-time jump threshold for new clip in seconds (default: 300,
-#                  but 900 was used in practice — see Findings below)
-#   --crop W:H:X:Y ffmpeg crop for timestamp region (default tuned for 640×480)
-#   --cache PATH   Override default cache file location
-#   --out-dir DIR  Output directory (default: <stem>_clips/)
+#   --interval N          Seconds between OCR samples (default: 10)
+#   --gap N               Camera-time jump threshold in seconds (default: 3600,
+#                         empirically validated on 215-boundary golden set; F1=0.920)
+#   --mode {scene,session,daily}  Clip grouping mode (default: daily)
+#   --crop W:H:X:Y        ffmpeg crop for timestamp region (default tuned for 640×480)
+#   --cache PATH          Override default cache file location
+#   --out-dir DIR         Output directory (default: <stem>_clips/)
+#   --min-clip N          Merge clips shorter than N seconds (default: 120; ignored in daily mode)
 ```
 
 ## How It Works
 
-1. **OCR scan**: Sample one frame every `--interval` seconds. Crop the bottom-right
-   region where the burned-in camcorder timestamp lives (`250:110:385:370` for
-   640×480). Run each crop through `ocr_timestamp` (Apple Vision, M4-native).
+1. **OCR scan**: Extract 3 frames per `--interval` window via a single ffmpeg pass
+   (no per-frame seeks). Crop the bottom-right region (`250:110:385:370` for 640×480),
+   apply deinterlace + 4× upscale + contrast enhancement, batch through `ocr_timestamp`
+   (Apple Vision, M4-native). Majority vote within each window. Results cached as raw
+   OCR text to `<stem>_ocr_cache.json` — parser fixes re-apply at load time, no rescan needed.
 
 2. **Parse**: Extract date (`M/ D/YY`) and time (`H:MM AM/PM`) from OCR text.
-   Multi-line OCR noise is handled by flattening newlines before regex matching.
-   Timestamps where time fails to parse are discarded (returning `None`) — defaulting
-   to `00:00` caused large false jumps.
+   Timestamps where AM/PM is absent are discarded — optional AM/PM caused 12-hour
+   backward phantom jumps. Years outside 1985–2005 are rejected as hallucinations.
 
-3. **Outlier filter**: Before split detection, remove isolated OCR misreads. A
-   reading is kept if it is consistent (within 900s drift) with EITHER its previous
-   OR its next valid neighbor. This preserves real clip boundaries (consistent with
-   next neighbor) while removing single-frame noise (inconsistent with both).
+3. **Outlier filter**: Remove isolated misreads and consecutive misread runs. A reading
+   is kept if it is consistent (within 900s drift) with EITHER its previous OR next
+   neighbor (within a `max_run=3` step window). Real boundary readings pass the forward
+   check; consecutive misread runs fail all neighbors and are dropped.
 
-4. **Split detection**: For each pair of consecutive valid readings `(t1, dt1)` and
-   `(t2, dt2)`:
-   - `video_advance = t2 - t1` (seconds of video between samples)
-   - `cam_advance = (dt2 - dt1).total_seconds()`
-   - Split if `cam_advance > video_advance + gap_s` (camera was off/paused)
-   - Split if `cam_advance < -1800` (large backward jump, new segment)
-   - `None` samples are skipped without resetting state
+4. **Boundary detection**: Emit a `Boundary` for each pair where:
+   - `cam_advance > video_advance + 60s` (camera paused/off), or
+   - `cam_advance < -1800s` (backward jump, new tape segment)
+   Type is `large_gap` when jump exceeds `--gap` threshold (default 3600s camera-time).
 
-5. **Cut**: `ffmpeg -ss <start> -i input -t <duration> -c copy` — stream copy,
-   no re-encode, lossless. Output files named `<stem>_clipNN_YYYY-MM-DD_HHMM.mp4`.
+5. **Grouping**: Filter boundaries to cut points by `--mode`:
+   - `daily` (default) — only confirmed calendar date changes; no date split across clips
+   - `session` — `large_gap` boundaries only
+   - `scene` — all detected pauses
+   After grouping, `_collapse_revert_phantoms` removes phantom clips from OCR misreads
+   (misread year/month creates a short clip with opposite-sign cam jumps on both sides).
 
-6. **Cache**: Scan results saved to `<stem>_ocr_cache.json`. Re-loaded automatically
-   on subsequent runs if `--interval` and `--crop` match.
+6. **Refinement**: For each `large_gap` boundary, dense 1s scan of the preceding
+   `[prev_sample, coarse_t]` window in parallel. Cuts at the last confirmed old-session
+   frame rather than the first new-session frame.
+
+7. **Cut**: Re-encodes only small boundary segments (~3–6s) at CRF 18 for frame accuracy;
+   stream-copies everything else. Concatenates via ffmpeg concat demuxer.
+   Output: `<stem>_clipNN_YYYY-MM-DD.mp4` (daily) or `<stem>_clipNN_YYYY-MM-DD_HHMM.mp4` (other modes).
+
+8. **Cache**: Self-invalidating — keyed on `interval`, `crop`, preprocessing filter chain,
+   and `frames_per_sample`. Any change triggers automatic rescan.
 
 ## Findings & Nuances
 
 ### Camera clock rate
-The camcorder's internal clock appears to advance at ~2× real time relative to the
-video file's playback duration. This is visible in continuous sections: 60s of video
-≈ 2 min of camera time. Cause unknown (likely a clock calibration issue on this
-specific camera). Effect: the `gap_s` threshold must be interpreted as camera-seconds,
-not wall-clock seconds. `--gap 900` (15 camera-minutes) was the effective value used.
+The camcorder's internal clock advances at ~2× real time relative to video playback.
+60s of video ≈ 2 min of camera time. Effect: `gap_s` thresholds are in camera-seconds,
+not wall-clock seconds. `--gap 3600` (1 camera-hour) is empirically validated on a
+215-boundary golden label set (F1=0.920). Prior values of 300 and 900 had unacceptable
+false-positive rates.
 
 ### OCR reliability
-Apple Vision reads the timestamp correctly most of the time but fails when:
-- The timestamp region is in motion (camera pan/shake)
+Success rate on the 5.9hr Converse 1990 tape: 1096/2128 samples (51%). Fails when:
+- Timestamp region is in motion (pan/shake)
 - Lighting is very dark or very bright
-- The `1/` month-day separator gets split across lines
+- The `1/` separator splits across OCR lines
 
-OCR success rate on a 5.9hr test file: 940/2128 samples (44%). The outlier
-filter and None-skipping logic make the pipeline robust to this level of failure.
+The outlier filter and `None`-skipping logic make the pipeline robust to ~50% failure.
 
-### Year filter
-Timestamps are filtered to years 1985–2005. OCR occasionally hallucinates years
-like 2049 or 1980; this filter catches them.
+### Phantom clip collapse (daily mode)
+OCR misreads that survive the outlier filter (e.g., reading "1999" instead of "1990"
+for a single frame in a transition zone) create a phantom short clip. In `daily` mode,
+these phantom clips are detected and removed by `_collapse_revert_phantoms`: a clip
+shorter than `min_clip_s` (120s) whose bounding boundaries have opposite-sign
+`cam_jump_s` values is a misread — a forward jump to the wrong date immediately
+followed by a backward jump back. Validated on Converse 1990.mp4: removed 8 phantom
+clips including `1999-05-19`, `1999-07-21`, `1990-01-22` (misread month), and
+`1990-09-01` (misread in an April sequence).
 
 ### Timestamp format
-`M/ D/YY` on bottom line, `H:MM AM/PM` on top line. The date uses padded spaces
-rather than leading zeros (e.g., `1/ 4/90` not `01/04/90`). The regex uses `[/\s]+`
-to match both separators.
+`M/ D/YY` on bottom line, `H:MM AM/PM` on top line. Single-digit months/days use a
+leading space (`1/ 4/90` not `01/04/90`). AM/PM is required — when absent the parser
+returns `None` (optional AM/PM caused phantom 12-hour backward jumps).
 
-### Split accuracy (known limitation)
-Splits are placed at the **sample time** where the timestamp jump was detected,
-not the exact frame where the recording session changed. With `--interval 10`, the
-split point can be up to 10 seconds late. Compounded with ffmpeg keyframe-snapping
-(`-ss` before `-i`), this means ~0–10s of "next session" content can appear at the
-tail of a clip.
-
-**Example**: The last ~2s of `clip03_1990-01-04_1723.mp4` belongs to the session
-captured in `clip04_1990-01-04_1750.mp4`. The actual camera switch happened between
-sample t=220s and t=230s; the split was placed at t=230s.
-
-**Fix (implemented)**: After coarse detection, a 1s-resolution refinement scan runs
-over each split boundary's [prev_sample, detected_sample] window. Savings range from
-0s to 2180s per boundary (visible in `--dry-run` output).
+### Split accuracy
+Coarse boundaries land within ±`interval`s of the actual cut. The refinement step
+does a dense 1s scan of `[prev_sample, coarse_sample]` and finds the last confirmed
+old-session frame. Savings range from 0s to 2180s per boundary (shown in `--dry-run`).

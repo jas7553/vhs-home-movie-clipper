@@ -9,7 +9,7 @@ Arguments:
     --interval  Seconds between sampled frames (default: 10)
     --gap       Time gap (seconds) between consecutive timestamps that
                 triggers a new clip, even on the same date (default: 3600)
-    --mode      Clip grouping mode: scene, session (default), or daily
+    --mode      Clip grouping mode: scene, session, or daily (default)
     --out-dir   Output directory for clips (default: <input>_clips/)
     --crop      ffmpeg crop string "w:h:x:y" for timestamp region
                 (default tuned for 640x480 with bottom-right overlay)
@@ -35,7 +35,7 @@ from pathlib import Path
 DEFAULT_INTERVAL = 10          # sample every N seconds
 DEFAULT_GAP = 3600             # 1-hour camera-time gap = new clip (empirically tuned; see golden_labels analysis)
 DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
-DEFAULT_MODE = "session"
+DEFAULT_MODE = "daily"
 DEFAULT_SCENE_THRESHOLD = 0.4
 DEFAULT_BLACK_MIN_DURATION = 0.1
 DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
@@ -376,6 +376,41 @@ def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S)
             continue
         merged.append(t)
     return merged
+
+
+def _collapse_revert_phantoms(
+    cuts: list[float],
+    boundary_map: dict[float, "Boundary"],
+    min_phantom_s: float = DEFAULT_MIN_CLIP_S,
+) -> list[float]:
+    """
+    Collapse phantom clips in daily mode: a short clip whose bounding boundaries
+    have opposite-sign cam_jump_s values is an OCR misread in a transition zone —
+    the camera jumped forward to a hallucinated date then immediately reverted.
+
+    Same-date violations (A→B→A with B being a misread year) and near-same-date
+    violations (A→B→C where B is a wildly wrong month/year and A≈C) both trigger
+    because in every such case one jump is large-positive and the next is
+    large-negative. Genuine short clips on a new date are always bracketed by
+    same-sign (both positive) jumps.
+    """
+    if len(cuts) <= 2:
+        return cuts
+    result = [cuts[0]]
+    i = 1
+    while i < len(cuts):
+        if i + 1 < len(cuts):
+            b1 = boundary_map.get(cuts[i])
+            b2 = boundary_map.get(cuts[i + 1])
+            clip_dur = cuts[i + 1] - cuts[i]
+            if (b1 is not None and b2 is not None
+                    and clip_dur < min_phantom_s
+                    and b1.cam_jump_s * b2.cam_jump_s < 0):  # opposite-sign jumps
+                i += 2  # skip both jump-in and revert-out cuts
+                continue
+        result.append(cuts[i])
+        i += 1
+    return result
 
 
 def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[float]:
@@ -789,7 +824,7 @@ def main():
     ap.add_argument("--gap", type=int, default=DEFAULT_GAP,
                     help="Camera timestamp gap (seconds) that triggers a new clip")
     ap.add_argument("--mode", choices=["scene", "session", "daily"], default=DEFAULT_MODE,
-                    help="Clip grouping mode (default: session)")
+                    help="Clip grouping mode (default: daily)")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--crop", default=DEFAULT_CROP,
                     help="ffmpeg crop 'w:h:x:y' for timestamp region")
@@ -852,8 +887,11 @@ def main():
     cut_ts = group_clips(boundaries, args.mode, args.gap)
     duration = get_duration(video)
 
-    # Build lookup: video_t → Boundary for refinement decisions
+    # Build lookup: video_t → Boundary for refinement decisions and phantom collapse
     boundary_map = {b.video_t: b for b in boundaries}
+
+    if args.mode == "daily":
+        cut_ts = _collapse_revert_phantoms(cut_ts, boundary_map)
 
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
 

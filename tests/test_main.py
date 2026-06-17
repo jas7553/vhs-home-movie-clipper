@@ -64,7 +64,7 @@ class TestMainDryRun:
             main()
         m_sv.assert_not_called()
 
-    def test_dry_run_with_splits_calls_snap(self, tmp_path):
+    def test_dry_run_does_not_refine_or_encode(self, tmp_path):
         video = tmp_path / "vid.mp4"
         video.touch()
         b = _large_gap_boundary(video_t=100.0, prev_t=90.0, prev_dt=_DT)
@@ -74,15 +74,17 @@ class TestMainDryRun:
              mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
              mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
              mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
-             mock.patch("split_homevideo.refine_split", return_value=99.0), \
+             mock.patch("split_homevideo.refine_split") as m_refine, \
              mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
              mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.split_video"), \
-             mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0) as m_kf, \
-             mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5) as m_kff:
+             mock.patch("split_homevideo.split_video") as m_sv, \
+             mock.patch("split_homevideo.snap_to_keyframe") as m_kf, \
+             mock.patch("split_homevideo.snap_to_keyframe_forward") as m_kff:
             main()
-        m_kf.assert_called()
-        m_kff.assert_called()
+        m_refine.assert_not_called()
+        m_sv.assert_not_called()
+        m_kf.assert_not_called()
+        m_kff.assert_not_called()
 
 
 class TestMainFullRun:
