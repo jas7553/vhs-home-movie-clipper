@@ -18,7 +18,11 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **Output filenames must accurately reflect the date of the footage.** If the clip contains Jan 6 footage, the filename should say `1990-01-06`, not `1990-01-16` due to a misread.
 
-**Boundary timing must be accurate to the actual stop/start frame, not the nearest OCR sample.** The pipeline refines coarse boundaries to 1-second resolution; that refinement must use the last frame of the outgoing session as the cut point, not the first frame of the incoming one.
+**Boundary timing must be accurate to the actual stop/start frame *where OCR is recoverable*.** For boundaries with readable timestamps on both sides, refinement resolves to 1-second resolution and uses the last frame of the outgoing session as the cut point, not the first frame of the incoming one.
+
+**At a Splice Dead Zone the boundary is an Ambiguity Window, not a recoverable frame.** Head-switch noise blanks OCR and saturates every visual detector across a ~15s burst, so frame-accurate placement is unsatisfiable there. The cut follows an end-of-noise-burst policy: the noise burst stays with the outgoing clip's tail (objective: zero wrong-date footage in the incoming clip). The cut anchors to the last visual event within the all-`None` span, falling back to the end of that span when no visual event exists. See `docs/adr/0001-splice-boundary-placement-policy.md`.
+
+**Detection and Placement are separate, separately-measured concerns.** Detection (does a boundary exist?) is scored by the golden set's y/n verdicts (F1=0.920). Placement (how many seconds the cut lands from the true session change) requires its own metric — a human-labeled true-change second on Splice Dead Zone boundaries. No boundary-placement change may be merged without a measured placement error; a high Detection F1 says nothing about Placement.
 
 ---
 
