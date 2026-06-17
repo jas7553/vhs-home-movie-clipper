@@ -539,7 +539,8 @@ def refine_split(
     gap_s: int,
     crop: str,
     tmpdir: str,
-) -> float:
+    visual_times: list[float] | None = None,
+) -> tuple[float, str]:
     """
     Dense 1s scan of [prev_t+1, coarse_t) to find the transition point.
 
@@ -547,10 +548,16 @@ def refine_split(
     rather than at the first NEW-session frame. This handles OCR returning None
     during the actual switch (camera motion, power-on noise) — those ambiguous
     frames belong to the old clip's tail, not the new clip's head.
+
+    If the entire window is an OCR dead zone (all None) and visual_times is
+    provided, falls back to the earliest visual signal (scene cut / black frame)
+    in [prev_t, coarse_t] as the anchor rather than returning coarse_t unchanged.
+
+    Returns (refined_t, method) where method is 'ocr', 'visual', or 'coarse'.
     """
     window = list(range(int(prev_t) + 1, int(coarse_t)))
     if not window:
-        return coarse_t
+        return coarse_t, "coarse"
 
     # Extract all frames in the refinement window in parallel, then batch OCR
     workers = (os.cpu_count() or 4) * 2
@@ -578,10 +585,19 @@ def refine_split(
         cam_advance = (dt - prev_dt).total_seconds()
         video_advance = float(t) - prev_t
         if cam_advance > video_advance + gap_s or cam_advance < -1800:
-            return float(last_old_t) + 1.0
+            return float(last_old_t) + 1.0, "ocr"
         else:
             last_old_t = t
-    return coarse_t
+
+    # Dense scan found nothing (OCR dead zone). Fall back to the earliest visual
+    # signal in [prev_t, coarse_t] — VHS head-switch noise that killed OCR also
+    # typically produces a black frame or scene cut at the true boundary.
+    if visual_times:
+        anchors = [vt for vt in visual_times if prev_t <= vt <= coarse_t]
+        if anchors:
+            return min(anchors), "visual"
+
+    return coarse_t, "coarse"
 
 
 def snap_to_keyframe(video: str, t: float, look_back: float = 30.0) -> float:
@@ -832,10 +848,11 @@ def main():
                     help="JSON file to cache OCR scan results (saves time on re-runs)")
     ap.add_argument("--visual-cache", default=None,
                     help="JSON file to cache scene-cut/black-frame detection (saves time on re-runs)")
-    ap.add_argument("--enable-visual-fusion", action="store_true",
-                    help="Require scene-cut/black-frame corroboration for OCR boundaries (experimental: "
-                         "VHS pause/resume often has no visual discontinuity, so this can reject real "
-                         "boundaries — off by default)")
+    ap.add_argument("--enable-visual-fusion", action="store_true", default=True,
+                    help="Run visual boundary detection (scene cuts + black frames) to anchor cuts "
+                         "in OCR dead zones where every frame returns None (default: on)")
+    ap.add_argument("--no-visual-fusion", dest="enable_visual_fusion", action="store_false",
+                    help="Disable visual boundary detection (faster; may misplace cuts at VHS head-switch noise zones)")
     ap.add_argument("--fuse-window", type=float, default=DEFAULT_FUSE_WINDOW,
                     help="Seconds of padding around [prev_t, video_t] to search for a corroborating visual signal")
     ap.add_argument("--min-clip", type=float, default=DEFAULT_MIN_CLIP_S,
@@ -871,12 +888,14 @@ def main():
 
     boundaries = find_all_boundaries(samples, gap_s=args.gap)
 
+    visual_times: list[float] = []
     if args.enable_visual_fusion:
         print("\nDetecting visual boundaries (scene cuts + black frames)...")
         scene_cuts, black_frames = detect_visual_boundaries(
             video, args.scene_threshold, args.black_min_duration, cache_path=visual_cache
         )
         print(f"  scene cuts: {len(scene_cuts)}  black frames: {len(black_frames)}")
+        visual_times = sorted(scene_cuts + black_frames)
         before = len(boundaries)
         boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, args.fuse_window)
         print(
@@ -922,9 +941,12 @@ def main():
         for vt in cut_ts[1:]:
             b = boundary_map.get(vt)
             if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
-                refined_t = refine_split(video, vt, b.prev_t, b.prev_dt, args.gap, args.crop, tmpdir)
+                refined_t, method = refine_split(
+                    video, vt, b.prev_t, b.prev_dt, args.gap, args.crop, tmpdir, visual_times
+                )
                 saved = vt - refined_t
-                print(f"  coarse={vt:.0f}s → refined={refined_t:.0f}s  (saved {saved:.0f}s)")
+                method_tag = f" [{method}]" if method != "ocr" else ""
+                print(f"  coarse={vt:.0f}s → refined={refined_t:.0f}s  (saved {saved:.0f}s){method_tag}")
                 splits.append(refined_t)
             else:
                 splits.append(vt)
