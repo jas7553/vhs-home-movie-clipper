@@ -591,9 +591,11 @@ def refine_split(
         else:
             last_old_t = t
 
-    # Splice Dead Zone: entire window was all-None. Anchor to the LAST visual
-    # event within [prev_t, coarse_t) — end of noise burst, not start.
-    if not any_ocr and visual_times:
+    # Splice Dead Zone only (< 120s None-span): anchor to LAST visual event
+    # within [prev_t, coarse_t) — end of noise burst, not start.
+    # Long Dead Zones (>= 120s) are out of scope; skip visual anchor there.
+    splice_dead_zone = (coarse_t - prev_t) < 120.0
+    if not any_ocr and splice_dead_zone and visual_times:
         anchors = [vt for vt in visual_times if prev_t <= vt < coarse_t]
         if anchors:
             return max(anchors), "visual"
