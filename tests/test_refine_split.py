@@ -127,15 +127,15 @@ class TestRefineSplit:
         assert t == 15.0
         assert method == "visual"
 
-    def test_visual_anchor_picks_earliest_in_window(self):
-        # Two visual signals in window: pick the earliest.
+    def test_visual_anchor_picks_last_in_window(self):
+        # Two visual signals in window: pick the last (end of noise burst).
         t, method = _run(
             coarse_t=20.0, prev_t=10.0,
             extract_side_effect=lambda v, t, c, d: None,
             ocr_map={},
             visual_times=[17.0, 13.0, 25.0],
         )
-        assert t == 13.0
+        assert t == 17.0
         assert method == "visual"
 
     def test_visual_anchor_outside_window_ignored(self):
