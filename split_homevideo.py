@@ -40,6 +40,7 @@ DEFAULT_SCENE_THRESHOLD = 0.4
 DEFAULT_BLACK_MIN_DURATION = 0.1
 DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
 DEFAULT_MIN_CLIP_S = 120.0     # clips shorter than this are merged into prior clip; validated on golden set
+ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refinement-collision slivers
 
 _CACHE_FORMAT = 2              # increment when cache schema changes; forces re-scan on old caches
 _VISUAL_CACHE_FORMAT = 1
@@ -920,7 +921,9 @@ def main():
 
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
 
-    effective_min_clip = 0.0 if args.mode == "daily" else args.min_clip
+    # Daily mode keeps all date changes regardless of duration, but still collapses
+    # sub-second slivers that result from two refined cuts landing 1s apart.
+    effective_min_clip = ARTIFACT_MIN_S if args.mode == "daily" else args.min_clip
 
     if args.dry_run:
         splits: list[float] = [0.0] + list(cut_ts[1:])
