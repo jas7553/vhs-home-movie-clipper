@@ -19,3 +19,15 @@ ocr_timestamp
 
 # Claude Code project settings
 .claude/
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*_credentials.json
+
+# Vision-refine prototype scratch (exported frames + manifest)
+vision_frames/
+
+# Local scratch: caches, generated clips, preserved readings backups (multi-GB)
+archive/
