@@ -115,4 +115,4 @@ Zones the binary can't, confirming they're single-day and shouldn't move.
   the remaining Splice Dead Zone frames are still ~1600 — read only the boundaries under audit.
 - **Placement-late is not a refinement problem.** Pulling those cuts earlier needs a *wider*
   window or forward reading past `coarse_t` — out of current scope.
-- Not yet run: full pipeline cut + clip audit vs the 8-FAIL baseline.
+- **Full pipeline audit run (2026-06-19):** 52 clips produced, no duplicate dates, chronological order, no misread dates in filenames. The pre-fix "8-FAIL baseline" is superseded — phantom collapse + refine fixes removed all known phantom clips. Pipeline placement error: **17.1s median** (28/40 SDZ boundaries, coarse baseline 22.5s).
