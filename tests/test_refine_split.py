@@ -49,8 +49,8 @@ class TestRefineSplit:
         assert method == "coarse"
 
     def test_detects_forward_jump(self):
-        # Frame at t=15 jumps; last_old_t still == prev_t (no confirmed old frames before it)
-        # → return prev_t + 1 = 11.0
+        # Frame at t=15 jumps; no confirmed old frames in window (last_old_t=prev_t=10).
+        # Cut = max(last_old_t+1, t-1) = max(11, 14) = 14: just before first confirmed new.
         path = "/tmp/frame_15.000.bmp"
         # cam_advance = 600s, video_advance = 5s; 600 > 5+300 → jump
         t, method = _run(
@@ -58,11 +58,12 @@ class TestRefineSplit:
             extract_side_effect=lambda v, t, c, d: path if t == 15 else None,
             ocr_map={path: "5:10 PM\n 1/ 4/90"},
         )
-        assert t == 11.0  # last_old_t(10) + 1
+        assert t == 14.0  # max(last_old_t(10)+1, t(15)-1) = max(11, 14) = 14
         assert method == "ocr"
 
     def test_old_session_frame_advances_last_old_t(self):
-        # t=14 confirms old session; t=15 jumps → return last_old_t(14) + 1 = 15
+        # t=14 confirms old session; t=15 jumps.
+        # Cut = max(last_old_t+1, t-1) = max(15, 14) = 15: keeps 14 in old clip.
         path14 = "/tmp/frame_14.000.bmp"
         path15 = "/tmp/frame_15.000.bmp"
 
@@ -80,18 +81,44 @@ class TestRefineSplit:
             # t=15: cam_advance=600s, video_advance=5s → jump
             ocr_map={path14: "5:04 PM\n 1/ 4/90", path15: "5:10 PM\n 1/ 4/90"},
         )
-        assert t == 15.0
+        assert t == 15.0  # max(14+1, 15-1) = max(15, 14) = 15
+        assert method == "ocr"
+
+    def test_garbled_old_frames_between_sessions(self):
+        # t=13 confirms old session; t=14,t=16 extract but OCR fails (garbled old-session);
+        # t=17 jumps (new session). Cut = max(last_old_t+1, t-1) = max(14, 16) = 16:
+        # garbled frames 14-15 stay in old clip, new clip starts at 16 (just before clean new).
+        path13 = "/tmp/frame_13.000.bmp"
+        path14 = "/tmp/frame_14.000.bmp"
+        path16 = "/tmp/frame_16.000.bmp"
+        path17 = "/tmp/frame_17.000.bmp"
+
+        def extract(v, t, c, d):
+            return {13: path13, 14: path14, 16: path16, 17: path17}.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map={
+                path13: "5:03 PM\n 1/ 4/90",  # old session confirmed
+                path14: "5:03 PM 4/90",         # garbled (missing month) → None
+                path16: "5:03 PM 4/90",         # garbled → None
+                path17: "5:10 PM\n 1/ 4/90",   # cam_advance=420s > 7+300 → jump
+            },
+        )
+        assert t == 16.0  # max(13+1, 17-1) = max(14, 16) = 16
         assert method == "ocr"
 
     def test_detects_backward_jump(self):
-        # cam_advance < -1800 → backward jump triggers split; last_old_t still prev_t
+        # cam_advance < -1800 → backward jump triggers split; last_old_t still prev_t=10.
+        # Cut = max(last_old_t+1, t-1) = max(11, 14) = 14.
         path = "/tmp/frame_15.000.bmp"
         t, method = _run(
             coarse_t=20.0, prev_t=10.0,
             extract_side_effect=lambda v, t, c, d: path if t == 15 else None,
             ocr_map={path: "10:00 AM\n 1/ 4/90"},
         )
-        assert t == 11.0  # last_old_t(10) + 1
+        assert t == 14.0  # max(10+1, 15-1) = max(11, 14) = 14
         assert method == "ocr"
 
     def test_skips_none_frames(self):
@@ -201,6 +228,7 @@ class TestRefineSplit:
 
     def test_ocr_result_takes_priority_over_visual(self):
         # OCR finds a jump at t=15; visual at 13s should be ignored.
+        # Cut = max(last_old_t+1, t-1) = max(11, 14) = 14.
         path = "/tmp/frame_15.000.bmp"
         t, method = _run(
             coarse_t=20.0, prev_t=10.0,
@@ -208,7 +236,7 @@ class TestRefineSplit:
             ocr_map={path: "5:10 PM\n 1/ 4/90"},
             visual_times=[13.0],
         )
-        assert t == 11.0
+        assert t == 14.0  # OCR wins over visual; max(11, 14) = 14
         assert method == "ocr"
 
     def test_visual_times_none_falls_back_to_coarse(self):

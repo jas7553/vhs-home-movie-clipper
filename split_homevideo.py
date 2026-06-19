@@ -877,7 +877,10 @@ def refine_split(
         cam_advance = (dt - prev_dt).total_seconds()
         video_advance = float(t) - prev_t
         if cam_advance > video_advance + gap_s or cam_advance < -1800:
-            return float(last_old_t) + 1.0, "ocr"
+            # Cut just before first confirmed new session, but never before
+            # last confirmed old (handles garbled-but-real old frames between them).
+            cut = max(float(last_old_t) + 1.0, float(t) - 1.0)
+            return cut, "ocr"
         else:
             last_old_t = t
 
