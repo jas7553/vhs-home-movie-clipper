@@ -118,7 +118,7 @@ class TestRefineSplit:
         # Old session confirmed at t=14; frames after t=14 extract but OCR gives garbled
         # new-session text (missing day field, like '11:43 AM 5/90'). parse_timestamp
         # rejects them → no cam_advance check fires. But because frames were extracted
-        # after last_old_t, we know the transition is there: cut at last_old_t+1=15.
+        # after last_old_t within a Splice Dead Zone window, cut at last_old_t+1=15.
         path14 = "/tmp/frame_14.000.bmp"
         path16 = "/tmp/frame_16.000.bmp"
 
@@ -130,7 +130,7 @@ class TestRefineSplit:
             return None
 
         t, method = _run(
-            coarse_t=20.0, prev_t=10.0,
+            coarse_t=20.0, prev_t=10.0,  # 20-10=10s < SPLICE_DEAD_ZONE_MAX_S
             extract_side_effect=extract,
             ocr_map={
                 path14: "5:04 PM\n 1/ 4/90",  # old session, cam_advance=240s < 5+300
@@ -139,6 +139,30 @@ class TestRefineSplit:
         )
         assert t == 15.0   # last_old_t(14) + 1
         assert method == "ocr"
+
+    def test_garbled_new_session_long_dead_zone_falls_back_to_coarse(self):
+        # Same garbled pattern as above but window >= SPLICE_DEAD_ZONE_MAX_S (120s).
+        # Long Dead Zone: fix must NOT fire; fall back to coarse_t.
+        path14 = "/tmp/frame_14.000.bmp"
+        path16 = "/tmp/frame_16.000.bmp"
+
+        def extract(v, t, c, d):
+            if t == 14:
+                return path14
+            if t == 16:
+                return path16
+            return None
+
+        t, method = _run(
+            coarse_t=200.0, prev_t=10.0,  # 200-10=190s >= SPLICE_DEAD_ZONE_MAX_S
+            extract_side_effect=extract,
+            ocr_map={
+                path14: "5:04 PM\n 1/ 4/90",
+                path16: "11:43 AM 5/90",
+            },
+        )
+        assert t == 200.0  # Long Dead Zone → coarse_t
+        assert method == "coarse"
 
     # --- visual anchor fallback (OCR dead zone) ---
 
