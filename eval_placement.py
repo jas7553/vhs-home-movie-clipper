@@ -24,7 +24,10 @@ from datetime import datetime
 from pathlib import Path
 from statistics import median
 
-import anthropic
+try:
+    import anthropic  # only needed for the paid binary-search path
+except ImportError:
+    anthropic = None
 
 DEFAULT_CROP = "250:110:385:370"
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -143,6 +146,41 @@ def load_sdz_boundaries(cache_path: str) -> list[dict]:
     return boundaries
 
 
+# ── readings-based true change (free path, no API) ─────────────────────────────
+
+def load_readings_by_coarse(readings_path: str) -> dict[int, dict[int, datetime | None]]:
+    """Group a filename->reading map (b<coarse>_t<t>.png) by coarse int.
+
+    Each group is {t: parsed_date | None}; NOISE/NONE/unparseable collapse to None
+    (the old/non-new side), matching find_true_change's classification.
+    """
+    with open(readings_path) as f:
+        raw = json.load(f)
+    by_coarse: dict[int, dict[int, datetime | None]] = {}
+    for name, text in raw.items():
+        m = re.match(r'b0*(\d+)_t0*(\d+)\.png', name)
+        if not m:
+            continue
+        coarse, t = int(m.group(1)), int(m.group(2))
+        by_coarse.setdefault(coarse, {})[t] = parse_date_text(text)
+    return by_coarse
+
+
+def true_change_from_readings(
+    group: dict[int, datetime | None], old_dt: datetime,
+) -> float | None:
+    """First t whose reading is a NEW-side date (a real date != old session).
+
+    Mirrors find_true_change: NOISE/NONE/unread count as the old side. Returns None
+    when no new-side date appears in the readings (transition not captured → skip).
+    """
+    for t in sorted(group):
+        dt = group[t]
+        if dt is not None and dt.date() != old_dt.date():
+            return float(t)
+    return None
+
+
 # ── binary search for true change ─────────────────────────────────────────────
 
 def find_true_change(
@@ -253,6 +291,10 @@ def main():
     ap.add_argument("--clips-dir", default=None, help="Directory of output clips (default: <stem>_clips)")
     ap.add_argument("--crop", default=DEFAULT_CROP)
     ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--readings", default=None, metavar="PATH",
+                    help="Derive true_change from a free-path readings.json (b<coarse>_t<t>.png "
+                         "-> timestamp/NOISE/NONE) instead of the paid binary-search API. "
+                         "Boundaries with no new-side reading are skipped.")
     ap.add_argument("--dry-run", action="store_true", help="Print boundaries from cache only; no vision calls")
     ap.add_argument("--search-window", type=float, default=60.0,
                     help="Seconds before coarse_t to start binary search (default 60)")
@@ -288,9 +330,16 @@ def main():
         total_dur = clip_starts[-1][1] + clip_duration(clip_starts[-1][0])
         print(f"  {len(clip_starts)} clips, total duration {total_dur:.0f}s\n")
 
-    client = anthropic.Anthropic()
+    readings_by_coarse = load_readings_by_coarse(args.readings) if args.readings else None
+    if readings_by_coarse is None:
+        if anthropic is None:
+            sys.exit("anthropic package not installed — use --readings for the free path.")
+        client = anthropic.Anthropic()
+    else:
+        client = None
     results = []
     total_calls = 0
+    skipped = 0
 
     for i, b in enumerate(boundaries, 1):
         coarse_t = b["coarse_t"]
@@ -300,13 +349,25 @@ def main():
         hi = coarse_t + 5.0  # small buffer past coarse
 
         print(f"[{i:2d}/{len(boundaries)}] coarse={coarse_t:.0f}s  {old_date} → {new_date}")
-        print(f"         binary search [{lo:.0f}s, {hi:.0f}s]...")
 
-        true_change, calls = find_true_change(
-            client, video, lo, hi, old_date, new_date, args.crop, args.model
-        )
-        total_calls += calls
-        print(f"         true_change={true_change:.0f}s  ({calls} vision calls)")
+        if readings_by_coarse is not None:
+            # Match the readings group by nearest coarse int (tolerate rounding drift).
+            ckey = min(readings_by_coarse, key=lambda c: abs(c - coarse_t), default=None)
+            group = readings_by_coarse.get(ckey) if ckey is not None and abs(ckey - coarse_t) <= 5 else None
+            true_change = true_change_from_readings(group, b["old_dt"]) if group else None
+            calls = 0
+            if true_change is None:
+                skipped += 1
+                print("         true_change=?  (no new-side reading — skipped)")
+                continue
+            print(f"         true_change={true_change:.0f}s  (from readings)")
+        else:
+            print(f"         binary search [{lo:.0f}s, {hi:.0f}s]...")
+            true_change, calls = find_true_change(
+                client, video, lo, hi, old_date, new_date, args.crop, args.model
+            )
+            total_calls += calls
+            print(f"         true_change={true_change:.0f}s  ({calls} vision calls)")
 
         pipeline_cut = find_pipeline_cut_for_boundary(clip_starts, coarse_t, new_date)
         if pipeline_cut is not None:
@@ -337,8 +398,10 @@ def main():
     coarse_errors = [r["coarse_error_s"] for r in results]
 
     print("=" * 60)
-    print(f"Splice Dead Zone boundaries evaluated: {len(results)}")
-    print(f"Vision calls total: {total_calls}")
+    print(f"Splice Dead Zone boundaries evaluated: {len(results)}"
+          + (f"  (skipped {skipped} with no new-side reading)" if skipped else ""))
+    if readings_by_coarse is None:
+        print(f"Vision calls total: {total_calls}")
     if errors:
         print("\nPlacement error (pipeline vs true_change):")
         print(f"  median : {median(errors):.1f}s")
