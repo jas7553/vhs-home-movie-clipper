@@ -31,6 +31,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import anthropic
 
 # --- defaults ---
 DEFAULT_INTERVAL = 10          # sample every N seconds
@@ -577,7 +581,7 @@ def _vision_frame_name(coarse_t: float, t: int) -> str:
     return f"b{int(coarse_t):06d}_t{int(t):06d}.png"
 
 
-def vision_read_frame(client, png_path: str) -> tuple[object, int, int]:
+def vision_read_frame(client: Any, png_path: str) -> tuple[datetime | str | None, int, int]:
     """Ask Haiku to read the timestamp in one frame.
 
     Returns (reading, input_tokens, output_tokens) where reading is a datetime
@@ -609,7 +613,7 @@ def vision_read_frame(client, png_path: str) -> tuple[object, int, int]:
 
 
 def _resolve_vision_cut(
-    window: list[int], readings: dict[int, object],
+    window: list[int], readings: dict[int, datetime | str | None],
     coarse_t: float, prev_t: float, prev_dt: datetime, gap_s: int,
 ) -> tuple[float, str]:
     """Walk a window of per-frame readings (datetime | "NOISE" | None) → cut point.
@@ -639,12 +643,14 @@ def _resolve_vision_cut(
             continue
         if reading is None:
             continue                            # ordinary footage / no legible timestamp
-        # reading is a datetime
+        # reading is a datetime (NOISE filtered above, None filtered above)
+        if not isinstance(reading, datetime):
+            continue
         saw_signal = True
         if is_jump(reading, t):
             nxt = next(((tt, rr) for tt, rr in seq[i + 1:]
                         if rr != "NOISE" and rr is not None), None)
-            if nxt is None or is_jump(nxt[1], nxt[0]):
+            if nxt is None or (isinstance(nxt[1], datetime) and is_jump(nxt[1], nxt[0])):
                 return float(last_old_t) + 1.0, "vision"  # confirmed new session
             continue                            # lone outlier — ignore, don't advance
         last_old_t = t
@@ -672,16 +678,16 @@ def _refine_split_vision(
         for future in as_completed(future_to_t):
             paths[future_to_t[future]] = future.result()
 
-    readings: dict[int, object] = {}
+    readings: dict[int, datetime | str | None] = {}
     tot_in = tot_out = 0
     valid = [(t, p) for t in window if (p := paths.get(t)) is not None]
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_t = {
+        vision_future_to_t = {
             executor.submit(vision_read_frame, client, p): t for t, p in valid
         }
-        for future in as_completed(future_to_t):
-            reading, in_tok, out_tok = future.result()
-            readings[future_to_t[future]] = reading
+        for vfuture in as_completed(vision_future_to_t):
+            reading, in_tok, out_tok = vfuture.result()
+            readings[vision_future_to_t[vfuture]] = reading
             tot_in += in_tok
             tot_out += out_tok
 
@@ -692,12 +698,12 @@ def _refine_split_vision(
 
 def _readings_for_window(
     coarse_t: float, window: list[int], readings_map: dict[str, str],
-) -> dict[int, object]:
+) -> dict[int, datetime | str | None]:
     """Translate a filename-keyed readings JSON into a t-keyed reading dict for one window.
 
     Unread frames are simply absent (walker skips them) — partial readings still work.
     """
-    out: dict[int, object] = {}
+    out: dict[int, datetime | str | None] = {}
     for t in window:
         key = _vision_frame_name(coarse_t, t)
         if key not in readings_map:
@@ -812,7 +818,7 @@ def refine_split(
     crop: str,
     tmpdir: str,
     visual_times: list[float] | None = None,
-    vision_client: "anthropic.Anthropic | None" = None,  # noqa: F821 (anthropic imported lazily)
+    vision_client: "anthropic.Anthropic | None" = None,
     vision_readings: dict[str, str] | None = None,
 ) -> tuple[float, str]:
     """
