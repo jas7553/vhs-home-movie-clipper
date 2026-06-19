@@ -145,3 +145,17 @@ class TestConsecutiveBoundaries:
         ]
         result = filter_ocr_outliers(samples)
         assert (120.0, dt(14, 0)) not in result
+
+    def test_far_neighbor_consistent_keeps_reading(self):
+        # valid[2]=(120, 14:00): immediate prev (10:02) and next (10:06) are
+        # inconsistent, but far next valid[4]=(240, 14:04) IS consistent
+        # (drift = |240-120| = 120s < 900s). Lines 328-329: far_next=True → keep.
+        samples = [
+            (0.0,   dt(10, 0)),
+            (60.0,  dt(10, 2)),
+            (120.0, dt(14, 0)),  # immediate neighbors inconsistent; far next consistent
+            (180.0, dt(10, 6)),
+            (240.0, dt(14, 4)),  # far next: drift with (120, 14:00) = 120s < 900s
+        ]
+        result = filter_ocr_outliers(samples)
+        assert (120.0, dt(14, 0)) in result

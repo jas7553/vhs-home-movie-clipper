@@ -84,6 +84,14 @@ class TestLabelFor:
         filtered = [(0.0, prev), (10.0, misread), (20.0, nxt)]
         assert _label_for(filtered, 10.0) == nxt.strftime("%Y-%m-%d_%H%M")
 
+    def test_stable_consecutive_confirmed_by_next(self):
+        # Both readings advance only ~1 min in 60s of video — not a jump.
+        # _reading_confirmed returns True via the "not jumped" branch (line 1074).
+        a = datetime(1990, 1, 4, 17, 0)
+        b = datetime(1990, 1, 4, 17, 1)
+        filtered = [(0.0, a), (60.0, b)]
+        assert _label_for(filtered, 0.0) == a.strftime("%Y-%m-%d_%H%M")
+
 
 class TestSplitVideo:
     def test_creates_output_dir(self, tmp_path):

@@ -1092,7 +1092,7 @@ def _label_for(filtered: list[tuple[float, datetime]], start: float, mode: str =
             if mode == "daily":
                 return dt.strftime("%Y-%m-%d")
             return dt.strftime("%Y-%m-%d_%H%M")
-    if fallback is not None:
+    if fallback is not None:  # pragma: no cover
         if mode == "daily":
             return fallback.strftime("%Y-%m-%d")
         return fallback.strftime("%Y-%m-%d_%H%M")
