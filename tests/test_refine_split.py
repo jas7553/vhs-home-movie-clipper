@@ -142,50 +142,72 @@ class TestRefineSplit:
         assert method == "coarse"
 
     def test_garbled_new_session_after_confirmed_old(self):
-        # Old session confirmed at t=14; frames after t=14 extract but OCR gives garbled
-        # new-session text (missing day field, like '11:43 AM 5/90'). parse_timestamp
-        # rejects them → no cam_advance check fires. But because frames were extracted
-        # after last_old_t within a Splice Dead Zone window, cut at last_old_t+1=15.
-        path14 = "/tmp/frame_14.000.bmp"
-        path16 = "/tmp/frame_16.000.bmp"
+        # Old session confirmed at t=5; garbled frames extracted at t=18,19 (coarse_t=20).
+        # Gap = coarse_t - last_old_t = 20-5 = 15 > 10 → substantial gap, fix fires.
+        path5 = "/tmp/frame_5.000.bmp"
+        path18 = "/tmp/frame_18.000.bmp"
 
         def extract(v, t, c, d):
-            if t == 14:
-                return path14
-            if t == 16:
-                return path16
+            if t == 5:
+                return path5
+            if t == 18:
+                return path18
             return None
 
         t, method = _run(
-            coarse_t=20.0, prev_t=10.0,  # 20-10=10s < SPLICE_DEAD_ZONE_MAX_S
+            coarse_t=20.0, prev_t=1.0,  # 20-1=19s < SPLICE_DEAD_ZONE_MAX_S
             extract_side_effect=extract,
             ocr_map={
-                path14: "5:04 PM\n 1/ 4/90",  # old session, cam_advance=240s < 5+300
-                path16: "11:43 AM 5/90",       # garbled new-session (missing day)
+                path5:  "5:04 PM\n 1/ 4/90",  # old session (cam_advance=240s < 4+300)
+                path18: "11:43 AM 5/90",        # garbled new-session (missing day)
             },
         )
-        assert t == 15.0   # last_old_t(14) + 1
+        assert t == 6.0    # last_old_t(5) + 1; gap=15 > 10 → fix fires
         assert method == "ocr"
 
-    def test_garbled_new_session_long_dead_zone_falls_back_to_coarse(self):
-        # Same garbled pattern as above but window >= SPLICE_DEAD_ZONE_MAX_S (120s).
-        # Long Dead Zone: fix must NOT fire; fall back to coarse_t.
-        path14 = "/tmp/frame_14.000.bmp"
-        path16 = "/tmp/frame_16.000.bmp"
+    def test_garbled_small_gap_falls_back_to_coarse(self):
+        # Old session confirmed at t=17; garbled frame at t=18 (coarse_t=20).
+        # Gap = 20-17 = 3 ≤ 10 → normal end-of-window sparseness, fix must NOT fire.
+        path17 = "/tmp/frame_17.000.bmp"
+        path18 = "/tmp/frame_18.000.bmp"
 
         def extract(v, t, c, d):
-            if t == 14:
-                return path14
-            if t == 16:
-                return path16
+            if t == 17:
+                return path17
+            if t == 18:
+                return path18
             return None
 
         t, method = _run(
-            coarse_t=200.0, prev_t=10.0,  # 200-10=190s >= SPLICE_DEAD_ZONE_MAX_S
+            coarse_t=20.0, prev_t=10.0,
             extract_side_effect=extract,
             ocr_map={
-                path14: "5:04 PM\n 1/ 4/90",
-                path16: "11:43 AM 5/90",
+                path17: "5:04 PM\n 1/ 4/90",
+                path18: "11:43 AM 5/90",
+            },
+        )
+        assert t == 20.0   # gap=3 ≤ 10 → coarse_t
+        assert method == "coarse"
+
+    def test_garbled_new_session_long_dead_zone_falls_back_to_coarse(self):
+        # Window >= SPLICE_DEAD_ZONE_MAX_S (120s) with substantial post-old gap.
+        # Long Dead Zone: fix must NOT fire; fall back to coarse_t.
+        path5 = "/tmp/frame_5.000.bmp"
+        path18 = "/tmp/frame_18.000.bmp"
+
+        def extract(v, t, c, d):
+            if t == 5:
+                return path5
+            if t == 18:
+                return path18
+            return None
+
+        t, method = _run(
+            coarse_t=200.0, prev_t=1.0,  # 200-1=199s >= SPLICE_DEAD_ZONE_MAX_S
+            extract_side_effect=extract,
+            ocr_map={
+                path5:  "5:04 PM\n 1/ 4/90",
+                path18: "11:43 AM 5/90",
             },
         )
         assert t == 200.0  # Long Dead Zone → coarse_t

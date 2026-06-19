@@ -886,10 +886,11 @@ def refine_split(
 
     # Old-session confirmed at last_old_t but new-session OCR garbled (extracted frames
     # after last_old_t but parse_timestamp rejected them — e.g. missing day field).
-    # Only apply within Splice Dead Zone range; Long Dead Zones fall back to coarse_t
-    # (same policy as the visual anchor below).
+    # Guards: Splice Dead Zone only; gap after last confirmed old must be > 10s
+    # (1 coarse interval) so normal end-of-window sparseness doesn't trigger this.
     if (any_ocr
             and (coarse_t - prev_t) < SPLICE_DEAD_ZONE_MAX_S
+            and (coarse_t - last_old_t) > 10
             and any(paths.get(t) is not None for t in window if t > last_old_t)):
         return float(last_old_t) + 1.0, "ocr"
 
