@@ -22,10 +22,12 @@ import glob
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -820,7 +822,7 @@ def refine_split(
     visual_times: list[float] | None = None,
     vision_client: "anthropic.Anthropic | None" = None,
     vision_readings: dict[str, str] | None = None,
-) -> tuple[float, str]:
+) -> tuple[float, str, str]:
     """
     Dense 1s scan of [prev_t+1, coarse_t) to find the transition point.
 
@@ -833,21 +835,24 @@ def refine_split(
     [prev_t, coarse_t) — end of the noise burst, not the start. Fallback when no
     visual event exists in the span: coarse_t (end of None-span).
 
-    Returns (refined_t, method) where method is 'ocr', 'visual', or 'coarse'.
+    Returns (refined_t, method, detail) where method is 'ocr', 'visual', or 'coarse'
+    and detail carries diagnostic context (LDZ span, SDZ-no-anchor, etc.).
     """
     window = list(range(int(prev_t) + 1, int(coarse_t)))
     if not window:
-        return coarse_t, "coarse"
+        return coarse_t, "coarse", "empty-window"
 
     # PROTOTYPE: vision-refine replaces the OCR binary + visual anchor with vision readings.
     # Readings file (free, pre-read by Claude Code) takes precedence over the live API path.
     if vision_readings is not None:
         rdict = _readings_for_window(coarse_t, window, vision_readings)
-        return _resolve_vision_cut(window, rdict, coarse_t, prev_t, prev_dt, gap_s)
+        refined_t, method = _resolve_vision_cut(window, rdict, coarse_t, prev_t, prev_dt, gap_s)
+        return refined_t, method, ""
     if vision_client is not None:
-        return _refine_split_vision(
+        refined_t, method = _refine_split_vision(
             video, coarse_t, prev_t, prev_dt, gap_s, crop, tmpdir, window, vision_client
         )
+        return refined_t, method, ""
 
     # Extract all frames in the refinement window in parallel, then batch OCR
     workers = (os.cpu_count() or 4) * 2
@@ -880,7 +885,7 @@ def refine_split(
             # Cut just before first confirmed new session, but never before
             # last confirmed old (handles garbled-but-real old frames between them).
             cut = max(float(last_old_t) + 1.0, float(t) - 1.0)
-            return cut, "ocr"
+            return cut, "ocr", ""
         else:
             last_old_t = t
 
@@ -892,18 +897,23 @@ def refine_split(
             and (coarse_t - prev_t) < SPLICE_DEAD_ZONE_MAX_S
             and (coarse_t - last_old_t) > 10
             and any(paths.get(t) is not None for t in window if t > last_old_t)):
-        return float(last_old_t) + 1.0, "ocr"
+        return float(last_old_t) + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s"
 
     # Splice Dead Zone only (< 120s None-span): anchor to LAST visual event
     # within [prev_t, coarse_t) — end of noise burst, not start.
     # Long Dead Zones (>= 120s) are out of scope; skip visual anchor there.
-    splice_dead_zone = (coarse_t - prev_t) < SPLICE_DEAD_ZONE_MAX_S
+    span = coarse_t - prev_t
+    splice_dead_zone = span < SPLICE_DEAD_ZONE_MAX_S
     if not any_ocr and splice_dead_zone and visual_times:
         anchors = [vt for vt in visual_times if prev_t <= vt < coarse_t]
         if anchors:
-            return max(anchors), "visual"
+            return max(anchors), "visual", ""
 
-    return coarse_t, "coarse"
+    if not any_ocr:
+        detail = f"SDZ {span:.0f}s no-anchor" if splice_dead_zone else f"LDZ {span:.0f}s"
+    else:
+        detail = "all-old-in-window"
+    return coarse_t, "coarse", detail
 
 
 def snap_to_keyframe(video: str, t: float, look_back: float = 30.0) -> float:
@@ -1125,7 +1135,7 @@ def split_video(
     for old in stale:
         os.remove(old)
     if stale:
-        print(f"  (removed {len(stale)} clip(s) from a previous run)")
+        print(f"stale_removed count={len(stale)}")
 
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
@@ -1133,7 +1143,7 @@ def split_video(
         out_path = os.path.join(out_dir, f"{stem}_clip{idx+1:02d}_{label}.mp4")
         exact_start = start if idx > 0 else None
         exact_end = splits[idx + 1] if idx + 1 < len(splits) else None
-        print(f"  clip {idx+1:02d}: {start:.1f}s → {end:.1f}s  ({label})  → {out_path}")
+        print(f"cutting clip={idx+1:02d} start={start:.1f} end={end:.1f} date={label} out={out_path}")
         cut_clip_with_boundary_encode(video, start, end, exact_start, exact_end, out_path)
 
 
@@ -1201,32 +1211,32 @@ def main() -> None:
     if not OCR_BIN.exists():
         sys.exit(f"ocr_timestamp binary not found at {OCR_BIN}. Run: swiftc -O ocr_timestamp.swift -o ocr_timestamp")
 
-    print(f"Scanning: {video}")
-    print(f"  interval={args.interval}s  gap={args.gap}s  mode={args.mode}  crop={args.crop}")
+    t0 = time.perf_counter()
+    phase_times: dict[str, float] = {}
+
+    print(f"scan file={video} interval={args.interval} gap={args.gap} mode={args.mode} crop={args.crop}")
     samples = scan(video, args.interval, args.crop, cache_path=cache)
+    phase_times["scan"] = time.perf_counter() - t0
 
     valid = [(t, dt) for t, dt in samples if dt]
-    print(f"\nOCR success: {len(valid)}/{len(samples)} frames")
-    if valid:
-        print(f"  date range: {valid[0][1].date()} → {valid[-1][1].date()}")
+    date_range = f" date_range={valid[0][1].date()}:{valid[-1][1].date()}" if valid else ""
+    print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
 
     boundaries = find_all_boundaries(samples, gap_s=args.gap)
 
     visual_times: list[float] = []
     if not args.dry_run and not args.no_visual_anchor and not args.vision_export:
-        print("\nDetecting visual boundaries (scene cuts + black frames)...")
+        t_vis = time.perf_counter()
         scene_cuts, black_frames = detect_visual_boundaries(
             video, args.scene_threshold, args.black_min_duration, cache_path=visual_cache
         )
-        print(f"  scene cuts: {len(scene_cuts)}  black frames: {len(black_frames)}")
         visual_times = sorted(scene_cuts + black_frames)
+        phase_times["visual"] = time.perf_counter() - t_vis
+        print(f"visual scene_cuts={len(scene_cuts)} black_frames={len(black_frames)}")
         if args.enable_visual_fusion:
             before = len(boundaries)
             boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, args.fuse_window)
-            print(
-                f"  confirmed {len(boundaries)}/{before} OCR boundary(ies) "
-                f"(visual corroboration within ±{args.fuse_window:.0f}s)"
-            )
+            print(f"visual_fusion confirmed={len(boundaries)} total={before} window={args.fuse_window:.0f}")
 
     cut_ts = group_clips(boundaries, args.mode, args.gap)
     duration = get_duration(video)
@@ -1255,17 +1265,17 @@ def main() -> None:
         before_merge = len(splits)
         splits = merge_short_clips(splits, effective_min_clip)
         if len(splits) < before_merge:
-            n = before_merge - len(splits)
-            print(f"\nMerged {n} clip(s) shorter than {effective_min_clip:.0f}s into their neighbor")
-        print(f"\nFound {len(splits)} clip(s) (boundary times ±{args.interval}s, not yet refined):")
+            print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
+        print(f"clips count={len(splits)} note=coarse_unrefined interval_error=+-{args.interval}s")
         for idx, start in enumerate(splits):
             end = splits[idx + 1] if idx + 1 < len(splits) else duration
             dur = end - start
             label = _label_for(filtered, start, args.mode)
             b = boundary_map.get(start)
-            btype = f" [{b.type}]" if b else ""
-            print(f"  {idx+1:3d}. {start:7.0f}s → {end:7.0f}s  ({dur/60:5.1f} min)  {label}{btype}")
-        print("\nDry run — not cutting.")
+            btype = f" btype={b.type}" if b else ""
+            print(f"clip {idx+1:02d} start={start:.0f} end={end:.0f}"
+                  f" dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}{btype}")
+        print("dry_run=true")
         return
 
     vision_readings = None
@@ -1284,39 +1294,52 @@ def main() -> None:
         print("  (vision-refine ON: reading refinement frames with Claude Haiku vision — paid API)")
 
     large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
-    print(f"\nRefining {large_gap_count} large_gap boundary(ies) at 1s resolution...")
+    print(f"refine count={large_gap_count}")
+    t_refine = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmpdir:
         splits = [0.0]
         for vt in cut_ts[1:]:
             b = boundary_map.get(vt)
             if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
-                refined_t, method = refine_split(
+                t_b = time.perf_counter()
+                refined_t, method, detail = refine_split(
                     video, vt, b.prev_t, b.prev_dt, args.gap, args.crop, tmpdir, visual_times,
                     vision_client=vision_client, vision_readings=vision_readings,
                 )
-                saved = vt - refined_t
-                method_tag = f" [{method}]" if method != "ocr" else ""
-                print(f"  coarse={vt:.0f}s → refined={refined_t:.0f}s  (saved {saved:.0f}s){method_tag}")
+                elapsed_b = time.perf_counter() - t_b
+                reason = f" reason={detail}" if detail else ""
+                print(f"boundary coarse={vt:.0f} refined={refined_t:.0f} saved={vt - refined_t:.0f}"
+                      f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
+                      f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={method}{reason}")
                 splits.append(refined_t)
             else:
                 splits.append(vt)
+    phase_times["refine"] = time.perf_counter() - t_refine
 
     before_merge = len(splits)
     splits = merge_short_clips(splits, effective_min_clip)
     if len(splits) < before_merge:
-        n = before_merge - len(splits)
-        print(f"\nMerged {n} clip(s) shorter than {effective_min_clip:.0f}s into their neighbor")
+        print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
 
-    print(f"\nFound {len(splits)} clip(s):")
+    print(f"clips count={len(splits)}")
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
         dur = end - start
         label = _label_for(filtered, start, args.mode)
-        print(f"  {idx+1:3d}. {start:7.0f}s → {end:7.0f}s  ({dur/60:5.1f} min)  {label}")
+        print(f"clip {idx+1:02d} start={start:.0f} end={end:.1f} dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}")
 
-    print(f"\nCutting into {out_dir}/")
+    print(f"cutting out_dir={out_dir}")
+    t_cut = time.perf_counter()
     split_video(video, splits, out_dir, filtered, args.mode)
-    print("Done.")
+    phase_times["cut"] = time.perf_counter() - t_cut
+
+    total = time.perf_counter() - t0
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
+    for phase, secs in phase_times.items():
+        print(f"phase name={phase} elapsed={secs:.1f} pct={100 * secs / total:.0f}")
+    print(f"total elapsed={total:.1f} peak_rss_mb={peak_mb:.0f} child_cpu={ru.ru_utime + ru.ru_stime:.1f}")
+    print("done")
 
 
 if __name__ == "__main__":
