@@ -12,12 +12,13 @@ _GAP = 300
 _PREV_DT = datetime(1990, 1, 4, 17, 0)
 
 
-def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None):
+def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None, interval=10):
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect), \
              mock.patch("split_homevideo.ocr_batch", return_value=ocr_map):
             t, method, _ = refine_split(
-                "vid.mp4", coarse_t, prev_t, _PREV_DT, _GAP, _CROP, tmpdir, visual_times
+                "vid.mp4", coarse_t, prev_t, _PREV_DT, _GAP, _CROP, tmpdir, visual_times,
+                interval=interval,
             )
             return t, method
 
@@ -273,22 +274,53 @@ class TestRefineSplit:
         assert t == 20.0
         assert method == "coarse"
 
-    def test_transition_at_int_coarse_t_is_found(self):
-        # coarse_t=16.67 (t_last_frame of a 10s/3fps bucket).
-        # Window must include int(coarse_t)=16 so the transition at t=16 is found.
-        # Old code: range(7, 16) → misses 16. New code: range(7, 17) → finds 16.
-        path16 = "/tmp/frame_16.000.bmp"
-        coarse_t = 2 * 10 / 3 * 5   # 5th frame (index 4) of a 3fps/10s scan...
-        # Simpler: use t_last_frame = (FRAMES_PER_SAMPLE-1)*interval/FRAMES_PER_SAMPLE * 3
-        # Actually: just use 16.67 which is int()=16
-        coarse_t = 50.0 / 3.0  # ≈ 16.667, int = 16
-        prev_t = 5.0
+    # --- coarse bucket tail coverage (regression: session change past coarse_t) ---
+
+    def test_change_inside_coarse_bucket_tail_found(self):
+        # The coarse scan majority-votes 3 frames per 10s bucket: the bucket at t=20
+        # samples the video at 20, 23.3, 26.7s. If 2/3 frames are new-session the bucket
+        # is labelled new at t=20, but the actual change is at 26s (inside the bucket tail).
+        # Old window [11,19] was all-old → old code returned coarse=20, leaking 6s of
+        # old footage into the new clip. Extended window [11,29] must find the change.
+        _OLD = "5:00 PM\n 1/ 4/90"   # cam_advance ≈ 0 relative to prev_dt → old session
+        _NEW = "5:10 PM\n 1/ 4/90"   # cam_advance = 600s → jump > GAP(300) → new session
+
+        paths = {t: f"/tmp/f{t}.bmp" for t in range(11, 30)}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        ocr_map = {paths[t]: (_OLD if t < 26 else _NEW) for t in range(11, 30)}
+
         t, method = _run(
-            coarse_t=coarse_t, prev_t=prev_t,
-            extract_side_effect=lambda v, sec, c, d: path16 if sec == 16 else None,
-            # cam_advance = 420s, video_advance = 11s; 420 > 11+300 → jump
-            ocr_map={path16: "5:07 PM\n 1/ 4/90"},
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map=ocr_map,
+            interval=10,
         )
-        # Cut = max(prev_t+1, 16-1) = max(6, 15) = 15
-        assert t == 15.0
+        # last_old_t=25 (t=25 reads old), first new=26 → cut = max(26, 25) = 26
+        assert t == 26.0
+        assert method == "ocr"
+
+    def test_change_at_coarse_t_itself_found(self):
+        # Session change at exactly coarse_t=20. Old window excluded coarse_t;
+        # extended window includes it and must find the change there.
+        _OLD = "5:00 PM\n 1/ 4/90"
+        _NEW = "5:10 PM\n 1/ 4/90"
+
+        paths = {t: f"/tmp/f{t}.bmp" for t in range(11, 30)}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        ocr_map = {paths[t]: (_OLD if t < 20 else _NEW) for t in range(11, 30)}
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map=ocr_map,
+            interval=10,
+        )
+        # last_old_t=19, first new=20 → cut = max(20, 19) = 20
+        assert t == 20.0
         assert method == "ocr"

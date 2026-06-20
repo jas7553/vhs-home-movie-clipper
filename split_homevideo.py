@@ -751,6 +751,7 @@ def _boundary_needs_vision(b: "Boundary") -> tuple[bool, str]:
 
 def _export_vision_frames(
     video: str, cut_ts: list[float], boundary_map: dict, crop: str, gap_s: int, export_dir: str,
+    interval: int = 10,
     force_all: bool = False,
 ) -> None:
     """Free path, phase 1: extract refinement-window PNGs + manifest.json, no API, no cut.
@@ -776,7 +777,7 @@ def _export_vision_frames(
             skipped += 1
             print(f"  boundary coarse={vt:.0f}s: skip — {reason}", flush=True)
             continue
-        window = list(range(int(b.prev_t) + 1, int(vt) + 1))
+        window = list(range(int(b.prev_t) + 1, int(vt) + interval))
         if not window:
             continue
         frames: list[dict] = []
@@ -826,9 +827,17 @@ def refine_split(
     visual_times: list[float] | None = None,
     vision_client: "anthropic.Anthropic | None" = None,
     vision_readings: dict[str, str] | None = None,
+    interval: int = 10,
 ) -> tuple[float, str, str]:
     """
-    Dense 1s scan of [prev_t+1, coarse_t) to find the transition point.
+    Dense 1s scan of [prev_t+1, coarse_t+interval) to find the transition point.
+
+    The window extends interval seconds past coarse_t because the coarse scan
+    majority-votes FRAMES_PER_SAMPLE frames that span [coarse_t, coarse_t +
+    (FRAMES_PER_SAMPLE-1)*interval/FRAMES_PER_SAMPLE]. The session change can
+    fall anywhere inside that span, so stopping at coarse_t leaves the tail
+    unscanned and causes contamination when the change is near the end of the
+    coarse bucket.
 
     Tracks the last frame confirming the OLD session and cuts there + 1s,
     rather than at the first NEW-session frame. This handles OCR returning None
@@ -836,13 +845,13 @@ def refine_split(
     frames belong to the old clip's tail, not the new clip's head.
 
     Splice Dead Zone (all-None window): anchors to the LAST visual event within
-    [prev_t, coarse_t) — end of the noise burst, not the start. Fallback when no
-    visual event exists in the span: coarse_t (end of None-span).
+    [prev_t, coarse_t+interval) — end of the noise burst, not the start. Fallback
+    when no visual event exists in the span: coarse_t (end of None-span).
 
     Returns (refined_t, method, detail) where method is 'ocr', 'visual', or 'coarse'
     and detail carries diagnostic context (LDZ span, SDZ-no-anchor, etc.).
     """
-    window = list(range(int(prev_t) + 1, int(coarse_t) + 1))
+    window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
     if not window:
         return coarse_t, "coarse", "empty-window"
 
@@ -1254,7 +1263,7 @@ def main() -> None:
     if args.vision_export:
         _export_vision_frames(
             video, cut_ts, boundary_map, args.crop, args.gap, args.vision_export,
-            force_all=args.vision_export_all,
+            interval=args.interval, force_all=args.vision_export_all,
         )
         return
 
@@ -1309,6 +1318,7 @@ def main() -> None:
                 refined_t, method, detail = refine_split(
                     video, vt, b.prev_t, b.prev_dt, args.gap, args.crop, tmpdir, visual_times,
                     vision_client=vision_client, vision_readings=vision_readings,
+                    interval=args.interval,
                 )
                 elapsed_b = time.perf_counter() - t_b
                 reason = f" reason={detail}" if detail else ""

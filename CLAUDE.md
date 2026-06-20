@@ -59,3 +59,17 @@ Two-file project:
 - **Detection vs Placement** (do not conflate): *Detection* = does a boundary exist near t (golden-set y/n, F1=0.920). *Placement* = how many seconds the cut lands from the true session change. They are independent — high F1 says nothing about placement accuracy. Placement has its own (human-labeled) ground truth on Splice Dead Zone boundaries; no placement change merges without a measured error. See `CONTEXT.md`.
 - **Splice Dead Zone** (≲120s all-`None` at a tape splice) vs **Long Dead Zone** (≳120s, up to 2160s of unreadable footage). The end-of-noise-burst placement policy applies *only* to Splice Dead Zones; Long Dead Zone handling is unsolved/out of scope.
 - **Visual signals: anchor always-on, drop-filter opt-in.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates for splice placement. `fuse_boundaries` (drops OCR boundaries lacking visual corroboration) stays behind `--enable-visual-fusion`, default **off** — VHS pause/resume often has no visual discontinuity, so the filter would delete real boundaries.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as local markdown files under `.scratch/`. No external PR triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default canonical label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: `CONTEXT.md` at root + `docs/adr/`. See `docs/agents/domain.md`.
