@@ -30,11 +30,12 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     import anthropic
@@ -92,8 +93,16 @@ class Boundary:
     cam_before: datetime | None     # last valid timestamp before boundary
     cam_after:  datetime | None     # first valid timestamp after boundary
     cam_jump_s: float               # (cam_after - cam_before).total_seconds(); negative = backward
-    prev_t:     float | None        # video_t of last valid sample before (for refine_split)
-    prev_dt:    datetime | None     # datetime of last valid sample before (for refine_split)
+    prev_t:     float | None        # video_t of last valid sample before (for refinement)
+    prev_dt:    datetime | None     # datetime of last valid sample before (for refinement)
+
+
+class RefinementResult(NamedTuple):
+    t: float
+    method: str
+    detail: str
+
+RefinementStrategy = Callable[[str, Boundary], RefinementResult]
 
 
 # ------------------------------------------------------------------ #
@@ -870,146 +879,144 @@ def _scan_for_transition(
     return any_ocr, last_old_t, None
 
 
-def refine_split(
-    video: str,
-    coarse_t: float,
-    prev_t: float,
-    prev_dt: datetime,
+def ocr_refinement(
     gap_s: int,
     crop: str,
     tmpdir: str,
-    visual_times: list[float] | None = None,
-    vision_client: "anthropic.Anthropic | None" = None,
-    vision_readings: dict[str, str] | None = None,
-    interval: int = 10,
-) -> tuple[float, str, str]:
-    """
-    Dense 1s scan of [prev_t+1, coarse_t+interval) to find the transition point.
+    interval: int,
+    visual_times: list[float] | None,
+) -> RefinementStrategy:
+    """Dense OCR-based refinement strategy. Returns a callable over (video, boundary)."""
+    def refine(video: str, boundary: Boundary) -> RefinementResult:
+        coarse_t = boundary.video_t
+        prev_t = boundary.prev_t
+        prev_dt = boundary.prev_dt
+        if prev_t is None or prev_dt is None:
+            return RefinementResult(coarse_t, "coarse", "no-prev")
 
-    The window extends interval seconds past coarse_t because the coarse scan
-    majority-votes FRAMES_PER_SAMPLE frames that span [coarse_t, coarse_t +
-    (FRAMES_PER_SAMPLE-1)*interval/FRAMES_PER_SAMPLE]. The session change can
-    fall anywhere inside that span, so stopping at coarse_t leaves the tail
-    unscanned and causes contamination when the change is near the end of the
-    coarse bucket.
+        window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
+        if not window:
+            return RefinementResult(coarse_t, "coarse", "empty-window")
 
-    Tracks the last frame confirming the OLD session and cuts there + 1s,
-    rather than at the first NEW-session frame. This handles OCR returning None
-    during the actual switch (camera motion, power-on noise) — those ambiguous
-    frames belong to the old clip's tail, not the new clip's head.
+        workers = (os.cpu_count() or 4) * 2
+        paths: dict[int, str | None] = {}
+        ocr_results: dict[str, str] = {}
+        span = coarse_t - prev_t
 
-    Splice Dead Zone (all-None window): anchors to the LAST visual event within
-    [prev_t, coarse_t+interval) — end of the noise burst, not the start. Fallback
-    when no visual event exists in the span: coarse_t (end of None-span).
-
-    Large windows (span >= SPLICE_DEAD_ZONE_MAX_S, i.e. LDZ-sized): two-pass
-    hierarchical scan — coarse sub-sample (~50 pts) brackets the transition, then
-    dense 1s scan only within the bracket. SDZ windows always get a full dense scan
-    so the garbled-new heuristic is unaffected.
-
-    Returns (refined_t, method, detail) where method is 'ocr', 'visual', or 'coarse'
-    and detail carries diagnostic context (LDZ span, SDZ-no-anchor, etc.).
-    """
-    window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
-    if not window:
-        return coarse_t, "coarse", "empty-window"
-
-    # PROTOTYPE: vision-refine replaces the OCR binary + visual anchor with vision readings.
-    # Readings file (free, pre-read by Claude Code) takes precedence over the live API path.
-    if vision_readings is not None:
-        rdict = _readings_for_window(coarse_t, window, vision_readings)
-        refined_t, method = _resolve_vision_cut(window, rdict, coarse_t, prev_t, prev_dt, gap_s)
-        return refined_t, method, ""
-    if vision_client is not None:
-        refined_t, method = _refine_split_vision(
-            video, coarse_t, prev_t, prev_dt, gap_s, crop, tmpdir, window, vision_client
-        )
-        return refined_t, method, ""
-
-    workers = (os.cpu_count() or 4) * 2
-    paths: dict[int, str | None] = {}
-    ocr_results: dict[str, str] = {}
-    span = coarse_t - prev_t
-
-    if span >= SPLICE_DEAD_ZONE_MAX_S:
-        # Two-pass hierarchical scan for LDZ-sized windows:
-        # 1) Coarse sub-sample (~50 pts) to bracket the transition.
-        # 2) Dense 1s scan only within [last_old, first_new].
-        # If coarse is all-None (true LDZ), skip dense scan entirely.
-        # If coarse is all-old, scan the short tail after the last coarse sample.
-        step = max(2, len(window) // 50)
-        coarse_times = window[::step]
-        c_paths, c_ocr = _extract_and_ocr_window(video, coarse_times, crop, tmpdir, workers)
-        paths.update(c_paths)
-        ocr_results.update(c_ocr)
-        any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
-            coarse_times, paths, ocr_results, prev_dt, prev_t, gap_s,
-        )
-        if first_new_c is not None:
-            lo, hi = int(last_old_c), int(first_new_c)
-            dense_times = [t for t in range(lo, hi + 1) if t not in paths]
-            if dense_times:
-                d_paths, d_ocr = _extract_and_ocr_window(video, dense_times, crop, tmpdir, workers)
-                paths.update(d_paths)
-                ocr_results.update(d_ocr)
-        elif any_ocr_c:
-            tail = [t for t in window if t > coarse_times[-1]]
-            if tail:
-                t_paths, t_ocr = _extract_and_ocr_window(video, tail, crop, tmpdir, workers)
-                paths.update(t_paths)
-                ocr_results.update(t_ocr)
-        # else: all-None coarse → LDZ with unreadable footage; fall through to visual/coarse.
-    else:
-        c_paths, c_ocr = _extract_and_ocr_window(video, window, crop, tmpdir, workers)
-        paths.update(c_paths)
-        ocr_results.update(c_ocr)
-
-    any_ocr = False
-    last_old_t: float = prev_t
-    for t in window:
-        path = paths.get(t)
-        if path is None:
-            continue
-        text = ocr_results.get(path, "")
-        dt = parse_timestamp(text) if text else None
-        if dt is None:
-            continue
-        any_ocr = True
-        cam_advance = (dt - prev_dt).total_seconds()
-        video_advance = float(t) - prev_t
-        if cam_advance > video_advance + gap_s or cam_advance < -1800:
-            # Cut just before first confirmed new session, but never before
-            # last confirmed old (handles garbled-but-real old frames between them).
-            cut = max(float(last_old_t) + 1.0, float(t) - 1.0)
-            return cut, "ocr", ""
+        if span >= SPLICE_DEAD_ZONE_MAX_S:
+            # Two-pass hierarchical scan for LDZ-sized windows:
+            # 1) Coarse sub-sample (~50 pts) to bracket the transition.
+            # 2) Dense 1s scan only within [last_old, first_new].
+            # If coarse is all-None (true LDZ), skip dense scan entirely.
+            # If coarse is all-old, scan the short tail after the last coarse sample.
+            step = max(2, len(window) // 50)
+            coarse_times = window[::step]
+            c_paths, c_ocr = _extract_and_ocr_window(video, coarse_times, crop, tmpdir, workers)
+            paths.update(c_paths)
+            ocr_results.update(c_ocr)
+            any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
+                coarse_times, paths, ocr_results, prev_dt, prev_t, gap_s,
+            )
+            if first_new_c is not None:
+                lo, hi = int(last_old_c), int(first_new_c)
+                dense_times = [t for t in range(lo, hi + 1) if t not in paths]
+                if dense_times:
+                    d_paths, d_ocr = _extract_and_ocr_window(video, dense_times, crop, tmpdir, workers)
+                    paths.update(d_paths)
+                    ocr_results.update(d_ocr)
+            elif any_ocr_c:
+                tail = [t for t in window if t > coarse_times[-1]]
+                if tail:
+                    t_paths, t_ocr = _extract_and_ocr_window(video, tail, crop, tmpdir, workers)
+                    paths.update(t_paths)
+                    ocr_results.update(t_ocr)
+            # else: all-None coarse → LDZ with unreadable footage; fall through to visual/coarse.
         else:
-            last_old_t = t
+            c_paths, c_ocr = _extract_and_ocr_window(video, window, crop, tmpdir, workers)
+            paths.update(c_paths)
+            ocr_results.update(c_ocr)
 
-    # Old-session confirmed at last_old_t but new-session OCR garbled (extracted frames
-    # after last_old_t but parse_timestamp rejected them — e.g. missing day field).
-    # Guards: Splice Dead Zone only; gap after last confirmed old must be > 10s
-    # (1 coarse interval) so normal end-of-window sparseness doesn't trigger this.
-    if (any_ocr
-            and (coarse_t - prev_t) < SPLICE_DEAD_ZONE_MAX_S
-            and (coarse_t - last_old_t) > 10
-            and any(paths.get(t) is not None for t in window if t > last_old_t)):
-        return float(last_old_t) + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s"
+        any_ocr, last_old_t, first_new_t = _scan_for_transition(
+            window, paths, ocr_results, prev_dt, prev_t, gap_s,
+        )
 
-    # Splice Dead Zone only (< 120s None-span): anchor to LAST visual event
-    # within [prev_t, coarse_t) — end of noise burst, not start.
-    # Long Dead Zones (>= 120s) are out of scope; skip visual anchor there.
-    span = coarse_t - prev_t
-    splice_dead_zone = span < SPLICE_DEAD_ZONE_MAX_S
-    if not any_ocr and splice_dead_zone and visual_times:
-        anchors = [vt for vt in visual_times if prev_t <= vt < coarse_t]
-        if anchors:
-            return max(anchors), "visual", ""
+        if first_new_t is not None:
+            # Cut just before first confirmed new session, never before last confirmed old
+            # (handles garbled-but-real old frames between the two confirmed points).
+            cut = max(last_old_t + 1.0, first_new_t - 1.0)
+            return RefinementResult(cut, "ocr", "")
 
-    if not any_ocr:
-        detail = f"SDZ {span:.0f}s no-anchor" if splice_dead_zone else f"LDZ {span:.0f}s"
-    else:
-        detail = "all-old-in-window"
-    return coarse_t, "coarse", detail
+        # Old-session confirmed at last_old_t but new-session OCR garbled (extracted frames
+        # after last_old_t but parse_timestamp rejected them — e.g. missing day field).
+        # Guards: Splice Dead Zone only; gap after last confirmed old must be > 10s
+        # (1 coarse interval) so normal end-of-window sparseness doesn't trigger this.
+        if (any_ocr
+                and span < SPLICE_DEAD_ZONE_MAX_S
+                and (coarse_t - last_old_t) > 10
+                and any(paths.get(t) is not None for t in window if t > last_old_t)):
+            return RefinementResult(last_old_t + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s")
+
+        # Splice Dead Zone only (< 120s None-span): anchor to LAST visual event
+        # within [prev_t, coarse_t) — end of noise burst, not start.
+        # Long Dead Zones (>= 120s) are out of scope; skip visual anchor there.
+        splice_dead_zone = span < SPLICE_DEAD_ZONE_MAX_S
+        if not any_ocr and splice_dead_zone and visual_times:
+            anchors = [vt for vt in visual_times if prev_t <= vt < coarse_t]
+            if anchors:
+                return RefinementResult(max(anchors), "visual", "")
+
+        if not any_ocr:
+            detail = f"SDZ {span:.0f}s no-anchor" if splice_dead_zone else f"LDZ {span:.0f}s"
+        else:
+            detail = "all-old-in-window"
+        return RefinementResult(coarse_t, "coarse", detail)
+
+    return refine
+
+
+def vision_api_refinement(
+    client: "anthropic.Anthropic",
+    gap_s: int,
+    crop: str,
+    tmpdir: str,
+    interval: int,
+) -> RefinementStrategy:
+    """PROTOTYPE: Vision API (Haiku) refinement strategy."""
+    def refine(video: str, boundary: Boundary) -> RefinementResult:
+        coarse_t = boundary.video_t
+        prev_t = boundary.prev_t
+        prev_dt = boundary.prev_dt
+        if prev_t is None or prev_dt is None:
+            return RefinementResult(coarse_t, "coarse", "no-prev")
+        window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
+        if not window:
+            return RefinementResult(coarse_t, "coarse", "empty-window")
+        refined_t, method = _refine_split_vision(
+            video, coarse_t, prev_t, prev_dt, gap_s, crop, tmpdir, window, client,
+        )
+        return RefinementResult(refined_t, method, "")
+    return refine
+
+
+def vision_readings_refinement(
+    readings: dict[str, str],
+    gap_s: int,
+    interval: int,
+) -> RefinementStrategy:
+    """PROTOTYPE: Pre-loaded vision readings refinement strategy (no API calls)."""
+    def refine(video: str, boundary: Boundary) -> RefinementResult:
+        coarse_t = boundary.video_t
+        prev_t = boundary.prev_t
+        prev_dt = boundary.prev_dt
+        if prev_t is None or prev_dt is None:
+            return RefinementResult(coarse_t, "coarse", "no-prev")
+        window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
+        if not window:
+            return RefinementResult(coarse_t, "coarse", "empty-window")
+        rdict = _readings_for_window(coarse_t, window, readings)
+        refined_t, method = _resolve_vision_cut(window, rdict, coarse_t, prev_t, prev_dt, gap_s)
+        return RefinementResult(refined_t, method, "")
+    return refine
 
 
 def snap_to_keyframe(video: str, t: float, look_back: float = 30.0) -> float:
@@ -1393,22 +1400,24 @@ def main() -> None:
     print(f"refine count={large_gap_count}")
     t_refine = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmpdir:
+        if vision_readings is not None:
+            strategy = vision_readings_refinement(vision_readings, args.gap, args.interval)
+        elif vision_client is not None:
+            strategy = vision_api_refinement(vision_client, args.gap, args.crop, tmpdir, args.interval)
+        else:
+            strategy = ocr_refinement(args.gap, args.crop, tmpdir, args.interval, visual_times)
         splits = [0.0]
         for vt in cut_ts[1:]:
             b = boundary_map.get(vt)
             if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
                 t_b = time.perf_counter()
-                refined_t, method, detail = refine_split(
-                    video, vt, b.prev_t, b.prev_dt, args.gap, args.crop, tmpdir, visual_times,
-                    vision_client=vision_client, vision_readings=vision_readings,
-                    interval=args.interval,
-                )
+                result = strategy(video, b)
                 elapsed_b = time.perf_counter() - t_b
-                reason = f" reason={detail}" if detail else ""
-                print(f"boundary coarse={vt:.0f} refined={refined_t:.0f} saved={vt - refined_t:.0f}"
+                reason = f" reason={result.detail}" if result.detail else ""
+                print(f"boundary coarse={vt:.0f} refined={result.t:.0f} saved={vt - result.t:.0f}"
                       f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
-                      f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={method}{reason}")
-                splits.append(refined_t)
+                      f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={result.method}{reason}")
+                splits.append(result.t)
             else:
                 splits.append(vt)
     phase_times["refine"] = time.perf_counter() - t_refine

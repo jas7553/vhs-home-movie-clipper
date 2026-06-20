@@ -11,12 +11,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from split_homevideo import (
+    Boundary,
     _extract_frame_png,
     _readings_for_window,
     _resolve_vision_cut,
     _vision_frame_name,
-    refine_split,
+    vision_api_refinement,
     vision_read_frame,
+    vision_readings_refinement,
 )
 
 _PREV_T = 100.0
@@ -156,13 +158,12 @@ class TestRefineSplitVisionReadingsPath:
             _vision_frame_name(coarse_t, 140): "6:00 PM\n 1/ 4/90",   # large jump → new session
             _vision_frame_name(coarse_t, 145): "6:05 PM\n 1/ 4/90",   # also jumps → confirmed
         }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            t, method, _ = refine_split(
-                "vid.mp4", coarse_t, prev_t, prev_dt, _GAP_S, "250:110:385:370", tmpdir,
-                vision_readings=readings_map,
-            )
-        assert method == "vision"
-        assert t == pytest.approx(131.0)
+        b = Boundary(video_t=coarse_t, type="large_gap", cam_before=prev_dt, cam_after=None,
+                     cam_jump_s=0.0, prev_t=prev_t, prev_dt=prev_dt)
+        strategy = vision_readings_refinement(readings_map, _GAP_S, 10)
+        result = strategy("vid.mp4", b)
+        assert result.method == "vision"
+        assert result.t == pytest.approx(131.0)
 
 
 class TestExtractFramePng:
@@ -259,15 +260,15 @@ class TestRefineSplitVisionClientPath:
             reading = new_reading if t >= 140 else old_reading
             return reading, 10, 5
 
+        b = Boundary(video_t=coarse_t, type="large_gap", cam_before=_PREV_DT, cam_after=None,
+                     cam_jump_s=0.0, prev_t=prev_t, prev_dt=_PREV_DT)
         with tempfile.TemporaryDirectory() as tmpdir, \
              patch("split_homevideo._extract_frame_png", side_effect=fake_extract), \
              patch("split_homevideo.vision_read_frame", side_effect=fake_vision):
-            t, method, _ = refine_split(
-                "vid.mp4", coarse_t, prev_t, _PREV_DT, _GAP_S, "250:110:385:370", tmpdir,
-                vision_client=client,
-            )
-        assert method == "vision"
-        assert t == pytest.approx(140.0)  # last old = 139, + 1
+            strategy = vision_api_refinement(client, _GAP_S, "250:110:385:370", tmpdir, 10)
+            result = strategy("vid.mp4", b)
+        assert result.method == "vision"
+        assert result.t == pytest.approx(140.0)  # last old = 139, + 1
 
 
 class TestResolveVisionCutUnknownString:

@@ -1,42 +1,49 @@
 """
-refine_split(): dense 1s scan to locate exact session boundary.
+ocr_refinement(): dense 1s scan to locate exact session boundary.
 """
 import tempfile
 import unittest.mock as mock
 from datetime import datetime
 
-from split_homevideo import SPLICE_DEAD_ZONE_MAX_S, refine_split
+from split_homevideo import SPLICE_DEAD_ZONE_MAX_S, Boundary, ocr_refinement
 
 _CROP = "250:110:385:370"
 _GAP = 300
 _PREV_DT = datetime(1990, 1, 4, 17, 0)
 
 
+def _boundary(coarse_t, prev_t):
+    return Boundary(
+        video_t=coarse_t, type="large_gap",
+        cam_before=_PREV_DT, cam_after=None, cam_jump_s=0.0,
+        prev_t=prev_t, prev_dt=_PREV_DT,
+    )
+
+
 def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None, interval=10):
+    b = _boundary(coarse_t, prev_t)
     with tempfile.TemporaryDirectory() as tmpdir:
+        strategy = ocr_refinement(_GAP, _CROP, tmpdir, interval, visual_times)
         with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect), \
              mock.patch("split_homevideo.ocr_batch", return_value=ocr_map):
-            t, method, _ = refine_split(
-                "vid.mp4", coarse_t, prev_t, _PREV_DT, _GAP, _CROP, tmpdir, visual_times,
-                interval=interval,
-            )
-            return t, method
+            result = strategy("vid.mp4", b)
+            return result.t, result.method
 
 
 class TestRefineSplit:
     def test_empty_window_returns_coarse(self):
         # interval=1: range(int(10)+1, int(10)+1) = range(11,11) = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method, _ = refine_split("vid.mp4", 10.0, 10.0, _PREV_DT, _GAP, _CROP, tmpdir, interval=1)
-        assert t == 10.0
-        assert method == "coarse"
+            result = ocr_refinement(_GAP, _CROP, tmpdir, 1, None)("vid.mp4", _boundary(10.0, 10.0))
+        assert result.t == 10.0
+        assert result.method == "coarse"
 
     def test_adjacent_frames_empty_window(self):
         # interval=1: range(int(9.5)+1, int(9.5)+1) = range(10,10) = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method, _ = refine_split("vid.mp4", 9.5, 9.5, _PREV_DT, _GAP, _CROP, tmpdir, interval=1)
-        assert t == 9.5
-        assert method == "coarse"
+            result = ocr_refinement(_GAP, _CROP, tmpdir, 1, None)("vid.mp4", _boundary(9.5, 9.5))
+        assert result.t == 9.5
+        assert result.method == "coarse"
 
     def test_returns_coarse_when_no_boundary_found(self):
         # All frames confirm old session (small cam advance) → return coarse_t
@@ -355,14 +362,13 @@ class TestRefineSplitTwoPass:
 
     def _run_ldz_with_call_count(self, extract_side_effect, ocr_map, visual_times=None):
         """Like _run_ldz but also returns how many times extract_frame was called."""
+        b = _boundary(_LDZ_COARSE_T, _LDZ_PREV_T)
         with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = ocr_refinement(_GAP, _CROP, tmpdir, _LDZ_INTERVAL, visual_times)
             with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect) as m_ex, \
                  mock.patch("split_homevideo.ocr_batch", return_value=ocr_map):
-                t, method, _ = refine_split(
-                    "vid.mp4", _LDZ_COARSE_T, _LDZ_PREV_T, _PREV_DT, _GAP, _CROP, tmpdir,
-                    visual_times, interval=_LDZ_INTERVAL,
-                )
-                return t, method, m_ex.call_count
+                result = strategy("vid.mp4", b)
+                return result.t, result.method, m_ex.call_count
 
     def test_two_pass_transition_in_middle_correct_result(self):
         # Transition at t=100: frames [1..99] = old, [100..200] = new.
@@ -457,11 +463,10 @@ class TestRefineSplitTwoPass:
         sdz_coarse_t = _LDZ_PREV_T + SPLICE_DEAD_ZONE_MAX_S - 1  # span=119 < 120
         window_len = int(sdz_coarse_t - _LDZ_PREV_T) + _LDZ_INTERVAL - 1  # ≈119
 
+        b = _boundary(sdz_coarse_t, _LDZ_PREV_T)
         with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = ocr_refinement(_GAP, _CROP, tmpdir, _LDZ_INTERVAL, None)
             with mock.patch("split_homevideo.extract_frame", return_value=None) as m_ex, \
                  mock.patch("split_homevideo.ocr_batch", return_value={}):
-                refine_split(
-                    "vid.mp4", sdz_coarse_t, _LDZ_PREV_T, _PREV_DT, _GAP, _CROP, tmpdir,
-                    interval=_LDZ_INTERVAL,
-                )
+                strategy("vid.mp4", b)
                 assert m_ex.call_count == window_len
