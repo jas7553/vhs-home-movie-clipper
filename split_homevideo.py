@@ -463,7 +463,8 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
     """
     Stage 2: decide which boundaries become cut points based on mode.
 
-    Returns list[float] of video_t values with 0.0 prepended.
+    Returns list[float] of video_t values with 0.0 prepended. In daily mode,
+    phantom clips from OCR misreads are collapsed before returning.
       scene   — all boundaries (gap + large_gap)
       session — large_gap only
       daily   — only confirmed date changes or backward jumps; unknown-date
@@ -483,6 +484,9 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
             )
             if date_change:
                 cuts.append(b.video_t)
+    if mode == "daily":
+        boundary_map = {b.video_t: b for b in boundaries}
+        cuts = _collapse_revert_phantoms(cuts, boundary_map)
     return cuts
 
 
@@ -1345,11 +1349,8 @@ def main() -> None:
     cut_ts = group_clips(boundaries, args.mode, args.gap)
     duration = get_duration(video)
 
-    # Build lookup: video_t → Boundary for refinement decisions and phantom collapse
+    # Build lookup: video_t → Boundary for refinement decisions
     boundary_map = {b.video_t: b for b in boundaries}
-
-    if args.mode == "daily":
-        cut_ts = _collapse_revert_phantoms(cut_ts, boundary_map)
 
     if args.vision_export:
         _export_vision_frames(
