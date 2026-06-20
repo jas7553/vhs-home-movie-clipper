@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 # --- defaults ---
 DEFAULT_INTERVAL = 10          # sample every N seconds
@@ -85,6 +85,12 @@ class RefinementResult(NamedTuple):
     detail: str
 
 RefinementStrategy = Callable[[str, Boundary], RefinementResult]
+
+OcrFn = Callable[[list[int]], dict[int, datetime | None]]
+
+
+class PlacementPolicy(Protocol):
+    def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult: ...
 
 
 # ------------------------------------------------------------------ #
@@ -581,8 +587,7 @@ def _extract_and_ocr_window(
 
 def _scan_for_transition(
     times: list[int],
-    paths: dict[int, str | None],
-    ocr_results: dict[str, str],
+    readings: dict[int, datetime | None],
     prev_dt: datetime,
     prev_t: float,
     gap_s: int,
@@ -592,11 +597,7 @@ def _scan_for_transition(
     any_ocr = False
     last_old_t: float = prev_t
     for t in times:
-        path = paths.get(t)
-        if path is None:
-            continue
-        text = ocr_results.get(path, "")
-        dt = parse_timestamp(text) if text else None
+        dt = readings.get(t)
         if dt is None:
             continue
         any_ocr = True
@@ -608,6 +609,113 @@ def _scan_for_transition(
     return any_ocr, last_old_t, None
 
 
+def make_ocr_fn(video: str, crop: str, tmpdir: str, workers: int) -> OcrFn:
+    """Production OcrFn: extracts frames via ffmpeg, parses timestamps via OCR binary."""
+    def ocr_fn(times: list[int]) -> dict[int, datetime | None]:
+        paths, raw = _extract_and_ocr_window(video, times, crop, tmpdir, workers)
+        return {
+            t: (parse_timestamp(raw.get(p, "")) if (p := paths.get(t)) is not None else None)
+            for t in times
+        }
+    return ocr_fn
+
+
+class LongDeadZonePolicy:
+    """Refinement for boundaries with span >= SPLICE_DEAD_ZONE_MAX_S.
+
+    Two-pass hierarchical scan: coarse sub-sample (~50 pts) to bracket the
+    transition, then dense 1s scan only within [last_old, first_new].
+    If coarse is all-None (true LDZ), skips dense scan and falls back to coarse_t.
+    If coarse is all-old, scans the short tail after the last coarse sample.
+    """
+
+    def __init__(self, gap_s: int, interval: int) -> None:
+        self._gap_s = gap_s
+        self._interval = interval
+
+    def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult:
+        coarse_t = boundary.video_t
+        prev_t = boundary.prev_t
+        prev_dt = boundary.prev_dt
+        assert prev_t is not None and prev_dt is not None
+        span = coarse_t - prev_t
+
+        window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
+        step = max(2, len(window) // 50)
+        coarse_times = window[::step]
+        readings: dict[int, datetime | None] = dict(ocr_fn(coarse_times))
+        any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
+            coarse_times, readings, prev_dt, prev_t, self._gap_s,
+        )
+        if first_new_c is not None:
+            lo, hi = int(last_old_c), int(first_new_c)
+            dense_times = [t for t in range(lo, hi + 1) if t not in readings]
+            if dense_times:
+                readings.update(ocr_fn(dense_times))
+        elif any_ocr_c:
+            tail = [t for t in window if t > coarse_times[-1]]
+            if tail:
+                readings.update(ocr_fn(tail))
+        # else: all-None coarse → true LDZ; fall through to coarse_t fallback
+
+        any_ocr, last_old_t, first_new_t = _scan_for_transition(
+            window, readings, prev_dt, prev_t, self._gap_s,
+        )
+        if first_new_t is not None:
+            return RefinementResult(max(last_old_t + 1.0, first_new_t - 1.0), "ocr", "")
+        detail = f"LDZ {span:.0f}s" if not any_ocr else "all-old-in-window"
+        return RefinementResult(coarse_t, "coarse", detail)
+
+
+class ShortSpanPolicy:
+    """Refinement for boundaries with span < SPLICE_DEAD_ZONE_MAX_S.
+
+    Single dense scan of the full window. Handles three outcomes in priority order:
+    1. OCR transition found → cut between last old and first new frame.
+    2. Garbled new-session OCR → cut just after last confirmed old frame.
+    3. All-None (Splice Dead Zone) → anchor to last visual event, or coarse_t fallback.
+    """
+
+    def __init__(self, gap_s: int, interval: int, visual_times: list[float] | None) -> None:
+        self._gap_s = gap_s
+        self._interval = interval
+        self._visual_times = visual_times
+
+    def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult:
+        coarse_t = boundary.video_t
+        prev_t = boundary.prev_t
+        prev_dt = boundary.prev_dt
+        assert prev_t is not None and prev_dt is not None
+        span = coarse_t - prev_t
+
+        window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
+        readings = ocr_fn(window)
+        any_ocr, last_old_t, first_new_t = _scan_for_transition(
+            window, readings, prev_dt, prev_t, self._gap_s,
+        )
+
+        if first_new_t is not None:
+            return RefinementResult(max(last_old_t + 1.0, first_new_t - 1.0), "ocr", "")
+
+        # Old-session confirmed but new-session OCR garbled (frames after last_old_t
+        # returned None — extracted but parse_timestamp rejected them, e.g. missing day field).
+        # Guard: gap after last confirmed old > 10s (1 coarse interval) to avoid triggering
+        # on normal end-of-window sparseness.
+        if (any_ocr
+                and (coarse_t - last_old_t) > 10
+                and any(readings.get(t) is None for t in window if t > int(last_old_t))):
+            return RefinementResult(last_old_t + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s")
+
+        # Splice Dead Zone: anchor to LAST visual event within [prev_t, coarse_t).
+        if not any_ocr and self._visual_times:
+            anchors = [vt for vt in self._visual_times if prev_t <= vt < coarse_t]
+            if anchors:
+                return RefinementResult(max(anchors), "visual", "")
+
+        detail = f"SDZ {span:.0f}s no-anchor" if not any_ocr else "all-old-in-window"
+        return RefinementResult(coarse_t, "coarse", detail)
+
+
 def ocr_refinement(
     gap_s: int,
     crop: str,
@@ -616,89 +724,22 @@ def ocr_refinement(
     visual_times: list[float] | None,
 ) -> RefinementStrategy:
     """Dense OCR-based refinement strategy. Returns a callable over (video, boundary)."""
+    ldz   = LongDeadZonePolicy(gap_s, interval)
+    short = ShortSpanPolicy(gap_s, interval, visual_times)
+
     def refine(video: str, boundary: Boundary) -> RefinementResult:
         coarse_t = boundary.video_t
         prev_t = boundary.prev_t
         prev_dt = boundary.prev_dt
         if prev_t is None or prev_dt is None:
             return RefinementResult(coarse_t, "coarse", "no-prev")
-
-        window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
-        if not window:
+        if int(coarse_t) + interval <= int(prev_t) + 1:
             return RefinementResult(coarse_t, "coarse", "empty-window")
-
         workers = (os.cpu_count() or 4) * 2
-        paths: dict[int, str | None] = {}
-        ocr_results: dict[str, str] = {}
+        ocr_fn = make_ocr_fn(video, crop, tmpdir, workers)
         span = coarse_t - prev_t
-
-        if span >= SPLICE_DEAD_ZONE_MAX_S:
-            # Two-pass hierarchical scan for LDZ-sized windows:
-            # 1) Coarse sub-sample (~50 pts) to bracket the transition.
-            # 2) Dense 1s scan only within [last_old, first_new].
-            # If coarse is all-None (true LDZ), skip dense scan entirely.
-            # If coarse is all-old, scan the short tail after the last coarse sample.
-            step = max(2, len(window) // 50)
-            coarse_times = window[::step]
-            c_paths, c_ocr = _extract_and_ocr_window(video, coarse_times, crop, tmpdir, workers)
-            paths.update(c_paths)
-            ocr_results.update(c_ocr)
-            any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
-                coarse_times, paths, ocr_results, prev_dt, prev_t, gap_s,
-            )
-            if first_new_c is not None:
-                lo, hi = int(last_old_c), int(first_new_c)
-                dense_times = [t for t in range(lo, hi + 1) if t not in paths]
-                if dense_times:
-                    d_paths, d_ocr = _extract_and_ocr_window(video, dense_times, crop, tmpdir, workers)
-                    paths.update(d_paths)
-                    ocr_results.update(d_ocr)
-            elif any_ocr_c:
-                tail = [t for t in window if t > coarse_times[-1]]
-                if tail:
-                    t_paths, t_ocr = _extract_and_ocr_window(video, tail, crop, tmpdir, workers)
-                    paths.update(t_paths)
-                    ocr_results.update(t_ocr)
-            # else: all-None coarse → LDZ with unreadable footage; fall through to visual/coarse.
-        else:
-            c_paths, c_ocr = _extract_and_ocr_window(video, window, crop, tmpdir, workers)
-            paths.update(c_paths)
-            ocr_results.update(c_ocr)
-
-        any_ocr, last_old_t, first_new_t = _scan_for_transition(
-            window, paths, ocr_results, prev_dt, prev_t, gap_s,
-        )
-
-        if first_new_t is not None:
-            # Cut just before first confirmed new session, never before last confirmed old
-            # (handles garbled-but-real old frames between the two confirmed points).
-            cut = max(last_old_t + 1.0, first_new_t - 1.0)
-            return RefinementResult(cut, "ocr", "")
-
-        # Old-session confirmed at last_old_t but new-session OCR garbled (extracted frames
-        # after last_old_t but parse_timestamp rejected them — e.g. missing day field).
-        # Guards: Splice Dead Zone only; gap after last confirmed old must be > 10s
-        # (1 coarse interval) so normal end-of-window sparseness doesn't trigger this.
-        if (any_ocr
-                and span < SPLICE_DEAD_ZONE_MAX_S
-                and (coarse_t - last_old_t) > 10
-                and any(paths.get(t) is not None for t in window if t > last_old_t)):
-            return RefinementResult(last_old_t + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s")
-
-        # Splice Dead Zone only (< 120s None-span): anchor to LAST visual event
-        # within [prev_t, coarse_t) — end of noise burst, not start.
-        # Long Dead Zones (>= 120s) are out of scope; skip visual anchor there.
-        splice_dead_zone = span < SPLICE_DEAD_ZONE_MAX_S
-        if not any_ocr and splice_dead_zone and visual_times:
-            anchors = [vt for vt in visual_times if prev_t <= vt < coarse_t]
-            if anchors:
-                return RefinementResult(max(anchors), "visual", "")
-
-        if not any_ocr:
-            detail = f"SDZ {span:.0f}s no-anchor" if splice_dead_zone else f"LDZ {span:.0f}s"
-        else:
-            detail = "all-old-in-window"
-        return RefinementResult(coarse_t, "coarse", detail)
+        policy: PlacementPolicy = ldz if span >= SPLICE_DEAD_ZONE_MAX_S else short
+        return policy.place(boundary, ocr_fn)
 
     return refine
 
