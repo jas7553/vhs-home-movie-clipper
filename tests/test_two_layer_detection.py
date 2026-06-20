@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from split_homevideo import _CACHE_FORMAT, find_all_boundaries, group_clips, parse_timestamp
+from split_homevideo import _CACHE_FORMAT, filter_ocr_outliers, find_all_boundaries, group_clips, parse_timestamp
 
 FIXTURE = Path(__file__).parent / "fixtures" / "test_15min_ocr_cache.json"
 GAP_S = 900
@@ -49,7 +49,7 @@ def samples():
 
 @pytest.fixture(scope="module")
 def boundaries(samples):
-    return find_all_boundaries(samples, gap_s=GAP_S)
+    return find_all_boundaries(filter_ocr_outliers(samples), gap_s=GAP_S)
 
 
 class TestSessionMode:

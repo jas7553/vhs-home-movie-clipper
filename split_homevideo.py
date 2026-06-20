@@ -369,20 +369,20 @@ def filter_ocr_outliers(
 
 
 def find_all_boundaries(
-    samples: list[tuple[float, datetime | None]],
+    samples: list[tuple[float, datetime]],
     min_gap_s: int = _MIN_GAP_S,
     gap_s: int = DEFAULT_GAP,
 ) -> list["Boundary"]:
     """
     Stage 1: emit every candidate boundary at a low detection floor (min_gap_s).
 
+    Accepts pre-filtered samples (no None entries) — call filter_ocr_outliers first.
     Returns Boundary objects sorted by video_t. Type 'large_gap' when the camera
     jump exceeds gap_s or is backward; 'gap' for smaller detected pauses.
     """
-    clean = filter_ocr_outliers(samples)
     boundaries: list[Boundary] = []
     prev: tuple[float, datetime] | None = None
-    for t, dt in clean:
+    for t, dt in samples:
         if prev is not None:
             prev_t, prev_dt = prev
             video_advance = t - prev_t
@@ -1325,7 +1325,8 @@ def main() -> None:
     date_range = f" date_range={valid[0][1].date()}:{valid[-1][1].date()}" if valid else ""
     print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
 
-    boundaries = find_all_boundaries(samples, gap_s=args.gap)
+    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
+    boundaries = find_all_boundaries(filtered, gap_s=args.gap)
 
     visual_times: list[float] = []
     if not args.dry_run and not args.no_visual_anchor and not args.vision_export:
@@ -1356,8 +1357,6 @@ def main() -> None:
             interval=args.interval, force_all=args.vision_export_all,
         )
         return
-
-    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
 
     # Daily mode keeps all date changes regardless of duration, but still collapses
     # sub-second slivers that result from two refined cuts landing 1s apart.
