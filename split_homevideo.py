@@ -17,7 +17,6 @@ Arguments:
 """
 
 import argparse
-import base64
 import glob
 import json
 import math
@@ -35,10 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
-
-if TYPE_CHECKING:
-    import anthropic
+from typing import NamedTuple
 
 # --- defaults ---
 DEFAULT_INTERVAL = 10          # sample every N seconds
@@ -67,20 +63,6 @@ MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fp
 # scale 4×: more glyph detail than 3×; unsharp: crisp edges post-scale; eq: harden contrast.
 _VF_PREPROCESS = "yadif,format=gray,scale=iw*4:ih*4:flags=lanczos,unsharp=5:5:2.0,eq=contrast=2.0:brightness=0.05"
 FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote → fewer misreads
-
-# --- vision-refine prototype (opt-in via --vision-refine) ---
-VISION_MODEL = "claude-haiku-4-5"      # $1/$5 per MTok in/out
-VISION_MAX_WORKERS = 10                # cap concurrent Haiku calls to stay under per-minute limits
-VISION_PROMPT = (
-    "This is a cropped region from a digitized VHS home video. It may contain a "
-    "burned-in camera timestamp: a date line like M/D/YY and a time line like H:MM AM/PM "
-    "(digits use spaces, not leading zeros).\n"
-    "Reply with EXACTLY one of these, and nothing else:\n"
-    "- the timestamp as `M/D/YY H:MM AM/PM` if a date is legible (give your best reading of "
-    "partly-degraded digits)\n"
-    "- `NOISE` if the frame is analog head-switch noise / static / a scrambled splice\n"
-    "- `NONE` if it is ordinary footage with no legible timestamp"
-)
 
 # ------------------------------------------------------------------ #
 # Boundary detection types
@@ -581,263 +563,6 @@ def fuse_boundaries(
     return confirmed
 
 
-def _extract_frame_png(video: str, t: float, crop: str, out_path: str) -> str | None:
-    """Crop a frame to PNG at out_path for vision reading.
-
-    Deinterlaced + 2× upscaled, but WITHOUT the OCR-binary preprocessing chain
-    (gray/threshold/unsharp) — vision reads the near-native cropped region better than
-    the binarized image tuned for Apple Vision.
-    """
-    cmd = [
-        "ffmpeg", "-loglevel", "error",
-        "-hwaccel", "videotoolbox",
-        "-ss", str(t),
-        "-i", video,
-        "-vframes", "1",
-        "-vf", f"crop={crop},yadif,scale=iw*2:ih*2:flags=lanczos",
-        "-update", "1",
-        "-y", out_path,
-    ]
-    ret = subprocess.run(cmd, capture_output=True)
-    if ret.returncode != 0 or not os.path.exists(out_path):
-        return None
-    return out_path
-
-
-def _vision_frame_name(coarse_t: float, t: int) -> str:
-    """Deterministic PNG name shared by export and readings-apply (sortable)."""
-    return f"b{int(coarse_t):06d}_t{int(t):06d}.png"
-
-
-def vision_read_frame(client: Any, png_path: str) -> tuple[datetime | str | None, int, int]:
-    """Ask Haiku to read the timestamp in one frame.
-
-    Returns (reading, input_tokens, output_tokens) where reading is a datetime
-    (legible timestamp), the string "NOISE" (head-switch noise burst), or None
-    (ordinary footage / no legible timestamp). SDK auto-retries 429/5xx.
-    """
-    with open(png_path, "rb") as f:
-        data = base64.standard_b64encode(f.read()).decode("utf-8")
-    resp = client.messages.create(
-        model=VISION_MODEL,
-        max_tokens=32,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": "image/png", "data": data}},
-                {"type": "text", "text": VISION_PROMPT},
-            ],
-        }],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    in_tok, out_tok = resp.usage.input_tokens, resp.usage.output_tokens
-    upper = text.upper()
-    if upper.startswith("NOISE"):
-        return "NOISE", in_tok, out_tok
-    if upper.startswith("NONE"):
-        return None, in_tok, out_tok
-    return parse_timestamp(text), in_tok, out_tok
-
-
-def _resolve_vision_cut(
-    window: list[int], readings: dict[int, datetime | str | None],
-    coarse_t: float, prev_t: float, prev_dt: datetime, gap_s: int,
-) -> tuple[float, str]:
-    """Walk a window of per-frame readings (datetime | "NOISE" | None) → cut point.
-
-    Tracks the last frame confirming the OLD session and cuts there + 1s. NOISE frames
-    count as the outgoing clip's tail (so an all-NOISE Splice Dead Zone lands the cut at
-    the end of the noise burst with no separate visual anchor). None / unread frames are
-    skipped. Falls back to coarse_t only when NO frame yielded any signal (Long Dead Zone).
-
-    A session jump is honored only when the NEXT classified date frame also jumps — a lone
-    out-of-order / misread date (e.g. a degraded "1/24" read as "1/20") does not trigger a
-    cut. Shared by the API path (--vision-refine) and the readings path (--vision-readings).
-    """
-    def is_jump(dt: datetime, t: int) -> bool:
-        cam_advance = (dt - prev_dt).total_seconds()
-        video_advance = float(t) - prev_t
-        return cam_advance > video_advance + gap_s or cam_advance < -1800
-
-    # Ordered classified frames actually present (skips unread positions).
-    seq = [(t, readings[t]) for t in window if t in readings]
-    last_old_t: float = prev_t
-    saw_signal = False
-    for i, (t, reading) in enumerate(seq):
-        if reading == "NOISE":
-            saw_signal = True
-            last_old_t = t                      # noise burst = outgoing clip's tail
-            continue
-        if reading is None:
-            continue                            # ordinary footage / no legible timestamp
-        # reading is a datetime (NOISE filtered above, None filtered above)
-        if not isinstance(reading, datetime):
-            continue
-        saw_signal = True
-        if is_jump(reading, t):
-            nxt = next(((tt, rr) for tt, rr in seq[i + 1:]
-                        if rr != "NOISE" and rr is not None), None)
-            if nxt is None or (isinstance(nxt[1], datetime) and is_jump(nxt[1], nxt[0])):
-                return float(last_old_t) + 1.0, "vision"  # confirmed new session
-            continue                            # lone outlier — ignore, don't advance
-        last_old_t = t
-
-    if saw_signal:
-        return float(last_old_t) + 1.0, "vision"  # end of noise burst / last old frame
-    return coarse_t, "coarse"                      # all-None: Long Dead Zone, out of scope
-
-
-def _refine_split_vision(
-    video: str, coarse_t: float, prev_t: float, prev_dt: datetime,
-    gap_s: int, crop: str, tmpdir: str, window: list[int], client,
-) -> tuple[float, str]:
-    """API path: read each window frame with Haiku, then resolve the cut."""
-    workers = min((os.cpu_count() or 4) * 2, VISION_MAX_WORKERS)
-    paths: dict[int, str | None] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_t = {
-            executor.submit(
-                _extract_frame_png, video, float(t), crop,
-                os.path.join(tmpdir, f"vframe_{t}.png"),
-            ): t
-            for t in window
-        }
-        for future in as_completed(future_to_t):
-            paths[future_to_t[future]] = future.result()
-
-    readings: dict[int, datetime | str | None] = {}
-    tot_in = tot_out = 0
-    valid = [(t, p) for t in window if (p := paths.get(t)) is not None]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        vision_future_to_t = {
-            executor.submit(vision_read_frame, client, p): t for t, p in valid
-        }
-        for vfuture in as_completed(vision_future_to_t):
-            reading, in_tok, out_tok = vfuture.result()
-            readings[vision_future_to_t[vfuture]] = reading
-            tot_in += in_tok
-            tot_out += out_tok
-
-    cost = tot_in / 1e6 * 1.0 + tot_out / 1e6 * 5.0
-    print(f"    [vision] {len(valid)} frames, {tot_in}+{tot_out} tok, ${cost:.4f}", flush=True)
-    return _resolve_vision_cut(window, readings, coarse_t, prev_t, prev_dt, gap_s)
-
-
-def _readings_for_window(
-    coarse_t: float, window: list[int], readings_map: dict[str, str],
-) -> dict[int, datetime | str | None]:
-    """Translate a filename-keyed readings JSON into a t-keyed reading dict for one window.
-
-    Unread frames are simply absent (walker skips them) — partial readings still work.
-    """
-    out: dict[int, datetime | str | None] = {}
-    for t in window:
-        key = _vision_frame_name(coarse_t, t)
-        if key not in readings_map:
-            continue
-        val = str(readings_map[key]).strip()
-        upper = val.upper()
-        if upper == "NOISE":
-            out[t] = "NOISE"
-        elif upper in ("NONE", ""):
-            out[t] = None
-        else:
-            out[t] = parse_timestamp(val)  # None if unparseable → skipped
-    return out
-
-
-def _boundary_needs_vision(b: "Boundary") -> tuple[bool, str]:
-    """Pre-filter: does this large_gap window actually need 1s vision frames?
-
-    A large_gap boundary always sits between the last readable OLD-date sample (prev_t)
-    and the first readable NEW-date sample (coarse_t); everything between is None by
-    construction, so the OCR cache can never confirm the interior. The only useful signal
-    is the *width* of that None-span:
-
-      - Splice Dead Zone (span <= SPLICE_DEAD_ZONE_MAX_S): vision at 1s recovers the
-        transition / end-of-noise-burst the OCR binary missed → EXPORT.
-      - Long Dead Zone (wider): unsolved, refine falls back to coarse_t (ADR 0001), so
-        vision adds nothing and these windows hold the most frames → SKIP.
-
-    Returns (needs_vision, reason). On this file the gate skips 4 Long Dead Zones but
-    ~65% of exported frames.
-    """
-    if not (b.type == "large_gap" and b.prev_t is not None and b.cam_before is not None):
-        return False, "not a refinable large_gap"
-    span = b.video_t - b.prev_t
-    if span >= SPLICE_DEAD_ZONE_MAX_S:
-        return False, f"{span:.0f}s None-span = Long Dead Zone (out of scope, falls back to coarse_t)"
-    return True, f"{span:.0f}s None-span = Splice Dead Zone"
-
-
-def _export_vision_frames(
-    video: str, cut_ts: list[float], boundary_map: dict, crop: str, gap_s: int, export_dir: str,
-    interval: int = 10,
-    force_all: bool = False,
-) -> None:
-    """Free path, phase 1: extract refinement-window PNGs + manifest.json, no API, no cut.
-
-    For each large_gap boundary, dump one PNG per 1s window position (deterministic name).
-    A None-span-width pre-filter (`_boundary_needs_vision`) exports only Splice Dead Zone
-    windows; Long Dead Zones fall back to coarse_t and are skipped (pass --vision-export-all
-    to override). Claude Code then reads the PNGs and writes
-    <export_dir>/readings.json; rerun with --vision-readings to apply.
-    """
-    export_dir = os.path.abspath(export_dir)
-    os.makedirs(export_dir, exist_ok=True)
-    workers = min((os.cpu_count() or 4) * 2, VISION_MAX_WORKERS)
-    manifest: dict = {"video": video, "gap_s": gap_s, "prompt": VISION_PROMPT, "boundaries": []}
-    total = 0
-    skipped = 0
-    for vt in cut_ts[1:]:
-        b = boundary_map.get(vt)
-        if not (b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None):
-            continue
-        needs, reason = _boundary_needs_vision(b)
-        if not needs and not force_all:
-            skipped += 1
-            print(f"  boundary coarse={vt:.0f}s: skip — {reason}", flush=True)
-            continue
-        window = list(range(int(b.prev_t) + 1, int(vt) + interval))
-        if not window:
-            continue
-        frames: list[dict] = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_t = {
-                executor.submit(
-                    _extract_frame_png, video, float(t), crop,
-                    os.path.join(export_dir, _vision_frame_name(vt, t)),
-                ): t
-                for t in window
-            }
-            for future in as_completed(future_to_t):
-                t = future_to_t[future]
-                if future.result():
-                    frames.append({"t": t, "file": _vision_frame_name(vt, t)})
-        frames.sort(key=lambda d: d["t"])
-        manifest["boundaries"].append({
-            "coarse_t": vt,
-            "prev_t": b.prev_t,
-            "prev_dt": b.prev_dt.isoformat(),
-            "gap_s": gap_s,
-            "frames": frames,
-        })
-        total += len(frames)
-        print(f"  boundary coarse={vt:.0f}s: {len(frames)} frames", flush=True)
-
-    manifest_path = os.path.join(export_dir, "manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"\nExported {total} frames across {len(manifest['boundaries'])} large_gap boundary(ies) "
-          f"to {export_dir}/  (pre-filter skipped {skipped} OCR-confident boundary(ies))")
-    print(f"Manifest: {manifest_path}")
-    print("Next (free, via Claude Code):")
-    print("  read the PNGs, classify each as `M/D/YY H:MM AM/PM` / NOISE / NONE,")
-    print(f"  write {os.path.join(export_dir, 'readings.json')}  (map: filename → reading)")
-    print(f"Then: python3 split_homevideo.py <video> --vision-readings {os.path.join(export_dir, 'readings.json')}")
-
-
 def _extract_and_ocr_window(
     video: str, times: list[int], crop: str, tmpdir: str, workers: int,
 ) -> tuple[dict[int, str | None], dict[str, str]]:
@@ -975,51 +700,6 @@ def ocr_refinement(
             detail = "all-old-in-window"
         return RefinementResult(coarse_t, "coarse", detail)
 
-    return refine
-
-
-def vision_api_refinement(
-    client: "anthropic.Anthropic",
-    gap_s: int,
-    crop: str,
-    tmpdir: str,
-    interval: int,
-) -> RefinementStrategy:
-    """PROTOTYPE: Vision API (Haiku) refinement strategy."""
-    def refine(video: str, boundary: Boundary) -> RefinementResult:
-        coarse_t = boundary.video_t
-        prev_t = boundary.prev_t
-        prev_dt = boundary.prev_dt
-        if prev_t is None or prev_dt is None:
-            return RefinementResult(coarse_t, "coarse", "no-prev")
-        window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
-        if not window:
-            return RefinementResult(coarse_t, "coarse", "empty-window")
-        refined_t, method = _refine_split_vision(
-            video, coarse_t, prev_t, prev_dt, gap_s, crop, tmpdir, window, client,
-        )
-        return RefinementResult(refined_t, method, "")
-    return refine
-
-
-def vision_readings_refinement(
-    readings: dict[str, str],
-    gap_s: int,
-    interval: int,
-) -> RefinementStrategy:
-    """PROTOTYPE: Pre-loaded vision readings refinement strategy (no API calls)."""
-    def refine(video: str, boundary: Boundary) -> RefinementResult:
-        coarse_t = boundary.video_t
-        prev_t = boundary.prev_t
-        prev_dt = boundary.prev_dt
-        if prev_t is None or prev_dt is None:
-            return RefinementResult(coarse_t, "coarse", "no-prev")
-        window = list(range(int(prev_t) + 1, int(coarse_t) + interval))
-        if not window:
-            return RefinementResult(coarse_t, "coarse", "empty-window")
-        rdict = _readings_for_window(coarse_t, window, readings)
-        refined_t, method = _resolve_vision_cut(window, rdict, coarse_t, prev_t, prev_dt, gap_s)
-        return RefinementResult(refined_t, method, "")
     return refine
 
 
@@ -1286,22 +966,6 @@ def main() -> None:
                     help="ffmpeg scene-change detection threshold (0-1)")
     ap.add_argument("--black-min-duration", type=float, default=DEFAULT_BLACK_MIN_DURATION,
                     help="Minimum duration (s) of a black frame run to count as a boundary signal")
-    ap.add_argument("--vision-refine", action="store_true", default=False,
-                    help="PROTOTYPE: refine large_gap boundaries with Claude Haiku vision "
-                         "(reads degraded/transitioning timestamps the OCR binary misses) instead "
-                         "of the OCR binary + scene-cut anchor. Requires the anthropic package + "
-                         "API credentials (paid). Opt-in; est. $1-4 per full run. Skipped in --dry-run.")
-    ap.add_argument("--vision-export", default=None, metavar="DIR",
-                    help="PROTOTYPE (free path): export refinement-window PNGs + manifest.json to "
-                         "DIR, then exit (ffmpeg only, no API). Have Claude Code read the PNGs and "
-                         "write DIR/readings.json, then rerun with --vision-readings.")
-    ap.add_argument("--vision-export-all", action="store_true", default=False,
-                    help="With --vision-export: bypass the pre-filter and export frames for every "
-                         "large_gap boundary (default exports only Splice Dead Zone windows "
-                         "(None-span < 120s); Long Dead Zones fall back to coarse_t and are skipped).")
-    ap.add_argument("--vision-readings", default=None, metavar="PATH",
-                    help="PROTOTYPE (free path): JSON map of frame-filename → timestamp/NOISE/NONE "
-                         "(produced from a --vision-export dir). Refines using these readings, no API.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -1333,7 +997,7 @@ def main() -> None:
     boundaries = find_all_boundaries(filtered, gap_s=args.gap)
 
     visual_times: list[float] = []
-    if not args.dry_run and not args.no_visual_anchor and not args.vision_export:
+    if not args.dry_run and not args.no_visual_anchor:
         t_vis = time.perf_counter()
         scene_cuts, black_frames = detect_visual_boundaries(
             video, args.scene_threshold, args.black_min_duration, cache_path=visual_cache
@@ -1351,13 +1015,6 @@ def main() -> None:
 
     # Build lookup: video_t → Boundary for refinement decisions
     boundary_map = {b.video_t: b for b in boundaries}
-
-    if args.vision_export:
-        _export_vision_frames(
-            video, cut_ts, boundary_map, args.crop, args.gap, args.vision_export,
-            interval=args.interval, force_all=args.vision_export_all,
-        )
-        return
 
     # Daily mode keeps all date changes regardless of duration, but still collapses
     # sub-second slivers that result from two refined cuts landing 1s apart.
@@ -1381,31 +1038,11 @@ def main() -> None:
         print("dry_run=true")
         return
 
-    vision_readings = None
-    if args.vision_readings:
-        with open(args.vision_readings) as f:
-            vision_readings = json.load(f)
-        print(f"  (vision-readings ON: {args.vision_readings}, {len(vision_readings)} frame readings, no API)")
-
-    vision_client = None
-    if args.vision_refine and not vision_readings:
-        try:
-            import anthropic
-        except ImportError:
-            sys.exit("--vision-refine requires the anthropic package: pip install anthropic")
-        vision_client = anthropic.Anthropic()
-        print("  (vision-refine ON: reading refinement frames with Claude Haiku vision — paid API)")
-
     large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
     print(f"refine count={large_gap_count}")
     t_refine = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmpdir:
-        if vision_readings is not None:
-            strategy = vision_readings_refinement(vision_readings, args.gap, args.interval)
-        elif vision_client is not None:
-            strategy = vision_api_refinement(vision_client, args.gap, args.crop, tmpdir, args.interval)
-        else:
-            strategy = ocr_refinement(args.gap, args.crop, tmpdir, args.interval, visual_times)
+        strategy = ocr_refinement(args.gap, args.crop, tmpdir, args.interval, visual_times)
         splits = [0.0]
         for vt in cut_ts[1:]:
             b = boundary_map.get(vt)
