@@ -157,7 +157,7 @@ class TestRefineSplitVisionReadingsPath:
             _vision_frame_name(coarse_t, 145): "6:05 PM\n 1/ 4/90",   # also jumps → confirmed
         }
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method = refine_split(
+            t, method, _ = refine_split(
                 "vid.mp4", coarse_t, prev_t, prev_dt, _GAP_S, "250:110:385:370", tmpdir,
                 vision_readings=readings_map,
             )
@@ -262,7 +262,7 @@ class TestRefineSplitVisionClientPath:
         with tempfile.TemporaryDirectory() as tmpdir, \
              patch("split_homevideo._extract_frame_png", side_effect=fake_extract), \
              patch("split_homevideo.vision_read_frame", side_effect=fake_vision):
-            t, method = refine_split(
+            t, method, _ = refine_split(
                 "vid.mp4", coarse_t, prev_t, _PREV_DT, _GAP_S, "250:110:385:370", tmpdir,
                 vision_client=client,
             )

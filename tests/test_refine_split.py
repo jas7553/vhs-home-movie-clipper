@@ -16,23 +16,24 @@ def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None):
     with tempfile.TemporaryDirectory() as tmpdir:
         with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect), \
              mock.patch("split_homevideo.ocr_batch", return_value=ocr_map):
-            return refine_split(
+            t, method, _ = refine_split(
                 "vid.mp4", coarse_t, prev_t, _PREV_DT, _GAP, _CROP, tmpdir, visual_times
             )
+            return t, method
 
 
 class TestRefineSplit:
     def test_empty_window_returns_coarse(self):
         # prev_t+1 >= coarse_t → window is empty
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method = refine_split("vid.mp4", 10.0, 10.0, _PREV_DT, _GAP, _CROP, tmpdir)
+            t, method, _ = refine_split("vid.mp4", 10.0, 10.0, _PREV_DT, _GAP, _CROP, tmpdir)
         assert t == 10.0
         assert method == "coarse"
 
     def test_adjacent_frames_empty_window(self):
         # window = range(int(9)+1, int(10)) = range(10, 10) = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method = refine_split("vid.mp4", 10.0, 9.5, _PREV_DT, _GAP, _CROP, tmpdir)
+            t, method, _ = refine_split("vid.mp4", 10.0, 9.5, _PREV_DT, _GAP, _CROP, tmpdir)
         assert t == 10.0
         assert method == "coarse"
 
