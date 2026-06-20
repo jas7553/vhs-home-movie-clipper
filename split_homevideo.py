@@ -931,14 +931,25 @@ def _reading_confirmed(filtered: list[tuple[float, datetime]], i: int) -> bool:
     return not (jumped_in and neighbors_consistent)
 
 
-def _label_for(filtered: list[tuple[float, datetime]], start: float, mode: str = "session") -> str:
+def _label_for(
+    filtered: list[tuple[float, datetime]],
+    start: float,
+    mode: str = "session",
+    boundary_map: dict[float, Boundary] | None = None,
+) -> str:
     """Return a label string for the clip starting at `start` seconds."""
+    # Refined cuts can land one sample before the first new-session frame, leaving
+    # the nearest filtered reading still in cam_before's date (old-session tail).
+    # Skip any reading whose date matches cam_before of the boundary at this cut.
+    boundary = boundary_map.get(start) if boundary_map else None
     fallback: datetime | None = None
     for i, (t, dt) in enumerate(filtered):
         if t >= start:
             if fallback is None:
                 fallback = dt
             if not _reading_confirmed(filtered, i):
+                continue
+            if boundary and boundary.cam_before is not None and dt.date() == boundary.cam_before.date():
                 continue
             if mode == "daily":
                 return dt.strftime("%Y-%m-%d")
@@ -951,7 +962,8 @@ def _label_for(filtered: list[tuple[float, datetime]], start: float, mode: str =
 
 
 def split_video(
-    video: str, splits: list[float], out_dir: str, filtered: list[tuple[float, datetime]], mode: str = "session"
+    video: str, splits: list[float], out_dir: str, filtered: list[tuple[float, datetime]],
+    mode: str = "session", boundary_map: dict[float, Boundary] | None = None
 ):
     os.makedirs(out_dir, exist_ok=True)
     duration = get_duration(video)
@@ -967,7 +979,7 @@ def split_video(
 
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
-        label = _label_for(filtered, start, mode)
+        label = _label_for(filtered, start, mode, boundary_map)
         out_path = os.path.join(out_dir, f"{stem}_clip{idx+1:02d}_{label}.mp4")
         exact_start = start if idx > 0 else None
         exact_end = splits[idx + 1] if idx + 1 < len(splits) else None
@@ -1068,20 +1080,29 @@ def main() -> None:
         if len(splits) < before_merge:
             print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
         print(f"clips count={len(splits)} note=coarse_unrefined interval_error=+-{args.interval}s")
+        prev_label: str | None = None
+        prev_idx: int | None = None
         for idx, start in enumerate(splits):
             end = splits[idx + 1] if idx + 1 < len(splits) else duration
             dur = end - start
-            label = _label_for(filtered, start, args.mode)
+            label = _label_for(filtered, start, args.mode, boundary_map)
             b = boundary_map.get(start)
             btype = f" btype={b.type}" if b else ""
             print(f"clip {idx+1:02d} start={start:.0f} end={end:.0f}"
                   f" dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}{btype}")
+            if args.mode == "daily" and prev_label == label and prev_idx is not None:
+                prev_dur = start - splits[prev_idx]
+                print(f"warn same_date_adjacent clips={prev_idx+1},{idx+1} date={label}"
+                      f" durations={prev_dur:.0f}s,{dur:.0f}s")
+            prev_label = label
+            prev_idx = idx
         print("dry_run=true")
         return
 
     large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
     print(f"refine count={large_gap_count}")
     t_refine = time.perf_counter()
+    refined_boundary_map: dict[float, Boundary] = {}
     with tempfile.TemporaryDirectory() as tmpdir:
         strategy = ocr_refinement(args.gap, args.crop, tmpdir, args.interval, visual_times)
         splits = [0.0]
@@ -1096,8 +1117,11 @@ def main() -> None:
                       f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
                       f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={result.method}{reason}")
                 splits.append(result.t)
+                refined_boundary_map[result.t] = b
             else:
                 splits.append(vt)
+                if b:
+                    refined_boundary_map[vt] = b
     phase_times["refine"] = time.perf_counter() - t_refine
 
     before_merge = len(splits)
@@ -1106,15 +1130,23 @@ def main() -> None:
         print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
 
     print(f"clips count={len(splits)}")
+    last_label: str | None = None
+    last_idx: int | None = None
     for idx, start in enumerate(splits):
         end = splits[idx + 1] if idx + 1 < len(splits) else duration
         dur = end - start
-        label = _label_for(filtered, start, args.mode)
+        label = _label_for(filtered, start, args.mode, refined_boundary_map)
         print(f"clip {idx+1:02d} start={start:.0f} end={end:.1f} dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}")
+        if args.mode == "daily" and last_label == label and last_idx is not None:
+            prev_dur = start - splits[last_idx]
+            print(f"warn same_date_adjacent clips={last_idx+1},{idx+1} date={label}"
+                  f" durations={prev_dur:.0f}s,{dur:.0f}s")
+        last_label = label
+        last_idx = idx
 
     print(f"cutting out_dir={out_dir}")
     t_cut = time.perf_counter()
-    split_video(video, splits, out_dir, filtered, args.mode)
+    split_video(video, splits, out_dir, filtered, args.mode, refined_boundary_map)
     phase_times["cut"] = time.perf_counter() - t_cut
 
     total = time.perf_counter() - t0
