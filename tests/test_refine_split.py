@@ -272,3 +272,23 @@ class TestRefineSplit:
         )
         assert t == 20.0
         assert method == "coarse"
+
+    def test_transition_at_int_coarse_t_is_found(self):
+        # coarse_t=16.67 (t_last_frame of a 10s/3fps bucket).
+        # Window must include int(coarse_t)=16 so the transition at t=16 is found.
+        # Old code: range(7, 16) → misses 16. New code: range(7, 17) → finds 16.
+        path16 = "/tmp/frame_16.000.bmp"
+        coarse_t = 2 * 10 / 3 * 5   # 5th frame (index 4) of a 3fps/10s scan...
+        # Simpler: use t_last_frame = (FRAMES_PER_SAMPLE-1)*interval/FRAMES_PER_SAMPLE * 3
+        # Actually: just use 16.67 which is int()=16
+        coarse_t = 50.0 / 3.0  # ≈ 16.667, int = 16
+        prev_t = 5.0
+        t, method = _run(
+            coarse_t=coarse_t, prev_t=prev_t,
+            extract_side_effect=lambda v, sec, c, d: path16 if sec == 16 else None,
+            # cam_advance = 420s, video_advance = 11s; 420 > 11+300 → jump
+            ocr_map={path16: "5:07 PM\n 1/ 4/90"},
+        )
+        # Cut = max(prev_t+1, 16-1) = max(6, 15) = 15
+        assert t == 15.0
+        assert method == "ocr"

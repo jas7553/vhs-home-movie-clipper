@@ -51,7 +51,7 @@ ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refine
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (vision/anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
-_CACHE_FORMAT = 2              # increment when cache schema changes; forces re-scan on old caches
+_CACHE_FORMAT = 3              # increment when cache schema changes; forces re-scan on old caches
 _VISUAL_CACHE_FORMAT = 1
 _MIN_GAP_S = 60               # minimum camera-time jump to emit a boundary (internal, not user-tunable)
 
@@ -246,25 +246,29 @@ def scan(
         print(f"  Running OCR on {len(frame_paths)} frames (batch)...", flush=True)
         ocr_results = ocr_batch(frame_paths)
 
-        # Phase 3: group frames by interval window, majority-vote on OCR reading
+        # Phase 3: group frames by interval window, majority-vote on OCR reading.
+        # Key: bucket start label (used only for grouping, not stored in results).
         interval_frames: dict[float, list[str]] = {}
         for path in frame_paths:
-            t = float((frame_index(path) // FRAMES_PER_SAMPLE) * interval)
-            interval_frames.setdefault(t, []).append(path)
+            bucket = float((frame_index(path) // FRAMES_PER_SAMPLE) * interval)
+            interval_frames.setdefault(bucket, []).append(path)
 
-        # (t, datetime|None, raw_text|None) — raw_text is stored in cache so
-        # parse_timestamp fixes propagate without re-scanning.
+        # (t_last_frame, datetime|None, raw_text|None) — t_last_frame is the actual
+        # video time of the last extracted frame in the bucket (a true upper bound on
+        # when any event in that bucket was observed), not the bucket-start label.
+        # raw_text is stored in cache so parse_timestamp fixes propagate without re-scanning.
         results: dict[float, tuple[datetime | None, str | None]] = {}
-        for t, paths in interval_frames.items():
+        for _bucket, paths in interval_frames.items():
+            t_last = float(max(frame_index(p) for p in paths)) * interval / FRAMES_PER_SAMPLE
             frame_data = [(p, ocr_results.get(p, "")) for p in paths]
             parsed = [(p, text, parse_timestamp(text)) for p, text in frame_data]
             valid = [(p, text, dt) for p, text, dt in parsed if dt is not None]
             if not valid:
-                results[t] = (None, None)
+                results[t_last] = (None, None)
             else:
                 winner_dt = Counter(dt for _, _, dt in valid).most_common(1)[0][0]
                 winner_text = next(text for _, text, dt in valid if dt == winner_dt)
-                results[t] = (winner_dt, winner_text)
+                results[t_last] = (winner_dt, winner_text)
 
     sorted_results = sorted(results.items())
     samples = [(t, dt) for t, (dt, _) in sorted_results]
@@ -772,7 +776,7 @@ def _export_vision_frames(
             skipped += 1
             print(f"  boundary coarse={vt:.0f}s: skip — {reason}", flush=True)
             continue
-        window = list(range(int(b.prev_t) + 1, int(vt)))
+        window = list(range(int(b.prev_t) + 1, int(vt) + 1))
         if not window:
             continue
         frames: list[dict] = []
@@ -838,7 +842,7 @@ def refine_split(
     Returns (refined_t, method, detail) where method is 'ocr', 'visual', or 'coarse'
     and detail carries diagnostic context (LDZ span, SDZ-no-anchor, etc.).
     """
-    window = list(range(int(prev_t) + 1, int(coarse_t)))
+    window = list(range(int(prev_t) + 1, int(coarse_t) + 1))
     if not window:
         return coarse_t, "coarse", "empty-window"
 
