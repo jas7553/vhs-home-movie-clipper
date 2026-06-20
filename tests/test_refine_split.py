@@ -5,7 +5,7 @@ import tempfile
 import unittest.mock as mock
 from datetime import datetime
 
-from split_homevideo import refine_split
+from split_homevideo import SPLICE_DEAD_ZONE_MAX_S, refine_split
 
 _CROP = "250:110:385:370"
 _GAP = 300
@@ -324,3 +324,144 @@ class TestRefineSplit:
         # last_old_t=19, first new=20 → cut = max(20, 19) = 20
         assert t == 20.0
         assert method == "ocr"
+
+
+# ---------------------------------------------------------------------------
+# Two-pass hierarchical scan (LDZ-sized windows, span >= SPLICE_DEAD_ZONE_MAX_S)
+# ---------------------------------------------------------------------------
+
+# Window parameters: prev_t=0, coarse_t=200, interval=1 → span=200 >= 120 → two-pass.
+# window = range(1, 201) → 200 elements; step = max(2, 200//50) = 4.
+# coarse_times = [1, 5, 9, ..., 197] (50 elements); tail = [198, 199, 200].
+_LDZ_PREV_T = 0.0
+_LDZ_COARSE_T = 200.0
+_LDZ_INTERVAL = 1
+
+_OLD = "5:00 PM\n 1/ 4/90"   # cam_advance ≈ 0 < gap → old session
+_NEW = "5:10 PM\n 1/ 4/90"   # cam_advance = 600s > GAP(300) → new session
+
+
+class TestRefineSplitTwoPass:
+    """Hierarchical coarse→dense scan for windows wider than SPLICE_DEAD_ZONE_MAX_S."""
+
+    def _run_ldz(self, extract_side_effect, ocr_map, visual_times=None):
+        return _run(
+            coarse_t=_LDZ_COARSE_T, prev_t=_LDZ_PREV_T,
+            extract_side_effect=extract_side_effect,
+            ocr_map=ocr_map,
+            visual_times=visual_times,
+            interval=_LDZ_INTERVAL,
+        )
+
+    def _run_ldz_with_call_count(self, extract_side_effect, ocr_map, visual_times=None):
+        """Like _run_ldz but also returns how many times extract_frame was called."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect) as m_ex, \
+                 mock.patch("split_homevideo.ocr_batch", return_value=ocr_map):
+                t, method, _ = refine_split(
+                    "vid.mp4", _LDZ_COARSE_T, _LDZ_PREV_T, _PREV_DT, _GAP, _CROP, tmpdir,
+                    visual_times, interval=_LDZ_INTERVAL,
+                )
+                return t, method, m_ex.call_count
+
+    def test_two_pass_transition_in_middle_correct_result(self):
+        # Transition at t=100: frames [1..99] = old, [100..200] = new.
+        # Coarse sub-sample (step=4) finds last_old_c=97, first_new_c=101 → dense [97..101].
+        # Walk produces: last_old_t=99, first_new_t=100 → cut = max(100, 99) = 100.
+        paths = {t: f"/tmp/f{t}.bmp" for t in range(1, 201)}
+
+        def extract(v, t, c, d):
+            return paths.get(int(t))
+
+        ocr_map = {paths[t]: (_OLD if t < 100 else _NEW) for t in range(1, 201)}
+        t, method, calls = self._run_ldz_with_call_count(extract, ocr_map)
+        assert t == 100.0
+        assert method == "ocr"
+        # Coarse: 50 samples; dense: at most step+2 = 6 frames. Total << 200.
+        assert calls < 80
+
+    def test_two_pass_fewer_extractions_than_full_scan(self):
+        # Verify that a large window uses far fewer extract_frame calls than its length.
+        # Transition at t=50.
+        paths = {t: f"/tmp/f{t}.bmp" for t in range(1, 201)}
+
+        def extract(v, t, c, d):
+            return paths.get(int(t))
+
+        ocr_map = {paths[t]: (_OLD if t < 50 else _NEW) for t in range(1, 201)}
+        _, _, calls = self._run_ldz_with_call_count(extract, ocr_map)
+        assert calls < 80  # well under 200
+
+    def test_two_pass_all_none_coarse_skips_dense(self):
+        # All extractions fail → coarse is all-None → skip dense scan entirely.
+        # Only the ~50 coarse samples should be attempted.
+        _, _, calls = self._run_ldz_with_call_count(
+            extract_side_effect=lambda v, t, c, d: None,
+            ocr_map={},
+        )
+        assert calls <= 52  # coarse only (50 + possible rounding = ≤52)
+
+    def test_two_pass_all_none_returns_coarse(self):
+        # All-None coarse (LDZ): no visual → fallback to coarse_t.
+        t, method = self._run_ldz(
+            extract_side_effect=lambda v, t, c, d: None,
+            ocr_map={},
+        )
+        assert t == _LDZ_COARSE_T
+        assert method == "coarse"
+
+    def test_two_pass_all_none_visual_anchor_not_used(self):
+        # LDZ (span >= 120s): visual anchor must NOT fire even with visual times present.
+        t, method = self._run_ldz(
+            extract_side_effect=lambda v, t, c, d: None,
+            ocr_map={},
+            visual_times=[50.0],
+        )
+        assert t == _LDZ_COARSE_T
+        assert method == "coarse"
+
+    def test_two_pass_transition_at_start(self):
+        # Transition at very first window frame t=1 → cut = coarse_t = max(0+1, 1-1)=max(1,0)=1.
+        path1 = "/tmp/f1.bmp"
+
+        def extract(v, t, c, d):
+            return path1 if int(t) == 1 else None
+
+        t, method, calls = self._run_ldz_with_call_count(
+            extract_side_effect=extract,
+            ocr_map={path1: _NEW},
+        )
+        assert t == 1.0  # max(prev_t+1, t-1) = max(1, 0) = 1
+        assert method == "ocr"
+        assert calls <= 52  # coarse only (t=1 is first coarse sample, dense = empty)
+
+    def test_two_pass_all_old_in_coarse_scans_tail(self):
+        # All coarse samples confirm old session; transition at t=199 (in tail).
+        # step=4, coarse_times[-1]=197, tail=[198,199,200]; transition at 199.
+        paths = {t: f"/tmp/f{t}.bmp" for t in range(1, 201)}
+
+        def extract(v, t, c, d):
+            return paths.get(int(t))
+
+        ocr_map = {paths[t]: (_OLD if t < 199 else _NEW) for t in range(1, 201)}
+        t, method, calls = self._run_ldz_with_call_count(extract, ocr_map)
+        # last_old_t=198, first_new_t=199 → cut = max(199, 198) = 199
+        assert t == 199.0
+        assert method == "ocr"
+        # Coarse (50) + tail (3) = 53 calls — not the full 200.
+        assert calls <= 60
+
+    def test_two_pass_span_below_threshold_uses_full_scan(self):
+        # span = SPLICE_DEAD_ZONE_MAX_S - 1 < threshold → full dense scan (SDZ path).
+        # Verify all window frames are attempted.
+        sdz_coarse_t = _LDZ_PREV_T + SPLICE_DEAD_ZONE_MAX_S - 1  # span=119 < 120
+        window_len = int(sdz_coarse_t - _LDZ_PREV_T) + _LDZ_INTERVAL - 1  # ≈119
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("split_homevideo.extract_frame", return_value=None) as m_ex, \
+                 mock.patch("split_homevideo.ocr_batch", return_value={}):
+                refine_split(
+                    "vid.mp4", sdz_coarse_t, _LDZ_PREV_T, _PREV_DT, _GAP, _CROP, tmpdir,
+                    interval=_LDZ_INTERVAL,
+                )
+                assert m_ex.call_count == window_len

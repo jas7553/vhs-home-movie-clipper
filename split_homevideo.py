@@ -825,6 +825,51 @@ def _export_vision_frames(
     print(f"Then: python3 split_homevideo.py <video> --vision-readings {os.path.join(export_dir, 'readings.json')}")
 
 
+def _extract_and_ocr_window(
+    video: str, times: list[int], crop: str, tmpdir: str, workers: int,
+) -> tuple[dict[int, str | None], dict[str, str]]:
+    """Extract frames for the given timestamps in parallel, OCR the valid ones."""
+    paths: dict[int, str | None] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_t = {
+            executor.submit(extract_frame, video, float(t), crop, tmpdir): t
+            for t in times
+        }
+        for future in as_completed(future_to_t):
+            paths[future_to_t[future]] = future.result()
+    valid_paths = [p for t in times if (p := paths.get(t)) is not None]
+    return paths, ocr_batch(valid_paths)
+
+
+def _scan_for_transition(
+    times: list[int],
+    paths: dict[int, str | None],
+    ocr_results: dict[str, str],
+    prev_dt: datetime,
+    prev_t: float,
+    gap_s: int,
+) -> tuple[bool, float, float | None]:
+    """Walk frame timestamps in order. Return (any_ocr, last_old_t, first_new_t).
+    first_new_t is None if no new-session frame was found."""
+    any_ocr = False
+    last_old_t: float = prev_t
+    for t in times:
+        path = paths.get(t)
+        if path is None:
+            continue
+        text = ocr_results.get(path, "")
+        dt = parse_timestamp(text) if text else None
+        if dt is None:
+            continue
+        any_ocr = True
+        cam_advance = (dt - prev_dt).total_seconds()
+        video_advance = float(t) - prev_t
+        if cam_advance > video_advance + gap_s or cam_advance < -1800:
+            return any_ocr, last_old_t, float(t)
+        last_old_t = float(t)
+    return any_ocr, last_old_t, None
+
+
 def refine_split(
     video: str,
     coarse_t: float,
@@ -857,6 +902,11 @@ def refine_split(
     [prev_t, coarse_t+interval) — end of the noise burst, not the start. Fallback
     when no visual event exists in the span: coarse_t (end of None-span).
 
+    Large windows (span >= SPLICE_DEAD_ZONE_MAX_S, i.e. LDZ-sized): two-pass
+    hierarchical scan — coarse sub-sample (~50 pts) brackets the transition, then
+    dense 1s scan only within the bracket. SDZ windows always get a full dense scan
+    so the garbled-new heuristic is unaffected.
+
     Returns (refined_t, method, detail) where method is 'ocr', 'visual', or 'coarse'
     and detail carries diagnostic context (LDZ span, SDZ-no-anchor, etc.).
     """
@@ -876,19 +926,43 @@ def refine_split(
         )
         return refined_t, method, ""
 
-    # Extract all frames in the refinement window in parallel, then batch OCR
     workers = (os.cpu_count() or 4) * 2
     paths: dict[int, str | None] = {}
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_t = {
-            executor.submit(extract_frame, video, float(t), crop, tmpdir): t
-            for t in window
-        }
-        for future in as_completed(future_to_t):
-            paths[future_to_t[future]] = future.result()
+    ocr_results: dict[str, str] = {}
+    span = coarse_t - prev_t
 
-    valid_paths = [p for t in window if (p := paths.get(t)) is not None]
-    ocr_results = ocr_batch(valid_paths)
+    if span >= SPLICE_DEAD_ZONE_MAX_S:
+        # Two-pass hierarchical scan for LDZ-sized windows:
+        # 1) Coarse sub-sample (~50 pts) to bracket the transition.
+        # 2) Dense 1s scan only within [last_old, first_new].
+        # If coarse is all-None (true LDZ), skip dense scan entirely.
+        # If coarse is all-old, scan the short tail after the last coarse sample.
+        step = max(2, len(window) // 50)
+        coarse_times = window[::step]
+        c_paths, c_ocr = _extract_and_ocr_window(video, coarse_times, crop, tmpdir, workers)
+        paths.update(c_paths)
+        ocr_results.update(c_ocr)
+        any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
+            coarse_times, paths, ocr_results, prev_dt, prev_t, gap_s,
+        )
+        if first_new_c is not None:
+            lo, hi = int(last_old_c), int(first_new_c)
+            dense_times = [t for t in range(lo, hi + 1) if t not in paths]
+            if dense_times:
+                d_paths, d_ocr = _extract_and_ocr_window(video, dense_times, crop, tmpdir, workers)
+                paths.update(d_paths)
+                ocr_results.update(d_ocr)
+        elif any_ocr_c:
+            tail = [t for t in window if t > coarse_times[-1]]
+            if tail:
+                t_paths, t_ocr = _extract_and_ocr_window(video, tail, crop, tmpdir, workers)
+                paths.update(t_paths)
+                ocr_results.update(t_ocr)
+        # else: all-None coarse → LDZ with unreadable footage; fall through to visual/coarse.
+    else:
+        c_paths, c_ocr = _extract_and_ocr_window(video, window, crop, tmpdir, workers)
+        paths.update(c_paths)
+        ocr_results.update(c_ocr)
 
     any_ocr = False
     last_old_t: float = prev_t
