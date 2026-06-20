@@ -20,6 +20,7 @@ import argparse
 import base64
 import glob
 import json
+import math
 import os
 import re
 import resource
@@ -186,19 +187,27 @@ def frame_index(path: str) -> int:
 
 
 def ocr_batch(paths: list[str]) -> dict[str, str]:
-    """Run ocr_timestamp once over all paths; return {path: raw_text}."""
+    """Run ocr_timestamp in parallel chunks; return {path: raw_text}."""
     if not paths:
         return {}
-    result = subprocess.run(
-        [str(OCR_BIN)] + paths,
-        capture_output=True, text=True,
-    )
-    out: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        if "\t" in line:
-            p, _, text = line.partition("\t")
-            out[p] = text
-    return out
+    n_workers = min(os.cpu_count() or 4, 8)
+    chunk_size = max(1, math.ceil(len(paths) / n_workers))
+    chunks = [paths[i:i + chunk_size] for i in range(0, len(paths), chunk_size)]
+
+    def run_chunk(chunk: list[str]) -> dict[str, str]:
+        result = subprocess.run([str(OCR_BIN)] + chunk, capture_output=True, text=True)
+        out: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if "\t" in line:
+                p, _, text = line.partition("\t")
+                out[p] = text
+        return out
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        merged: dict[str, str] = {}
+        for chunk_result in pool.map(run_chunk, chunks):
+            merged.update(chunk_result)
+    return merged
 
 
 # ------------------------------------------------------------------ #
