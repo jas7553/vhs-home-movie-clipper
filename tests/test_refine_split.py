@@ -25,17 +25,17 @@ def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None, inte
 
 class TestRefineSplit:
     def test_empty_window_returns_coarse(self):
-        # prev_t+1 >= coarse_t → window is empty
+        # interval=1: range(int(10)+1, int(10)+1) = range(11,11) = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method, _ = refine_split("vid.mp4", 10.0, 10.0, _PREV_DT, _GAP, _CROP, tmpdir)
+            t, method, _ = refine_split("vid.mp4", 10.0, 10.0, _PREV_DT, _GAP, _CROP, tmpdir, interval=1)
         assert t == 10.0
         assert method == "coarse"
 
     def test_adjacent_frames_empty_window(self):
-        # window = range(int(9)+1, int(10)) = range(10, 10) = []
+        # interval=1: range(int(9.5)+1, int(9.5)+1) = range(10,10) = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            t, method, _ = refine_split("vid.mp4", 10.0, 9.5, _PREV_DT, _GAP, _CROP, tmpdir)
-        assert t == 10.0
+            t, method, _ = refine_split("vid.mp4", 9.5, 9.5, _PREV_DT, _GAP, _CROP, tmpdir, interval=1)
+        assert t == 9.5
         assert method == "coarse"
 
     def test_returns_coarse_when_no_boundary_found(self):
