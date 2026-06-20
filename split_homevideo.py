@@ -1139,7 +1139,7 @@ def split_video(
 
 # ------------------------------------------------------------------ #
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="Input video file")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
