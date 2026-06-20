@@ -14,15 +14,19 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **The same calendar date must not appear in more than one clip.** If footage from January 6 exists, all of it goes in one clip. A clip may span multiple dates (e.g., a short recording on Jan 4 followed by Jan 5 footage with no significant gap can share a clip), but no date may be split across clips.
 
+**Each clip must contain footage only from its labeled date(s).** A clip named `_1990-01-06` must not include any frames dated 1990-01-05 or 1990-01-07. This is a correctness requirement, not a quality tradeoff — cross-date contamination is a failure regardless of magnitude or duration.
+
 **Clip boundaries must correspond to real pauses in recording.** A split should represent the camera being stopped and restarted — not an artifact of OCR noise, tape degradation, or algorithmic error.
 
 **Output filenames must accurately reflect the date of the footage.** If the clip contains Jan 6 footage, the filename should say `1990-01-06`, not `1990-01-16` due to a misread.
 
-**Boundary timing must be accurate to the actual stop/start frame *where OCR is recoverable*.** For boundaries with readable timestamps on both sides, refinement resolves to 1-second resolution and uses the last frame of the outgoing session as the cut point, not the first frame of the incoming one.
+**Boundary timing must be accurate to within one second of the actual stop/start frame where OCR is recoverable.** Refinement uses the last confirmed old-session frame as the cut point — not the first new-session frame — so no new-date footage appears in the outgoing clip. Frame-level precision (≤1 frame, ~33ms) is the aspirational target; 1-second resolution is the acceptable floor. A cut placed more than 1 second from the true session change, where OCR was readable on both sides of the boundary, is a placement failure.
 
 **At a Splice Dead Zone the boundary is an Ambiguity Window, not a recoverable frame.** Head-switch noise blanks OCR and saturates every visual detector across a ~15s burst, so frame-accurate placement is unsatisfiable there. The cut follows an end-of-noise-burst policy: the noise burst stays with the outgoing clip's tail (objective: zero wrong-date footage in the incoming clip). The cut anchors to the last visual event within the all-`None` span, falling back to the end of that span when no visual event exists. See `docs/adr/0001-splice-boundary-placement-policy.md`.
 
 **Detection and Placement are separate, separately-measured concerns.** Detection (does a boundary exist?) is scored by the golden set's y/n verdicts (F1=0.920). Placement (how many seconds the cut lands from the true session change) requires its own metric — a human-labeled true-change second on Splice Dead Zone boundaries. No boundary-placement change may be merged without a measured placement error; a high Detection F1 says nothing about Placement.
+
+**Splice Dead Zone placement error must not exceed 15s median** (measured against human-labeled true-change seconds on the labeled SDZ set). The current baseline is 17.1s median (28/40 SDZ boundaries, measured 2026-06-19); that baseline is a failure of this requirement and marks the target to beat.
 
 ---
 
