@@ -94,7 +94,17 @@ class RefinementResult(NamedTuple):
 
 RefinementStrategy = Callable[[str, Boundary], RefinementResult]
 
-OcrFn = Callable[[list[int]], dict[int, datetime | None]]
+
+class Reading(NamedTuple):
+    """One refinement-scan frame: the parsed timestamp (or None) plus the raw OCR
+    text. Refinement keeps the raw text so it can classify garbled gap frames whose
+    date is partially legible but rejected by the strict parser (see
+    _gap_date_class / _place_content_aware)."""
+    dt:  datetime | None
+    raw: str
+
+
+OcrFn = Callable[[list[int]], dict[int, Reading]]
 
 
 class PlacementPolicy(Protocol):
@@ -662,7 +672,7 @@ def _extract_and_ocr_window(
 
 def _scan_for_transition(
     times: list[int],
-    readings: dict[int, datetime | None],
+    readings: dict[int, Reading],
     prev_dt: datetime,
     prev_t: float,
     gap_s: int,
@@ -672,7 +682,8 @@ def _scan_for_transition(
     any_ocr = False
     last_old_t: float = prev_t
     for t in times:
-        dt = readings.get(t)
+        reading = readings.get(t)
+        dt = reading.dt if reading is not None else None
         if dt is None:
             continue
         any_ocr = True
@@ -684,14 +695,98 @@ def _scan_for_transition(
     return any_ocr, last_old_t, None
 
 
+# Lenient date-field extractors for garbled gap frames. The strict parser
+# (parse_timestamp) rejects these — missing/garbled month, doubled slash, etc. —
+# but the day immediately before the two-digit year and the leading month before
+# the first slash survive OCR mangling well enough to tell old-date from new-date
+# content. The year may OCR as 7x/8x/9x, hence the [789]\d class.
+_DAY_BEFORE_YEAR = re.compile(r"(\d{1,2})\s*[/.\s\-]\s*([789]\d)(?!\d)")
+_MONTH_LEAD = re.compile(r"(?<!\d)(\d{1,2})\s*/")
+
+
+def _lenient_days(raw: str) -> set[int]:
+    out: set[int] = set()
+    for m in _DAY_BEFORE_YEAR.finditer(raw):
+        d = int(m.group(1))
+        if d > 31:                       # e.g. "074/90" -> "74"; retry trailing digit -> 4
+            d = int(m.group(1)[-1])
+        if 1 <= d <= 31:
+            out.add(d)
+    return out
+
+
+def _lenient_months(raw: str) -> set[int]:
+    out: set[int] = set()
+    for m in _MONTH_LEAD.finditer(raw):
+        mo = int(m.group(1))
+        if mo > 12:
+            mo = int(m.group(1)[-1])
+        if 1 <= mo <= 12:
+            out.add(mo)
+    return out
+
+
+def _gap_date_class(raw: str, old_dt: datetime, new_dt: datetime) -> str:
+    """Classify a garbled gap frame as 'old', 'new', or 'noise' by which session's
+    date its recoverable digits match. Only fields that *differ* between the two
+    sessions discriminate; a field shared by both (e.g. same day) is ignored."""
+    days = _lenient_days(raw)
+    months = _lenient_months(raw)
+    new_hit = (new_dt.day in days and new_dt.day != old_dt.day) \
+        or (new_dt.month in months and new_dt.month != old_dt.month)
+    old_hit = (old_dt.day in days and old_dt.day != new_dt.day) \
+        or (old_dt.month in months and old_dt.month != new_dt.month)
+    if new_hit and not old_hit:
+        return "new"
+    if old_hit and not new_hit:
+        return "old"
+    return "noise"
+
+
+def _place_content_aware(
+    window: list[int],
+    readings: dict[int, Reading],
+    last_old_t: float,
+    first_new_t: float,
+    old_dt: datetime,
+    new_dt: datetime | None,
+) -> float:
+    """Decide the cut across the unreadable gap between the last confirmed old-session
+    frame and the first confirmed new-session frame.
+
+    The gap is one of three things and the correct cut differs (REQUIREMENTS L23/L25):
+      - garbled NEW-date footage  -> cut at its start, so none leaks into the old clip;
+      - garbled OLD-date footage  -> keep it with the old clip;
+      - a head-switch noise burst -> keep it with the old clip (ADR-0001 end-of-burst).
+    Classify each gap frame by its recoverable date digits. Old content extends the
+    confirmed-old run through the last 'old'-classified frame; the cut lands on the
+    first 'new'-classified frame after that. When no new-date content is visible in
+    the gap (pure noise, or all-old garble), fall back to the conservative
+    end-of-gap placement, which keeps the ambiguous span with the outgoing clip."""
+    fallback = max(last_old_t + 1.0, first_new_t - 1.0)
+    if new_dt is None or new_dt.date() == old_dt.date():
+        return fallback
+    gap = [t for t in window if last_old_t < t < first_new_t]
+    classes = {
+        t: _gap_date_class(readings[t].raw, old_dt, new_dt)
+        for t in gap if t in readings
+    }
+    last_old_garble = max(
+        (t for t in gap if classes.get(t) == "old"), default=int(last_old_t),
+    )
+    new_frames = [t for t in gap if t > last_old_garble and classes.get(t) == "new"]
+    return float(min(new_frames)) if new_frames else fallback
+
+
 def make_ocr_fn(video: str, crop: str, tmpdir: str, workers: int) -> OcrFn:
     """Production OcrFn: extracts frames via ffmpeg, parses timestamps via OCR binary."""
-    def ocr_fn(times: list[int]) -> dict[int, datetime | None]:
+    def ocr_fn(times: list[int]) -> dict[int, Reading]:
         paths, raw = _extract_and_ocr_window(video, times, crop, tmpdir, workers)
-        return {
-            t: (parse_timestamp(raw.get(p, "")) if (p := paths.get(t)) is not None else None)
-            for t in times
-        }
+        out: dict[int, Reading] = {}
+        for t in times:
+            text = raw.get(p, "") if (p := paths.get(t)) is not None else ""
+            out[t] = Reading(parse_timestamp(text) if p is not None else None, text)
+        return out
     return ocr_fn
 
 
@@ -718,7 +813,7 @@ class LongDeadZonePolicy:
         window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
         step = max(2, len(window) // 50)
         coarse_times = window[::step]
-        readings: dict[int, datetime | None] = dict(ocr_fn(coarse_times))
+        readings: dict[int, Reading] = dict(ocr_fn(coarse_times))
         any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
             coarse_times, readings, prev_dt, prev_t, self._gap_s,
         )
@@ -737,7 +832,9 @@ class LongDeadZonePolicy:
             window, readings, prev_dt, prev_t, self._gap_s,
         )
         if first_new_t is not None:
-            return RefinementResult(max(last_old_t + 1.0, first_new_t - 1.0), "ocr", "")
+            new_dt = readings[int(first_new_t)].dt
+            cut = _place_content_aware(window, readings, last_old_t, first_new_t, prev_dt, new_dt)
+            return RefinementResult(cut, "ocr", "")
         detail = f"LDZ {span:.0f}s" if not any_ocr else "all-old-in-window"
         return RefinementResult(coarse_t, "coarse", detail)
 
@@ -746,8 +843,9 @@ class ShortSpanPolicy:
     """Refinement for boundaries with span < SPLICE_DEAD_ZONE_MAX_S.
 
     Single dense scan of the full window. Handles three outcomes in priority order:
-    1. OCR transition found → cut between last old and first new frame.
-    2. Garbled new-session OCR → cut just after last confirmed old frame.
+    1. OCR transition found → content-aware cut across the gap (_place_content_aware):
+       at the first garbled-new frame, else end-of-gap when the gap is old/noise.
+    2. Garbled new-session OCR (no clean new frame at all) → cut just after last old.
     3. All-None (Splice Dead Zone) → anchor to last visual event, or coarse_t fallback.
     """
 
@@ -770,7 +868,9 @@ class ShortSpanPolicy:
         )
 
         if first_new_t is not None:
-            return RefinementResult(max(last_old_t + 1.0, first_new_t - 1.0), "ocr", "")
+            new_dt = readings[int(first_new_t)].dt
+            cut = _place_content_aware(window, readings, last_old_t, first_new_t, prev_dt, new_dt)
+            return RefinementResult(cut, "ocr", "")
 
         # Old-session confirmed but new-session OCR garbled (frames after last_old_t
         # returned None — extracted but parse_timestamp rejected them, e.g. missing day field).
@@ -778,7 +878,8 @@ class ShortSpanPolicy:
         # on normal end-of-window sparseness.
         if (any_ocr
                 and (coarse_t - last_old_t) > 10
-                and any(readings.get(t) is None for t in window if t > int(last_old_t))):
+                and any((r := readings.get(t)) is None or r.dt is None
+                        for t in window if t > int(last_old_t))):
             return RefinementResult(last_old_t + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s")
 
         # Splice Dead Zone: anchor to LAST visual event within [prev_t, coarse_t).

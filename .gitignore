@@ -33,3 +33,6 @@ vision_frames/
 
 # Local scratch: caches, generated clips, preserved readings backups (multi-GB)
 archive/
+
+# Local scratch: issue notes, probe/measurement scripts, montages — not part of the tool
+.scratch/

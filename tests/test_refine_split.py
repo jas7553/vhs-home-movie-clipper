@@ -5,23 +5,31 @@ import tempfile
 import unittest.mock as mock
 from datetime import datetime
 
-from split_homevideo import SPLICE_DEAD_ZONE_MAX_S, Boundary, ocr_refinement
+from split_homevideo import (
+    SPLICE_DEAD_ZONE_MAX_S,
+    Boundary,
+    Reading,
+    _gap_date_class,
+    _place_content_aware,
+    ocr_refinement,
+)
 
 _CROP = "250:110:385:370"
 _GAP = 300
 _PREV_DT = datetime(1990, 1, 4, 17, 0)
 
 
-def _boundary(coarse_t, prev_t):
+def _boundary(coarse_t, prev_t, prev_dt=_PREV_DT):
     return Boundary(
         video_t=coarse_t, type="large_gap",
-        cam_before=_PREV_DT, cam_after=None, cam_jump_s=0.0,
-        prev_t=prev_t, prev_dt=_PREV_DT,
+        cam_before=prev_dt, cam_after=None, cam_jump_s=0.0,
+        prev_t=prev_t, prev_dt=prev_dt,
     )
 
 
-def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None, interval=10):
-    b = _boundary(coarse_t, prev_t)
+def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None, interval=10,
+         prev_dt=_PREV_DT):
+    b = _boundary(coarse_t, prev_t, prev_dt)
     with tempfile.TemporaryDirectory() as tmpdir:
         strategy = ocr_refinement(_GAP, _CROP, tmpdir, interval, visual_times)
         with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect), \
@@ -470,3 +478,109 @@ class TestRefineSplitTwoPass:
                  mock.patch("split_homevideo.ocr_batch", return_value={}):
                 strategy("vid.mp4", b)
                 assert m_ex.call_count == window_len
+
+
+# ---------------------------------------------------------------------------
+# Content-aware gap placement: classify garbled gap frames as old/new/noise so
+# the cut keeps new-date content out of the outgoing clip (REQUIREMENTS L23) but
+# still keeps old-date / noise garble with it (ADR-0001). Strings below are real
+# OCR captured from Converse 1990.mp4 at the named boundaries (.scratch/probe_gaps.py).
+# ---------------------------------------------------------------------------
+
+class TestGapDateClass:
+    def test_clip71_garbled_new_classified_new(self):
+        old, new = datetime(1990, 9, 29), datetime(1990, 10, 4)
+        for raw in ("4/90", "074/90", "07 4/90", "0/ 4/90", "102 4/90", "107 4/90"):
+            assert _gap_date_class(raw, old, new) == "new", raw
+
+    def test_b5717_garbled_old_classified_old(self):
+        old, new = datetime(1990, 2, 17), datetime(1990, 2, 21)
+        assert _gap_date_class("6:15-P 2717/90", old, new) == "old"
+
+    def test_b5717_no_frame_misclassified_new(self):
+        # An all-old garble gap must never produce a 'new' classification (would
+        # leak old footage forward). 2/21 day '21' appears nowhere in the gap.
+        old, new = datetime(1990, 2, 17), datetime(1990, 2, 21)
+        for raw in ("6:15- 271 730", ":15 PM 7290,", "6:15-B 27 790", "6:15 A 27 1130"):
+            assert _gap_date_class(raw, old, new) != "new", raw
+
+    def test_b457_new_via_day_before_year(self):
+        old, new = datetime(1990, 1, 4), datetime(1990, 1, 5)
+        assert _gap_date_class("11:40 AM 5/90", old, new) == "new"
+        assert _gap_date_class("", old, new) == "noise"
+
+    def test_b10567_new_via_leading_month(self):
+        # day 6 is hard to recover mid-gap; the leading month '5/' carries it.
+        old, new = datetime(1990, 4, 29), datetime(1990, 5, 6)
+        assert _gap_date_class("15 -5/ A 790", old, new) == "new"
+
+    def test_same_field_shared_is_ignored(self):
+        # old 1/4, new 1/4 (time-only jump): no field discriminates → never 'new'.
+        old = new = datetime(1990, 1, 4)
+        assert _gap_date_class("5:03 PM 4/90", old, new) == "noise"
+
+
+class TestPlaceContentAware:
+    def _readings(self, mapping):
+        from split_homevideo import parse_timestamp
+        return {t: Reading(parse_timestamp(raw), raw) for t, raw in mapping.items()}
+
+    def test_garbled_new_cuts_at_content_start(self):
+        # clip71: gap 6..14 is garbled 10/4; cut must land at gap start (6), not first_new-1 (14).
+        old, new = datetime(1990, 9, 29), datetime(1990, 10, 4)
+        raws = {5: "9/29/90", 6: "4/90", 7: "074/90", 8: "07 4/90", 9: "06",
+                10: "4/90 10", 11: "0/ 4/90", 12: "102 4/90", 13: "107 4/90",
+                14: "4/90", 15: "10/ 4/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new)
+        assert cut == 6.0
+
+    def test_garbled_old_falls_back_to_end_of_gap(self):
+        # b_5717: gap is garbled 2/17 (old); keep it with old clip → first_new-1.
+        old, new = datetime(1990, 2, 17), datetime(1990, 2, 21)
+        raws = {5: "6:15 PM 2/17/90", 6: "6:15- 271 730", 7: "6:15-P 2717/90",
+                8: "6:15-B 27 790", 15: "6:51 PM 2/21/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new)
+        assert cut == 14.0  # max(5+1, 15-1)
+
+    def test_old_then_noise_then_new_cuts_at_new_run(self):
+        # b_18577 shape: garbled-old, then a noise burst, then garbled-new at the end.
+        old, new = datetime(1990, 8, 4), datetime(1990, 8, 9)
+        raws = {5: "38 PM 8/ 4 /90", 6: "87-4790", 7: "·4790", 8: "", 9: "",
+                12: "8/ 34 PM 9/90", 15: "84 PM 8/ 9/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new)
+        assert cut == 12.0  # first 'new'-classified frame after the old garble
+
+    def test_same_date_jump_uses_fallback(self):
+        # new_dt date == old_dt date (time-only jump) → no content reasoning, fallback.
+        old = new = datetime(1990, 1, 4)
+        raws = {5: "5:00 PM 1/ 4/90", 10: "5:10 PM 1/ 4/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 10.0, old, new)
+        assert cut == 9.0  # max(5+1, 10-1)
+
+
+class TestContentAwareEndToEnd:
+    def test_clip71_short_span_policy_cuts_early(self):
+        # Full ShortSpanPolicy path with real garbled-new gap strings: the cut must
+        # move from the old max() result (14) to the new content start (6).
+        # Footage here is date-only (overlay shows no time) → prev_dt is midnight,
+        # matching the date-only "9/29/90" old frames (which parse to midnight).
+        prev_dt = datetime(1990, 9, 29)
+        raws = {5: "9/29/90", 6: "4/90", 7: "074/90", 8: "07 4/90", 9: "06",
+                10: "4/90 10", 11: "0/ 4/90", 12: "102 4/90", 13: "107 4/90",
+                14: "4/90", 15: "10/ 4/90"}
+        paths = {t: f"/tmp/f{t}.bmp" for t in raws}
+
+        def extract(v, t, c, d):
+            return paths.get(int(t))
+
+        ocr_map = {paths[t]: raws[t] for t in raws}
+        t, method = _run(
+            coarse_t=20.0, prev_t=1.0, extract_side_effect=extract,
+            ocr_map=ocr_map, interval=10, prev_dt=prev_dt,
+        )
+        assert t == 6.0
+        assert method == "ocr"
