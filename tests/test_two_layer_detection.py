@@ -49,7 +49,7 @@ def samples():
 
 @pytest.fixture(scope="module")
 def boundaries(samples):
-    return find_all_boundaries(filter_ocr_outliers(samples))
+    return find_all_boundaries(filter_ocr_outliers(samples), gap_s=GAP_S)
 
 
 class TestSessionMode:
