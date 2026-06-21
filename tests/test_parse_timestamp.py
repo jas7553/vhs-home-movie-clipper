@@ -4,10 +4,13 @@ parse_timestamp() converts raw OCR text to a datetime.
 Tape format: bottom line "M/ D/YY", top line "H:MM AM/PM", often split
 across newlines with extra whitespace. The function must be robust to OCR
 noise while still rejecting hallucinations (years outside 1985–2005,
-month > 12, missing time, etc.).
+month > 12, etc.).
 
-No-time rejection is intentional: defaulting to 00:00 would produce huge
-false time-jumps that trigger spurious clip splits.
+Date-only readings are accepted (time falls back to midnight): the camcorder
+overlay can be set to show the date without a time, producing long date-only
+spans. Rejecting them made those spans invisible to boundary detection and
+collapsed several real date changes into one clip. The "00:00 causes false
+jumps" hazard is handled downstream (outlier filter + daily-mode date grouping).
 """
 from datetime import datetime
 
@@ -64,10 +67,28 @@ class TestInvalidDateCombination:
         assert parse_timestamp("5:01 PM\n2/30/90") is None
 
 
+class TestDateOnly:
+    """Date-only readings (no time, or time without a meridian) fall back to
+    midnight and keep the date — the camcorder overlay can show date-only."""
+
+    def test_date_without_time(self):
+        assert parse_timestamp("1/ 4/90") == datetime(1990, 1, 4, 0, 0)
+
+    def test_date_only_compact(self):
+        assert parse_timestamp("8/27/90") == datetime(1990, 8, 27, 0, 0)
+
+    def test_time_without_meridian_keeps_date(self):
+        # "7:14" with no AM/PM is ambiguous — drop the time, keep the date.
+        assert parse_timestamp("7:14\n 1/ 4/90") == datetime(1990, 1, 4, 0, 0)
+
+    def test_date_only_still_range_checks_year(self):
+        assert parse_timestamp("1/ 1/79") is None    # 2079, out of range
+        assert parse_timestamp("1/ 1/84") is None    # 1984, below floor
+
+
 @pytest.mark.parametrize("text", [
     "",
     "blurry static ~~~",
-    "1/ 4/90",          # date without time — 00:00 default would cause false jumps
     "5:01 PM",          # time without date
     "5:01 PM\n13/ 4/90",  # month > 12
     "5:01 PM\n 1/32/90",  # day > 31
@@ -76,7 +97,6 @@ class TestInvalidDateCombination:
     "5:01 PM\n1/ 1/79",   # 79 → 2079, outside 1985–2005
     "5:01 PM\n1/ 1/84",   # 84 → 1984, just below range floor
     "5:01 PM\n 1  4 90",  # space-only date separators (no "/") — misread, reject
-    "7:14\n 1/ 4/90",     # missing AM/PM — ambiguous, reject
     "11 5/90",            # month misread: space before first "/" only, no leading slash
 ])
 def test_rejected(text: str):

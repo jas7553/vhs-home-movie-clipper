@@ -3,7 +3,7 @@
 Split a home video into logical clips by reading the burned-in timestamp.
 
 Usage:
-    python3 split_homevideo.py <input.mp4> [--interval 10] [--gap 300] [--out-dir ./clips]
+    python3 split_homevideo.py <input.mp4> [--interval 10] [--gap 3600] [--out-dir ./clips]
 
 Arguments:
     --interval  Seconds between sampled frames (default: 10)
@@ -49,7 +49,9 @@ ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refine
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (vision/anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
-_CACHE_FORMAT = 4              # increment when cache schema changes; forces re-scan on old caches
+_CACHE_FORMAT = 5              # increment when cache schema changes; forces re-scan on old caches
+                              # (5: date-only readings accepted — _vote_bucket now stores date-only
+                              #  text that v4 discarded, so old caches must be regenerated)
                               # (4: crop-primary scan with preprocessing fallback — supersedes v3 all-preprocessed)
 _VISUAL_CACHE_FORMAT = 1
 _MIN_GAP_S = 60               # minimum camera-time jump to emit a boundary (internal, not user-tunable)
@@ -63,10 +65,10 @@ MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fp
 # yadif: deinterlaces VHS comb artifacts; format=gray: removes color noise Vision ignores anyway;
 # scale 4×: more glyph detail than 3×; unsharp: crisp edges post-scale; eq: harden contrast.
 # Measured on Converse 1990.mp4 (150 frames spread across the file): crop-only OCR parses
-# 46% of frames, this chain only 33% — the unsharp+contrast=2.0 blows out the timestamp on a
+# 67% of frames, this chain only 45% — the unsharp+contrast=2.0 blows out the timestamp on a
 # large class of (brighter/lower-contrast) frames, turning readable footage into all-None
 # "dead zones". So scan() runs crop-only first and only applies this chain to buckets crop-only
-# could not read (it uniquely recovers ~5% that crop-only misses). See scan().
+# could not read (it uniquely recovers a few % that crop-only misses). See scan().
 _VF_PREPROCESS = "yadif,format=gray,scale=iw*4:ih*4:flags=lanczos,unsharp=5:5:2.0,eq=contrast=2.0:brightness=0.05"
 FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote → fewer misreads
 
@@ -129,17 +131,28 @@ def parse_timestamp(text: str) -> datetime | None:
     # Reject implausible years for home VHS footage (1985–2005)
     if not (1985 <= year <= 2005):
         return None
-    # Require a real time parse — defaulting to 00:00 on failure causes huge false jumps
-    if not time_m:
-        return None
-    hour, minute = int(time_m.group(1)), int(time_m.group(2))
-    ampm = (time_m.group(3) or "").upper()
-    if not ampm:
-        return None
-    if ampm == "PM" and hour != 12:
-        hour += 12
-    elif ampm == "AM" and hour == 12:
-        hour = 0
+    # Time is optional. A fully-qualified time (H:MM AM/PM) is used as-is; when
+    # the time is absent, or its meridian is missing, fall back to midnight and
+    # keep the date. Date-only readings are real on this footage: the camcorder
+    # overlay can be set to show the date without a time, producing long spans
+    # (e.g. 8/27, 9/2, 10/6 over 36 min) where every frame is date-only.
+    # Rejecting them (the old behavior) made those spans invisible to boundary
+    # detection, collapsing several real date changes into one clip — cross-date
+    # contamination, a correctness failure. The "00:00 causes huge false jumps"
+    # hazard the old guard worried about is absorbed downstream: filter_ocr_
+    # outliers drops a lone midnight reading sitting among timed frames (its
+    # drift to both timed neighbors is large while they bridge each other), and
+    # daily-mode grouping cuts only on date changes, so an intra-day midnight
+    # jump never becomes a clip boundary.
+    hour, minute = 0, 0
+    if time_m:
+        ampm = (time_m.group(3) or "").upper()
+        if ampm:
+            hour, minute = int(time_m.group(1)), int(time_m.group(2))
+            if ampm == "PM" and hour != 12:
+                hour += 12
+            elif ampm == "AM" and hour == 12:
+                hour = 0
     try:
         return datetime(year, month, day, hour, minute)
     except ValueError:
@@ -154,7 +167,7 @@ def extract_frame(video: str, t: float, crop: str, tmpdir: str, preprocess: bool
     """Extract one cropped frame to a BMP; return path or None on failure.
 
     Default is crop-only: it has a higher OCR yield than the _VF_PREPROCESS chain
-    (46% vs 33% on the test file), so it is the primary path everywhere — including
+    (67% vs 45% on the test file), so it is the primary path everywhere — including
     refinement, which calls this without overriding the default. preprocess=True is
     the fallback applied only to frames crop-only cannot read (see scan()).
     """
@@ -548,13 +561,24 @@ def detect_visual_boundaries(
 
     Returns (scene_cut_times, black_frame_times), both sorted lists of video_t.
     """
+    cached: dict | None = None
     if cache_path and os.path.exists(cache_path):
         with open(cache_path) as f:
             cached = json.load(f)
         if (cached.get("cache_format") == _VISUAL_CACHE_FORMAT
                 and cached.get("scene_threshold") == scene_threshold
                 and cached.get("black_min_duration") == black_min_duration):
+            print(f"  (loaded from visual cache: {cache_path})")
             return cached["scene_cuts"], cached["black_frames"]
+        # Cache present but stale: say why before paying for a full re-decode.
+        why = []
+        if cached.get("cache_format") != _VISUAL_CACHE_FORMAT:
+            why.append(f"cache_format={cached.get('cache_format')}!={_VISUAL_CACHE_FORMAT}")
+        if cached.get("scene_threshold") != scene_threshold:
+            why.append(f"scene_threshold={cached.get('scene_threshold')}!={scene_threshold}")
+        if cached.get("black_min_duration") != black_min_duration:
+            why.append(f"black_min_duration={cached.get('black_min_duration')}!={black_min_duration}")
+        print(f"  (visual cache miss: {'; '.join(why) or 'unknown'})")
 
     cmd = [
         "ffmpeg", "-loglevel", "info",
