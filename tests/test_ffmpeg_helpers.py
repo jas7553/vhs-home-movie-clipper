@@ -24,6 +24,14 @@ class TestFfmpegCopySeg:
             _ffmpeg_copy_seg("vid.mp4", 0.0, 10.0, "/out/seg.mp4")
         assert m.call_args[1].get("check") is True
 
+    def test_igndts_flag_present(self):
+        with mock.patch("subprocess.run") as m:
+            _ffmpeg_copy_seg("vid.mp4", 0.0, 10.0, "/out/seg.mp4")
+        cmd = m.call_args[0][0]
+        assert "-fflags" in cmd
+        fflags_idx = cmd.index("-fflags")
+        assert "+igndts" in cmd[fflags_idx + 1]
+
 
 class TestFfmpegEncodeSeg:
     def test_calls_ffmpeg_with_libx264(self):

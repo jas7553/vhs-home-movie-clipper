@@ -1301,6 +1301,7 @@ def _ffmpeg_copy_seg(video: str, seg_start: float, seg_end: float, out: str):
         "-map", "0:v:0", "-map", "0:a:0",
         "-c", "copy",
         "-video_track_timescale", str(VIDEO_TIMESCALE),
+        "-fflags", "+igndts",  # recompute DTS from PTS; prevents non-monotonic DTS from VFR source regions
         "-avoid_negative_ts", "make_zero",
         "-y", out,
     ], check=True)
@@ -1390,7 +1391,7 @@ def cut_clip_with_boundary_encode(
             "-i", list_path,
             "-c", "copy",
             "-video_track_timescale", str(VIDEO_TIMESCALE),
-            "-fflags", "+genpts",
+            "-fflags", "+igndts",  # ignore input DTS; recompute from PTS across the concat seam
             "-avoid_negative_ts", "make_zero",
             "-muxpreload", "0",
             "-muxdelay", "0",
