@@ -67,6 +67,28 @@ class TestInvalidDateCombination:
         assert parse_timestamp("5:01 PM\n2/30/90") is None
 
 
+class TestTimeWithSeconds:
+    """H:MM:SS AM/PM — seconds tolerated, ignored downstream."""
+
+    def test_seconds_pm(self):
+        assert parse_timestamp("8:00:26 PM\n 1/ 4/90") == datetime(1990, 1, 4, 20, 0)
+
+    def test_seconds_am(self):
+        assert parse_timestamp("9:15:03 AM\n 3/15/95") == datetime(1995, 3, 15, 9, 15)
+
+    def test_seconds_no_meridian_falls_back_to_midnight(self):
+        # no AM/PM → ambiguous → keep date, midnight
+        assert parse_timestamp("7:14:55\n 1/ 4/90") == datetime(1990, 1, 4, 0, 0)
+
+    def test_seconds_do_not_corrupt_date(self):
+        # ensure :26 is not mistaken for a date component
+        result = parse_timestamp("8:00:26 PM\n11/26/92")
+        assert result == datetime(1992, 11, 26, 20, 0)
+
+    def test_existing_hhmm_still_works(self):
+        assert parse_timestamp("5:01 PM\n 1/ 4/90") == datetime(1990, 1, 4, 17, 1)
+
+
 class TestDateOnly:
     """Date-only readings (no time, or time without a meridian) fall back to
     midnight and keep the date — the camcorder overlay can show date-only."""

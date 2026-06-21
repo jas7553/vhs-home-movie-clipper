@@ -153,7 +153,7 @@ _MONTH_MAP = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 TIME_PATTERN = re.compile(
-    r"(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?", re.IGNORECASE
+    r"(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM|am|pm)?", re.IGNORECASE
 )
 
 
