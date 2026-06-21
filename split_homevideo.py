@@ -772,15 +772,13 @@ def drop_digit_drop_runs(
 def drop_year_misread_runs(
     samples: list[tuple[float, datetime | None]],
 ) -> list[tuple[float, datetime | None]]:
-    """Drop runs of same-date readings that are in-range year misreads.
+    """Drop contiguous blocks of runs that are in-range year misreads.
 
-    A run whose year differs from both the left and right outer run's year,
-    while sharing the same month as both, is a year misread (e.g. 1990→1999
-    within April). Genuine New-Year boundaries always co-change month, so
-    same-month context safely constrains the drop.
-
-    The outer runs must share the same year — guards against dropping a run
-    that sits legitimately between two advancing years (1990-Apr→1991-Apr→1992-Apr).
+    A maximal span of one or more adjacent runs whose years all differ from the
+    bracketing real runs' year, while sharing the same month, is a year-misread
+    cluster (e.g. 1990-04-29 / [1991-04-29, 1991-04-28] / 1990-04-29).  The
+    outer runs must share the same year.  Genuine New-Year boundaries always
+    co-change month, so same-month context safely constrains the drop.
     """
     dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
     if len(dated) < 3:
@@ -803,17 +801,25 @@ def drop_year_misread_runs(
         return samples
 
     drop: set[int] = set()
-    for r in range(1, len(runs) - 1):
-        run_date, run_indices = runs[r]
+    r = 1
+    while r < len(runs) - 1:
         left_date = runs[r - 1][0]
-        right_date = runs[r + 1][0]
-        if (
-            left_date.year == right_date.year
-            and run_date.year != left_date.year
-            and run_date.month == left_date.month
-            and run_date.month == right_date.month
+        # Advance block_end over all consecutive runs with year≠left_year and month==left_month
+        block_end = r
+        while (
+            block_end < len(runs) - 1
+            and runs[block_end][0].year != left_date.year
+            and runs[block_end][0].month == left_date.month
         ):
-            drop.update(run_indices)
+            block_end += 1
+        if block_end > r:
+            right_date = runs[block_end][0]
+            if right_date.year == left_date.year and right_date.month == left_date.month:
+                for inner_r in range(r, block_end):
+                    drop.update(runs[inner_r][1])
+                r = block_end + 1
+                continue
+        r += 1
 
     return [s for i, s in enumerate(samples) if i not in drop]
 

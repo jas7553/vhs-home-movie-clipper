@@ -265,6 +265,30 @@ class TestDropYearMisreadRuns:
         result = ymd(drop_year_misread_runs(s))
         assert result == [(1990,4,29)] * 4
 
+    def test_two_adjacent_phantom_runs_collapsed(self):
+        # Real 4/29 case: [1990-04-29, 1991-04-29, 1991-04-28, 1990-04-29]
+        # Both phantom runs have year≠1990 and month==4 — collapse as one block
+        s = mk_yr([
+            (1990,4,29),(1990,4,29),
+            (1991,4,29),(1991,4,29),
+            (1991,4,28),(1991,4,28),
+            (1990,4,29),(1990,4,29),
+        ])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,4,29)] * 4
+
+    def test_three_adjacent_phantom_runs_collapsed(self):
+        # Three inner phantom runs — all same-month, different year → drop whole block
+        s = mk_yr([
+            (1990,4,29),(1990,4,29),
+            (1991,4,29),(1991,4,29),
+            (1991,4,28),(1991,4,28),
+            (1991,4,27),(1991,4,27),
+            (1990,4,29),(1990,4,29),
+        ])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,4,29)] * 4
+
     def test_passthrough_too_short(self):
         s = mk_yr([(1990,4,29),(1999,4,29)])
         assert drop_year_misread_runs(s) == s
