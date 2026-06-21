@@ -1004,9 +1004,16 @@ def _scan_for_transition(
     gap_s: int,
 ) -> tuple[bool, float, float | None]:
     """Walk frame timestamps in order. Return (any_ocr, last_old_t, first_new_t).
-    first_new_t is None if no new-session frame was found."""
+    first_new_t is None if no new-session frame was found.
+
+    Scans all frames rather than stopping at the first apparent jump, so that a
+    single garbled frame misread as the new date (a false positive) is rejected
+    when the very next legible frame reverts to the old session.  The returned
+    first_new_t is the first *sustained* new-session reading — one not immediately
+    followed by an old-session reading."""
     any_ocr = False
     last_old_t: float = prev_t
+    candidate_new_t: float | None = None
     for t in times:
         reading = readings.get(t)
         dt = reading.dt if reading is not None else None
@@ -1015,10 +1022,15 @@ def _scan_for_transition(
         any_ocr = True
         cam_advance = (dt - prev_dt).total_seconds()
         video_advance = float(t) - prev_t
-        if cam_advance > video_advance + gap_s or cam_advance < -1800:
-            return any_ocr, last_old_t, float(t)
-        last_old_t = float(t)
-    return any_ocr, last_old_t, None
+        is_new = cam_advance > video_advance + gap_s or cam_advance < -1800
+        if is_new:
+            if candidate_new_t is None:
+                candidate_new_t = float(t)
+        else:
+            # Old-session frame after a candidate jump → false positive; reset.
+            candidate_new_t = None
+            last_old_t = float(t)
+    return any_ocr, last_old_t, candidate_new_t
 
 
 # Lenient date-field extractors for garbled gap frames. The strict parser
@@ -1076,32 +1088,51 @@ def _place_content_aware(
     first_new_t: float,
     old_dt: datetime,
     new_dt: datetime | None,
+    visual_times: list[float] | None = None,
 ) -> float:
     """Decide the cut across the unreadable gap between the last confirmed old-session
     frame and the first confirmed new-session frame.
 
     The gap is one of three things and the correct cut differs (REQUIREMENTS L23/L25):
       - garbled NEW-date footage  -> cut at its start, so none leaks into the old clip;
-      - garbled OLD-date footage  -> keep it with the old clip;
-      - a head-switch noise burst -> keep it with the old clip (ADR-0001 end-of-burst).
+      - garbled OLD-date footage  -> keep it with the old clip (ADR-0001);
+      - a head-switch noise burst -> anchor to last visual event in the burst, or
+                                     cut at last_old_t+1 when no signal exists (L23).
     Classify each gap frame by its recoverable date digits. Old content extends the
     confirmed-old run through the last 'old'-classified frame; the cut lands on the
-    first 'new'-classified frame after that. When no new-date content is visible in
-    the gap (pure noise, or all-old garble), fall back to the conservative
-    end-of-gap placement, which keeps the ambiguous span with the outgoing clip."""
-    fallback = max(last_old_t + 1.0, first_new_t - 1.0)
+    first 'new'-classified frame after that. When no date content is visible in the
+    gap (pure noise), apply visual-anchor or last_old_t+1 rather than the
+    end-of-gap placement — the end-of-gap heuristic causes tail leaks when OCR misses
+    the early new-session frames at the start of a noise burst."""
+    same_date_fallback = max(last_old_t + 1.0, first_new_t - 1.0)
     if new_dt is None or new_dt.date() == old_dt.date():
-        return fallback
+        return same_date_fallback
     gap = [t for t in window if last_old_t < t < first_new_t]
     classes = {
         t: _gap_date_class(readings[t].raw, old_dt, new_dt)
         for t in gap if t in readings
     }
     last_old_garble = max(
-        (t for t in gap if classes.get(t) == "old"), default=int(last_old_t),
+        (t for t in gap if classes.get(t) == "old"), default=None,
     )
-    new_frames = [t for t in gap if t > last_old_garble and classes.get(t) == "new"]
-    return float(min(new_frames)) if new_frames else fallback
+    new_frames = [
+        t for t in gap
+        if (last_old_garble is None or t > last_old_garble) and classes.get(t) == "new"
+    ]
+    if new_frames:
+        return float(min(new_frames))
+    if last_old_garble is not None:
+        # Confirmed old garble in gap: keep the whole ambiguous span with the old
+        # clip (ADR-0001), so new clip starts just before the first confirmed new frame.
+        return max(last_old_t + 1.0, first_new_t - 1.0)
+    # Pure noise: no date digits recoverable from any gap frame.  Visual anchor marks
+    # the end of a head-switch noise burst (ADR-0001); absent that, cut at
+    # last_old_t+1 so no unclassified content leaks into the outgoing clip (L23).
+    if visual_times:
+        anchors = [vt for vt in visual_times if last_old_t < vt < first_new_t]
+        if anchors:
+            return max(anchors)
+    return last_old_t + 1.0
 
 
 def make_ocr_fn(video: str, crop: str, tmpdir: str, workers: int) -> OcrFn:
@@ -1162,6 +1193,7 @@ class LongDeadZonePolicy:
             cut = _place_content_aware(window, readings, last_old_t, first_new_t, prev_dt, new_dt)
             return RefinementResult(cut, "ocr", "")
         detail = f"LDZ {span:.0f}s" if not any_ocr else "all-old-in-window"
+
         return RefinementResult(coarse_t, "coarse", detail)
 
 
@@ -1195,7 +1227,10 @@ class ShortSpanPolicy:
 
         if first_new_t is not None:
             new_dt = readings[int(first_new_t)].dt
-            cut = _place_content_aware(window, readings, last_old_t, first_new_t, prev_dt, new_dt)
+            cut = _place_content_aware(
+                window, readings, last_old_t, first_new_t, prev_dt, new_dt,
+                self._visual_times,
+            )
             return RefinementResult(cut, "ocr", "")
 
         # Old-session confirmed but new-session OCR garbled (frames after last_old_t

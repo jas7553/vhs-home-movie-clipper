@@ -207,6 +207,32 @@ class TestRefineSplit:
         assert t == 20.0   # gap=3 ≤ 10 → coarse_t
         assert method == "coarse"
 
+    def test_false_positive_new_session_rejected_by_revert(self):
+        # Frame t=14 reads new-session (5/19) but t=15 reverts to old (5/12) → false
+        # positive; frame t=18 is the sustained new-session start.
+        # Fix 1: _scan_for_transition resets candidate_new_t on revert, so
+        # first_new_t=18, last_old_t=15.  Fix 2: pure-noise gap [16,17] → last_old+1=16.
+        prev_dt = datetime(1990, 5, 12, 15, 0)
+        _OLD = "3:00 PM\n 5/12/90"
+        _NEW = "3:00 PM\n 5/19/90"
+        paths = {13: "/tmp/fp_f13.bmp", 14: "/tmp/fp_f14.bmp",
+                 15: "/tmp/fp_f15.bmp", 18: "/tmp/fp_f18.bmp"}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0, prev_dt=prev_dt,
+            extract_side_effect=extract,
+            ocr_map={paths[13]: _OLD, paths[14]: _NEW, paths[15]: _OLD, paths[18]: _NEW},
+            interval=10,
+        )
+        # Without fix 1: first_new_t=14 (stops at first jump), cut=last_old(10)+1=11
+        # or max(11,13)=13 depending on gap classification.
+        # With fix 1: first_new_t=18, last_old_t=15.  Gap [16,17] pure noise → 16.
+        assert t == 16.0
+        assert method == "ocr"
+
     def test_garbled_new_session_long_dead_zone_falls_back_to_coarse(self):
         # Window >= SPLICE_DEAD_ZONE_MAX_S (120s) with substantial post-old gap.
         # Long Dead Zone: fix must NOT fire; fall back to coarse_t.
@@ -466,6 +492,30 @@ class TestRefineSplitTwoPass:
         # Coarse (50) + tail (3) = 53 calls — not the full 200.
         assert calls <= 60
 
+    def test_two_pass_false_positive_in_coarse_rejected(self):
+        # Coarse scan: t=101 new (false positive) then t=105 old (revert) then t=161 new (true).
+        # Fix 1 resets candidate in coarse, so last_old_c=105, first_new_c=161.
+        # Dense scan on [105..161] finds last_old=159, first_new=161 → cut=max(160,160)=160.
+        # step=4, coarse_times=[1,5,9,...,197]. t=101,105,161 are coarse samples only if
+        # 101 % 4 == 1, i.e., (101-1) % 4 == 0 → yes (t=1,5,...,101,105,...).
+        paths = {t: f"/tmp/ldz_fp_{t}.bmp" for t in range(1, 201)}
+
+        def extract(v, t, c, d):
+            return paths.get(int(t))
+
+        # False positive at 101, revert at 105, true new from 161 onward.
+        ocr_map = {
+            paths[t]: (_OLD if t != 101 and t < 161 else _NEW)
+            for t in range(1, 201)
+        }
+        t, method = self._run_ldz(extract, ocr_map)
+        # last_old_t ≥ 159 (dense scan within [105,161]); first_new_t ≤ 161.
+        # cut = max(last_old+1, first_new-1) or last_old+1 depending on gap.
+        # last_old_t=160 (or wherever), first_new_t=161 → cut=161 or 160+1=161.
+        assert t >= 159.0
+        assert t <= 161.0
+        assert method == "ocr"
+
     def test_two_pass_span_below_threshold_uses_full_scan(self):
         # span = SPLICE_DEAD_ZONE_MAX_S - 1 < threshold → full dense scan (SDZ path).
         # Verify all window frames are attempted.
@@ -561,6 +611,33 @@ class TestPlaceContentAware:
         window = list(range(2, 30))
         cut = _place_content_aware(window, self._readings(raws), 5.0, 10.0, old, new)
         assert cut == 9.0  # max(5+1, 10-1)
+
+    def test_pure_noise_gap_cuts_at_last_old_plus_one(self):
+        # Gap [6..14] all empty strings → all "noise" → no old/new garble detected.
+        # Old fallback would be max(6, 14)=14; new L23 rule: last_old_t+1=6.
+        old, new = datetime(1990, 5, 12), datetime(1990, 5, 19)
+        raws = {5: "5:00 PM\n 5/12/90", 6: "", 7: "", 8: "", 9: "", 15: "5:00 PM\n 5/19/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new)
+        assert cut == 6.0  # last_old_t(5) + 1; no date content in gap
+
+    def test_pure_noise_gap_visual_anchor_used(self):
+        # Pure noise gap with a visual event: anchor to end of noise burst.
+        old, new = datetime(1990, 5, 12), datetime(1990, 5, 19)
+        raws = {5: "5:00 PM\n 5/12/90", 6: "", 7: "", 8: "", 9: "", 15: "5:00 PM\n 5/19/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new,
+                                   visual_times=[8.5])
+        assert cut == 8.5  # visual anchor inside gap; end of noise burst
+
+    def test_pure_noise_gap_visual_anchor_outside_gap_ignored(self):
+        # Visual event outside (last_old_t, first_new_t) must not be used.
+        old, new = datetime(1990, 5, 12), datetime(1990, 5, 19)
+        raws = {5: "5:00 PM\n 5/12/90", 6: "", 7: "", 8: "", 9: "", 15: "5:00 PM\n 5/19/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new,
+                                   visual_times=[4.0, 16.0])
+        assert cut == 6.0  # no anchor in gap → last_old_t+1
 
 
 class TestContentAwareEndToEnd:
