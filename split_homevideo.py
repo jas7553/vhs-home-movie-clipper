@@ -32,7 +32,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
@@ -157,6 +157,26 @@ TIME_PATTERN = re.compile(
 )
 
 
+def _parse_time_only(text: str) -> tuple[int, int] | None:
+    """(hour24, minute) if text has a meridian time but no parseable date; else None."""
+    flat = re.sub(r"[\n\r]+", " ", text)
+    flat = re.sub(r" +", " ", flat).strip()
+    if DATE_PATTERN.search(flat) or WORD_MONTH_PATTERN.search(flat):
+        return None
+    time_m = TIME_PATTERN.search(flat)
+    if not time_m:
+        return None
+    ampm = (time_m.group(3) or "").upper()
+    if not ampm:
+        return None
+    hour, minute = int(time_m.group(1)), int(time_m.group(2))
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+    return (hour, minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
 def parse_timestamp(text: str) -> datetime | None:
     """Parse '5:01 PM / 1/ 4/90' style OCR output (may have noisy newlines)."""
     # Normalize: collapse newlines + multiple spaces so multi-line OCR joins up
@@ -276,15 +296,22 @@ def _bucket_frames(paths: list[str]) -> dict[int, list[str]]:
     return buckets
 
 
-def _vote_bucket(paths: list[str], ocr: dict[str, str]) -> tuple[datetime, str] | None:
-    """Majority-vote the parseable readings in one window. Returns (winner_dt, raw_text) or None."""
+def _vote_bucket(paths: list[str], ocr: dict[str, str]) -> tuple[datetime | None, str | None]:
+    """Majority-vote parseable readings; fall back to time-only text.
+
+    Returns (dated_dt, text) when a dated reading wins, (None, time_only_text) when
+    the window holds only time-only overlays, or (None, None) if unreadable.
+    """
     parsed = [(p, text, parse_timestamp(text)) for p in paths for text in (ocr.get(p, ""),)]
     valid = [(p, text, dt) for p, text, dt in parsed if dt is not None]
-    if not valid:
-        return None
-    winner_dt = Counter(dt for _, _, dt in valid).most_common(1)[0][0]
-    winner_text = next(text for _, text, dt in valid if dt == winner_dt)
-    return winner_dt, winner_text
+    if valid:
+        winner_dt = Counter(dt for _, _, dt in valid).most_common(1)[0][0]
+        winner_text = next(text for _, text, dt in valid if dt == winner_dt)
+        return winner_dt, winner_text
+    for _, text, _ in parsed:
+        if text and _parse_time_only(text) is not None:
+            return None, text
+    return None, None
 
 
 def ocr_batch(paths: list[str]) -> dict[str, str]:
@@ -324,6 +351,55 @@ def get_duration(video: str) -> float:
     return float(r.stdout.strip())
 
 
+def fill_timeonly_dates(
+    raw: list[tuple[float, datetime | None, str | None]],
+) -> list[tuple[float, datetime | None]]:
+    """Infer dates for time-only OCR readings (AM/PM time with no date in overlay).
+
+    Applies the chronological-tape assumption: a time-only reading inherits the date
+    of its nearest dated predecessor.  When the camera clock wraps backward by more
+    than 12 camera-hours the running date increments by one day, so overnight spans
+    that bridge midnight split correctly across dates.  If no predecessor exists the
+    nearest dated successor's date is used.  When neither side has a dated reading
+    the entry stays None (unresolvable — the fail-safe from the issue spec).
+    """
+    n = len(raw)
+    result: list[tuple[float, datetime | None]] = [(t, dt) for t, dt, _ in raw]
+    last_effective: datetime | None = None
+
+    for k in range(n):
+        t_k, dt_k, text_k = raw[k]
+        if dt_k is not None:
+            last_effective = dt_k
+            continue
+        if not text_k:
+            continue
+        hm = _parse_time_only(text_k)
+        if hm is None:
+            continue
+        h, m = hm
+        if last_effective is not None:
+            prev_min = last_effective.hour * 60 + last_effective.minute
+            cur_min = h * 60 + m
+            d = last_effective.date()
+            if cur_min < prev_min - 12 * 60:
+                d = d + timedelta(days=1)
+            dt_filled = datetime(d.year, d.month, d.day, h, m)
+        else:
+            succ: datetime | None = None
+            for j in range(k + 1, n):
+                if raw[j][1] is not None:
+                    succ = raw[j][1]
+                    break
+            if succ is None:
+                continue
+            dt_filled = datetime(succ.year, succ.month, succ.day, h, m)
+        result[k] = (t_k, dt_filled)
+        last_effective = dt_filled
+
+    return result
+
+
 def scan(
     video: str, interval: int, crop: str, cache_path: str | None = None
 ) -> list[tuple[float, datetime | None]]:
@@ -341,10 +417,10 @@ def scan(
                 and cached.get("vf_preprocess") == _VF_PREPROCESS
                 and cached.get("frames_per_sample", 1) == FRAMES_PER_SAMPLE):
             print(f"  (loaded from cache: {cache_path})")
-            return [
-                (float(t), parse_timestamp(text) if text else None)
+            return fill_timeonly_dates([
+                (float(t), parse_timestamp(text) if text else None, text or None)
                 for t, text in cached["samples"]
-            ]
+            ])
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Phase 1: crop-only extraction (PRIMARY — higher OCR yield than preprocessing; see _VF_PREPROCESS).
@@ -357,12 +433,15 @@ def scan(
         crop_buckets = _bucket_frames(crop_paths)
 
         # Per-window majority vote; remember which windows crop-only could not read.
-        readings: dict[int, tuple[datetime, str]] = {}
+        readings: dict[int, tuple[datetime, str | None]] = {}
+        timeonly_map: dict[int, str] = {}
         unsolved: list[int] = []
         for bk, paths in crop_buckets.items():
-            won = _vote_bucket(paths, crop_ocr)
-            if won is not None:
-                readings[bk] = won
+            dt, text = _vote_bucket(paths, crop_ocr)
+            if dt is not None:
+                readings[bk] = (dt, text)
+            elif text is not None:
+                timeonly_map[bk] = text
             else:
                 unsolved.append(bk)
 
@@ -378,9 +457,11 @@ def scan(
                 pp_ocr = ocr_batch(pp_paths)
                 pp_buckets = _bucket_frames(pp_paths)
                 for bk in unsolved:
-                    won = _vote_bucket(pp_buckets.get(bk, []), pp_ocr)
-                    if won is not None:
-                        readings[bk] = won
+                    dt, text = _vote_bucket(pp_buckets.get(bk, []), pp_ocr)
+                    if dt is not None:
+                        readings[bk] = (dt, text)
+                    elif text is not None:
+                        timeonly_map[bk] = text
             else:
                 print(f"  (skipped fallback: frame-count mismatch "
                       f"{len(pp_paths)} != {len(crop_paths)})", flush=True)
@@ -391,10 +472,14 @@ def scan(
         results: dict[float, tuple[datetime | None, str | None]] = {}
         for bk, paths in crop_buckets.items():
             t_last = float(max(frame_index(p) for p in paths)) * interval / FRAMES_PER_SAMPLE
-            results[t_last] = readings.get(bk) or (None, None)
+            if bk in readings:
+                results[t_last] = readings[bk]
+            elif bk in timeonly_map:
+                results[t_last] = (None, timeonly_map[bk])
+            else:
+                results[t_last] = (None, None)
 
     sorted_results = sorted(results.items())
-    samples = [(t, dt) for t, (dt, _) in sorted_results]
 
     if cache_path:
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
@@ -409,7 +494,7 @@ def scan(
             }, f)
         print(f"  (scan cached to {cache_path})")
 
-    return samples
+    return fill_timeonly_dates([(t, dt, text) for t, (dt, text) in sorted_results])
 
 
 def filter_ocr_outliers(
