@@ -49,12 +49,12 @@ def samples():
 
 @pytest.fixture(scope="module")
 def boundaries(samples):
-    return find_all_boundaries(filter_ocr_outliers(samples), gap_s=GAP_S)
+    return find_all_boundaries(filter_ocr_outliers(samples))
 
 
 class TestSessionMode:
     def test_seven_boundaries(self, boundaries):
-        cuts = group_clips(boundaries, mode="session", gap_s=GAP_S)
+        cuts = group_clips(boundaries, mode="session")
         assert cuts[0] == 0.0
         n = len(cuts) - 1
         assert n == len(GOLDEN_SESSION), (
@@ -62,14 +62,14 @@ class TestSessionMode:
         )
 
     def test_boundary_positions(self, boundaries):
-        cuts = group_clips(boundaries, mode="session", gap_s=GAP_S)
+        cuts = group_clips(boundaries, mode="session")
         for golden, actual in zip(GOLDEN_SESSION, sorted(cuts[1:]), strict=True):
             assert abs(actual - golden) <= TOLERANCE_S, (
                 f"Boundary {actual:.0f}s is >{TOLERANCE_S}s from golden {golden:.0f}s"
             )
 
     def test_all_session_boundaries_are_large_gap(self, boundaries):
-        cuts = group_clips(boundaries, mode="session", gap_s=GAP_S)
+        cuts = group_clips(boundaries, mode="session")
         boundary_map = {b.video_t: b for b in boundaries}
         for vt in cuts[1:]:
             b = boundary_map.get(vt)
@@ -80,7 +80,7 @@ class TestSessionMode:
 
 class TestDailyMode:
     def test_two_boundaries(self, boundaries):
-        cuts = group_clips(boundaries, mode="daily", gap_s=GAP_S)
+        cuts = group_clips(boundaries, mode="daily")
         assert cuts[0] == 0.0
         n = len(cuts) - 1
         assert n == len(GOLDEN_DAILY), (
@@ -88,14 +88,14 @@ class TestDailyMode:
         )
 
     def test_boundary_positions(self, boundaries):
-        cuts = group_clips(boundaries, mode="daily", gap_s=GAP_S)
+        cuts = group_clips(boundaries, mode="daily")
         for golden, actual in zip(GOLDEN_DAILY, sorted(cuts[1:]), strict=True):
             assert abs(actual - golden) <= TOLERANCE_S, (
                 f"Daily boundary {actual:.0f}s is >{TOLERANCE_S}s from golden {golden:.0f}s"
             )
 
     def test_daily_boundaries_cross_date(self, boundaries):
-        cuts = group_clips(boundaries, mode="daily", gap_s=GAP_S)
+        cuts = group_clips(boundaries, mode="daily")
         boundary_map = {b.video_t: b for b in boundaries}
         for vt in cuts[1:]:
             b = boundary_map.get(vt)
@@ -110,21 +110,21 @@ class TestDailyMode:
 
 class TestSceneMode:
     def test_more_boundaries_than_session(self, boundaries):
-        session_cuts = group_clips(boundaries, mode="session", gap_s=GAP_S)
-        scene_cuts = group_clips(boundaries, mode="scene", gap_s=GAP_S)
+        session_cuts = group_clips(boundaries, mode="session")
+        scene_cuts = group_clips(boundaries, mode="scene")
         assert len(scene_cuts) > len(session_cuts), (
             f"scene ({len(scene_cuts)}) should have more cuts than session ({len(session_cuts)})"
         )
 
     def test_includes_all_session_boundaries(self, boundaries):
-        session_cuts = set(group_clips(boundaries, mode="session", gap_s=GAP_S))
-        scene_cuts = set(group_clips(boundaries, mode="scene", gap_s=GAP_S))
+        session_cuts = set(group_clips(boundaries, mode="session"))
+        scene_cuts = set(group_clips(boundaries, mode="scene"))
         assert session_cuts.issubset(scene_cuts), (
             f"Scene missing session boundaries: {session_cuts - scene_cuts}"
         )
 
     def test_includes_gap_type_boundaries(self, boundaries):
-        scene_cuts = set(group_clips(boundaries, mode="scene", gap_s=GAP_S))
+        scene_cuts = set(group_clips(boundaries, mode="scene"))
         gap_boundaries = [b for b in boundaries if b.type == "gap"]
         assert len(gap_boundaries) > 0, "No gap-type boundaries found in fixture"
         for b in gap_boundaries:

@@ -13,12 +13,12 @@ _DT = datetime(1990, 1, 4, 17, 1)
 class TestLabelFor:
     def test_returns_formatted_datetime(self):
         filtered = [(5.0, _DT)]
-        assert _label_for(filtered, 5.0) == "1990-01-04_1701"
+        assert _label_for(filtered, 5.0, mode="session") == "1990-01-04_1701"
 
     def test_returns_first_reading_at_or_after_start(self):
         dt2 = datetime(1990, 2, 14, 9, 0)
         filtered = [(5.0, _DT), (100.0, dt2)]
-        assert _label_for(filtered, 80.0) == "1990-02-14_0900"
+        assert _label_for(filtered, 80.0, mode="session") == "1990-02-14_0900"
 
     def test_fallback_when_no_reading_after_start(self):
         filtered = [(5.0, _DT)]
@@ -38,7 +38,7 @@ class TestLabelFor:
             (1040.0, misread),
             (1090.0, real),
         ]
-        assert _label_for(filtered, 1040.0) == "1990-01-06_1012"
+        assert _label_for(filtered, 1040.0, mode="session") == "1990-01-06_1012"
 
     def test_daily_mode_skips_isolated_misread(self):
         misread = datetime(1999, 5, 19, 10, 14)
@@ -54,7 +54,7 @@ class TestLabelFor:
         # Only candidate at/after start is unconfirmed (no next sample to check) —
         # must still return something rather than the position-based fallback.
         filtered = [(5.0, _DT)]
-        assert _label_for(filtered, 5.0) == "1990-01-04_1701"
+        assert _label_for(filtered, 5.0, mode="session") == "1990-01-04_1701"
 
     def test_first_reading_forward_jump_trusted_by_default(self):
         # No "prev" exists for the first reading, so a forward jump (the common
@@ -63,7 +63,7 @@ class TestLabelFor:
         early = datetime(1990, 1, 1, 10, 0)
         later = datetime(1990, 1, 1, 22, 0)  # 12hr forward jump in 10 video seconds
         filtered = [(10.0, early), (20.0, later)]
-        assert _label_for(filtered, 10.0) == early.strftime("%Y-%m-%d_%H%M")
+        assert _label_for(filtered, 10.0, mode="session") == early.strftime("%Y-%m-%d_%H%M")
 
     def test_last_candidate_has_no_next_to_check_so_is_trusted(self):
         # A backward jump at the very first reading has no prev to confirm it
@@ -72,7 +72,7 @@ class TestLabelFor:
         a = datetime(1999, 1, 1, 0, 0)
         b = datetime(1990, 1, 1, 0, 0)
         filtered = [(10.0, a), (20.0, b)]
-        assert _label_for(filtered, 10.0) == b.strftime("%Y-%m-%d_%H%M")
+        assert _label_for(filtered, 10.0, mode="session") == b.strftime("%Y-%m-%d_%H%M")
 
     def test_misread_with_real_sandwich_is_skipped(self):
         # A misread flanked by a real "prev" reading too, so the sandwich check
@@ -82,7 +82,7 @@ class TestLabelFor:
         misread = datetime(1999, 1, 1, 0, 0)
         nxt = datetime(1990, 1, 6, 10, 11)
         filtered = [(0.0, prev), (10.0, misread), (20.0, nxt)]
-        assert _label_for(filtered, 10.0) == nxt.strftime("%Y-%m-%d_%H%M")
+        assert _label_for(filtered, 10.0, mode="session") == nxt.strftime("%Y-%m-%d_%H%M")
 
     def test_stable_consecutive_confirmed_by_next(self):
         # Both readings advance only ~1 min in 60s of video — not a jump.
@@ -90,7 +90,7 @@ class TestLabelFor:
         a = datetime(1990, 1, 4, 17, 0)
         b = datetime(1990, 1, 4, 17, 1)
         filtered = [(0.0, a), (60.0, b)]
-        assert _label_for(filtered, 0.0) == a.strftime("%Y-%m-%d_%H%M")
+        assert _label_for(filtered, 0.0, mode="session") == a.strftime("%Y-%m-%d_%H%M")
 
 
 class TestSplitVideo:
@@ -119,7 +119,7 @@ class TestSplitVideo:
         with mock.patch("split_homevideo.get_duration", return_value=100.0), \
              mock.patch("split_homevideo.cut_clip_with_boundary_encode",
                         side_effect=lambda *a, **kw: calls.append(a)):
-            split_video("myvid.mp4", [0.0, 50.0], out_dir, filtered)
+            split_video("myvid.mp4", [0.0, 50.0], out_dir, filtered, mode="session")
         assert len(calls) == 2
         assert "myvid_clip01_1990-01-04_1701.mp4" in calls[0][5]
         assert "myvid_clip02_1990-06-01_1000.mp4" in calls[1][5]
