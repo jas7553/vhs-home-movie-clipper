@@ -1,32 +1,28 @@
 """
-main(): CLI entry point — arg parsing, file/binary checks, dry-run vs full run.
+main(): CLI entry point — arg parsing, file/binary checks, path construction,
+and orchestrating run() + split_video(). Pipeline logic lives in test_run.py.
 """
 import unittest.mock as mock
 from datetime import datetime
 
 import pytest
 
-from split_homevideo import Boundary, main
+from split_homevideo import PipelineConfig, PipelineResult, main
 
 _DT = datetime(1990, 1, 4, 17, 1)
+
+_EMPTY_RESULT = PipelineResult(
+    splits=[0.0],
+    filtered=[(0.0, _DT)],
+    boundary_map={},
+    phase_times={"scan": 0.1, "visual": 0.0, "refine": 0.0},
+)
 
 
 def _mock_ocr_bin(exists=True):
     m = mock.Mock()
     m.exists.return_value = exists
     return m
-
-
-def _large_gap_boundary(video_t=100.0, prev_t=90.0, prev_dt=_DT):
-    return Boundary(
-        video_t=video_t,
-        type="large_gap",
-        cam_before=prev_dt,
-        cam_after=datetime(1990, 1, 4, 20, 0),
-        cam_jump_s=10800.0,
-        prev_t=prev_t,
-        prev_dt=prev_dt,
-    )
 
 
 class TestMainFileNotFound:
@@ -47,42 +43,15 @@ class TestMainOcrBinMissing:
 
 
 class TestMainDryRun:
-    def test_dry_run_does_not_call_split_video(self, tmp_path):
+    def test_does_not_call_split_video(self, tmp_path):
         video = tmp_path / "vid.mp4"
         video.touch()
         with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
-             mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.split_video") as m_sv, \
-             mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0), \
-             mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5):
+             mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT), \
+             mock.patch("split_homevideo.split_video") as m_sv:
             main()
         m_sv.assert_not_called()
-
-    def test_dry_run_does_not_refine_or_encode(self, tmp_path):
-        video = tmp_path / "vid.mp4"
-        video.touch()
-        b = _large_gap_boundary(video_t=100.0, prev_t=90.0, prev_dt=_DT)
-        with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]), \
-             mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
-             mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.split_video") as m_sv, \
-             mock.patch("split_homevideo.snap_to_keyframe") as m_kf, \
-             mock.patch("split_homevideo.snap_to_keyframe_forward") as m_kff:
-            main()
-        m_sv.assert_not_called()
-        m_kf.assert_not_called()
-        m_kff.assert_not_called()
 
 
 class TestMainFullRun:
@@ -91,35 +60,18 @@ class TestMainFullRun:
         video.touch()
         with mock.patch("sys.argv", ["prog", str(video)]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
-             mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.split_video") as m_sv, \
-             mock.patch("split_homevideo.snap_to_keyframe", return_value=95.0), \
-             mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=100.5):
+             mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT), \
+             mock.patch("split_homevideo.split_video") as m_sv:
             main()
         m_sv.assert_called_once()
 
     def test_uses_default_cache_path(self, tmp_path):
         video = tmp_path / "myvid.mp4"
         video.touch()
-        captured = {}
-        def fake_scan(v, interval, crop, cache_path=None):
-            captured["cache"] = cache_path
-            return [(0.0, _DT)]
         with mock.patch("sys.argv", ["prog", str(video)]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
-             mock.patch("split_homevideo.scan", side_effect=fake_scan), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.get_duration", return_value=100.0), \
-             mock.patch("split_homevideo.split_video"), \
-             mock.patch("split_homevideo.snap_to_keyframe", return_value=0.0), \
-             mock.patch("split_homevideo.snap_to_keyframe_forward", return_value=0.0):
+             mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT) as m_run, \
+             mock.patch("split_homevideo.split_video"):
             main()
-        assert captured["cache"].endswith("myvid_ocr_cache.json")
+        config: PipelineConfig = m_run.call_args[0][0]
+        assert config.cache.endswith("myvid_ocr_cache.json")

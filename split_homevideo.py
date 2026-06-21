@@ -111,6 +111,31 @@ class PlacementPolicy(Protocol):
     def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult: ...
 
 
+@dataclass
+class PipelineConfig:
+    video: str
+    interval: int = DEFAULT_INTERVAL
+    gap: int = DEFAULT_GAP
+    crop: str = DEFAULT_CROP
+    mode: str = DEFAULT_MODE
+    cache: str | None = None
+    visual_cache: str | None = None
+    enable_visual_fusion: bool = False
+    no_visual_anchor: bool = False
+    fuse_window: float = DEFAULT_FUSE_WINDOW
+    min_clip: float = DEFAULT_MIN_CLIP_S
+    scene_threshold: float = DEFAULT_SCENE_THRESHOLD
+    black_min_duration: float = DEFAULT_BLACK_MIN_DURATION
+    dry_run: bool = False
+
+
+class PipelineResult(NamedTuple):
+    splits: list[float]
+    filtered: list[tuple[float, datetime]]
+    boundary_map: dict[float, Boundary]
+    phase_times: dict[str, float]
+
+
 # ------------------------------------------------------------------ #
 # Timestamp parsing
 # ------------------------------------------------------------------ #
@@ -1163,6 +1188,117 @@ def split_video(
         cut_clip_with_boundary_encode(video, start, end, exact_start, exact_end, out_path)
 
 
+def run(config: PipelineConfig) -> PipelineResult:
+    """Execute the full detection + refinement pipeline. Caller owns cutting."""
+    t0 = time.perf_counter()
+    phase_times: dict[str, float] = {}
+
+    print(f"scan file={config.video} interval={config.interval} gap={config.gap} mode={config.mode} crop={config.crop}")
+    samples = scan(config.video, config.interval, config.crop, cache_path=config.cache)
+    phase_times["scan"] = time.perf_counter() - t0
+
+    valid = [(t, dt) for t, dt in samples if dt]
+    date_range = f" date_range={valid[0][1].date()}:{valid[-1][1].date()}" if valid else ""
+    print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
+
+    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
+    filtered = drop_date_islands(filtered)
+    boundaries = find_all_boundaries(filtered, gap_s=config.gap)
+
+    visual_times: list[float] = []
+    if not config.dry_run and not config.no_visual_anchor:
+        t_vis = time.perf_counter()
+        scene_cuts, black_frames = detect_visual_boundaries(
+            config.video, config.scene_threshold, config.black_min_duration,
+            cache_path=config.visual_cache,
+        )
+        visual_times = sorted(scene_cuts + black_frames)
+        phase_times["visual"] = time.perf_counter() - t_vis
+        print(f"visual scene_cuts={len(scene_cuts)} black_frames={len(black_frames)}")
+        if config.enable_visual_fusion:
+            before = len(boundaries)
+            boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, config.fuse_window)
+            print(f"visual_fusion confirmed={len(boundaries)} total={before} window={config.fuse_window:.0f}")
+
+    cut_ts = group_clips(boundaries, config.mode, config.gap)
+    boundary_map: dict[float, Boundary] = {b.video_t: b for b in boundaries}
+    duration = get_duration(config.video)
+    effective_min_clip = ARTIFACT_MIN_S if config.mode == "daily" else config.min_clip
+
+    if config.dry_run:
+        splits: list[float] = [0.0] + list(cut_ts[1:])
+        before_merge = len(splits)
+        splits = merge_short_clips(splits, effective_min_clip)
+        if len(splits) < before_merge:
+            print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
+        print(f"clips count={len(splits)} note=coarse_unrefined interval_error=+-{config.interval}s")
+        prev_label: str | None = None
+        prev_idx: int | None = None
+        for idx, start in enumerate(splits):
+            end = splits[idx + 1] if idx + 1 < len(splits) else duration
+            dur = end - start
+            label = _label_for(filtered, start, config.mode, boundary_map)
+            b = boundary_map.get(start)
+            btype = f" btype={b.type}" if b else ""
+            print(f"clip {idx+1:02d} start={start:.0f} end={end:.0f}"
+                  f" dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}{btype}")
+            if config.mode == "daily" and prev_label == label and prev_idx is not None:
+                prev_dur = start - splits[prev_idx]
+                print(f"warn same_date_adjacent clips={prev_idx+1},{idx+1} date={label}"
+                      f" durations={prev_dur:.0f}s,{dur:.0f}s")
+            prev_label = label
+            prev_idx = idx
+        print("dry_run=true")
+        return PipelineResult(splits, filtered, boundary_map, phase_times)
+
+    large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
+    print(f"refine count={large_gap_count}")
+    t_refine = time.perf_counter()
+    refined_boundary_map: dict[float, Boundary] = {}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        strategy = ocr_refinement(config.gap, config.crop, tmpdir, config.interval, visual_times)
+        splits = [0.0]
+        for vt in cut_ts[1:]:
+            b = boundary_map.get(vt)
+            if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
+                t_b = time.perf_counter()
+                rr = strategy(config.video, b)
+                elapsed_b = time.perf_counter() - t_b
+                reason = f" reason={rr.detail}" if rr.detail else ""
+                print(f"boundary coarse={vt:.0f} refined={rr.t:.0f} saved={vt - rr.t:.0f}"
+                      f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
+                      f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={rr.method}{reason}")
+                splits.append(rr.t)
+                refined_boundary_map[rr.t] = b
+            else:
+                splits.append(vt)
+                if b:
+                    refined_boundary_map[vt] = b
+    phase_times["refine"] = time.perf_counter() - t_refine
+
+    before_merge = len(splits)
+    splits = merge_short_clips(splits, effective_min_clip)
+    if len(splits) < before_merge:
+        print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
+
+    print(f"clips count={len(splits)}")
+    last_label: str | None = None
+    last_idx: int | None = None
+    for idx, start in enumerate(splits):
+        end = splits[idx + 1] if idx + 1 < len(splits) else duration
+        dur = end - start
+        label = _label_for(filtered, start, config.mode, refined_boundary_map)
+        print(f"clip {idx+1:02d} start={start:.0f} end={end:.1f} dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}")
+        if config.mode == "daily" and last_label == label and last_idx is not None:
+            prev_dur = start - splits[last_idx]
+            print(f"warn same_date_adjacent clips={last_idx+1},{idx+1} date={label}"
+                  f" durations={prev_dur:.0f}s,{dur:.0f}s")
+        last_label = label
+        last_idx = idx
+
+    return PipelineResult(splits, filtered, refined_boundary_map, phase_times)
+
+
 # ------------------------------------------------------------------ #
 
 def main() -> None:
@@ -1202,128 +1338,41 @@ def main() -> None:
     if not os.path.exists(video):
         sys.exit(f"File not found: {video}")
 
-    out_dir = args.out_dir or (Path(video).stem + "_clips")
-    out_dir = os.path.abspath(out_dir)
-
-    cache = args.cache or (Path(video).stem + "_ocr_cache.json")
-    visual_cache = args.visual_cache or (Path(video).stem + "_visual_cache.json")
-
     if not OCR_BIN.exists():
         sys.exit(f"ocr_timestamp binary not found at {OCR_BIN}. Run: swiftc -O ocr_timestamp.swift -o ocr_timestamp")
 
+    out_dir = args.out_dir or (Path(video).stem + "_clips")
+    out_dir = os.path.abspath(out_dir)
+    cache = args.cache or (Path(video).stem + "_ocr_cache.json")
+    visual_cache = args.visual_cache or (Path(video).stem + "_visual_cache.json")
+
+    config = PipelineConfig(
+        video=video,
+        interval=args.interval,
+        gap=args.gap,
+        mode=args.mode,
+        crop=args.crop,
+        cache=cache,
+        visual_cache=visual_cache,
+        enable_visual_fusion=args.enable_visual_fusion,
+        no_visual_anchor=args.no_visual_anchor,
+        fuse_window=args.fuse_window,
+        min_clip=args.min_clip,
+        scene_threshold=args.scene_threshold,
+        black_min_duration=args.black_min_duration,
+        dry_run=args.dry_run,
+    )
+
     t0 = time.perf_counter()
-    phase_times: dict[str, float] = {}
-
-    print(f"scan file={video} interval={args.interval} gap={args.gap} mode={args.mode} crop={args.crop}")
-    samples = scan(video, args.interval, args.crop, cache_path=cache)
-    phase_times["scan"] = time.perf_counter() - t0
-
-    valid = [(t, dt) for t, dt in samples if dt]
-    date_range = f" date_range={valid[0][1].date()}:{valid[-1][1].date()}" if valid else ""
-    print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
-
-    filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
-    filtered = drop_date_islands(filtered)
-    boundaries = find_all_boundaries(filtered, gap_s=args.gap)
-
-    visual_times: list[float] = []
-    if not args.dry_run and not args.no_visual_anchor:
-        t_vis = time.perf_counter()
-        scene_cuts, black_frames = detect_visual_boundaries(
-            video, args.scene_threshold, args.black_min_duration, cache_path=visual_cache
-        )
-        visual_times = sorted(scene_cuts + black_frames)
-        phase_times["visual"] = time.perf_counter() - t_vis
-        print(f"visual scene_cuts={len(scene_cuts)} black_frames={len(black_frames)}")
-        if args.enable_visual_fusion:
-            before = len(boundaries)
-            boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, args.fuse_window)
-            print(f"visual_fusion confirmed={len(boundaries)} total={before} window={args.fuse_window:.0f}")
-
-    cut_ts = group_clips(boundaries, args.mode, args.gap)
-    duration = get_duration(video)
-
-    # Build lookup: video_t → Boundary for refinement decisions
-    boundary_map = {b.video_t: b for b in boundaries}
-
-    # Daily mode keeps all date changes regardless of duration, but still collapses
-    # sub-second slivers that result from two refined cuts landing 1s apart.
-    effective_min_clip = ARTIFACT_MIN_S if args.mode == "daily" else args.min_clip
+    result = run(config)
 
     if args.dry_run:
-        splits: list[float] = [0.0] + list(cut_ts[1:])
-        before_merge = len(splits)
-        splits = merge_short_clips(splits, effective_min_clip)
-        if len(splits) < before_merge:
-            print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
-        print(f"clips count={len(splits)} note=coarse_unrefined interval_error=+-{args.interval}s")
-        prev_label: str | None = None
-        prev_idx: int | None = None
-        for idx, start in enumerate(splits):
-            end = splits[idx + 1] if idx + 1 < len(splits) else duration
-            dur = end - start
-            label = _label_for(filtered, start, args.mode, boundary_map)
-            b = boundary_map.get(start)
-            btype = f" btype={b.type}" if b else ""
-            print(f"clip {idx+1:02d} start={start:.0f} end={end:.0f}"
-                  f" dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}{btype}")
-            if args.mode == "daily" and prev_label == label and prev_idx is not None:
-                prev_dur = start - splits[prev_idx]
-                print(f"warn same_date_adjacent clips={prev_idx+1},{idx+1} date={label}"
-                      f" durations={prev_dur:.0f}s,{dur:.0f}s")
-            prev_label = label
-            prev_idx = idx
-        print("dry_run=true")
         return
-
-    large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
-    print(f"refine count={large_gap_count}")
-    t_refine = time.perf_counter()
-    refined_boundary_map: dict[float, Boundary] = {}
-    with tempfile.TemporaryDirectory() as tmpdir:
-        strategy = ocr_refinement(args.gap, args.crop, tmpdir, args.interval, visual_times)
-        splits = [0.0]
-        for vt in cut_ts[1:]:
-            b = boundary_map.get(vt)
-            if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
-                t_b = time.perf_counter()
-                result = strategy(video, b)
-                elapsed_b = time.perf_counter() - t_b
-                reason = f" reason={result.detail}" if result.detail else ""
-                print(f"boundary coarse={vt:.0f} refined={result.t:.0f} saved={vt - result.t:.0f}"
-                      f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
-                      f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={result.method}{reason}")
-                splits.append(result.t)
-                refined_boundary_map[result.t] = b
-            else:
-                splits.append(vt)
-                if b:
-                    refined_boundary_map[vt] = b
-    phase_times["refine"] = time.perf_counter() - t_refine
-
-    before_merge = len(splits)
-    splits = merge_short_clips(splits, effective_min_clip)
-    if len(splits) < before_merge:
-        print(f"merge_short merged={before_merge - len(splits)} min_clip={effective_min_clip:.0f}")
-
-    print(f"clips count={len(splits)}")
-    last_label: str | None = None
-    last_idx: int | None = None
-    for idx, start in enumerate(splits):
-        end = splits[idx + 1] if idx + 1 < len(splits) else duration
-        dur = end - start
-        label = _label_for(filtered, start, args.mode, refined_boundary_map)
-        print(f"clip {idx+1:02d} start={start:.0f} end={end:.1f} dur_s={dur:.0f} dur_min={dur/60:.1f} date={label}")
-        if args.mode == "daily" and last_label == label and last_idx is not None:
-            prev_dur = start - splits[last_idx]
-            print(f"warn same_date_adjacent clips={last_idx+1},{idx+1} date={label}"
-                  f" durations={prev_dur:.0f}s,{dur:.0f}s")
-        last_label = label
-        last_idx = idx
 
     print(f"cutting out_dir={out_dir}")
     t_cut = time.perf_counter()
-    split_video(video, splits, out_dir, filtered, args.mode, refined_boundary_map)
+    split_video(video, result.splits, out_dir, result.filtered, config.mode, result.boundary_map)
+    phase_times = dict(result.phase_times)
     phase_times["cut"] = time.perf_counter() - t_cut
 
     total = time.perf_counter() - t0
