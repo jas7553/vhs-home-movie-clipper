@@ -769,6 +769,55 @@ def drop_digit_drop_runs(
     return [s for i, s in enumerate(samples) if i not in drop]
 
 
+def drop_year_misread_runs(
+    samples: list[tuple[float, datetime | None]],
+) -> list[tuple[float, datetime | None]]:
+    """Drop runs of same-date readings that are in-range year misreads.
+
+    A run whose year differs from both the left and right outer run's year,
+    while sharing the same month as both, is a year misread (e.g. 1990→1999
+    within April). Genuine New-Year boundaries always co-change month, so
+    same-month context safely constrains the drop.
+
+    The outer runs must share the same year — guards against dropping a run
+    that sits legitimately between two advancing years (1990-Apr→1991-Apr→1992-Apr).
+    """
+    dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
+    if len(dated) < 3:
+        return samples
+
+    runs: list[tuple[date, list[int]]] = []
+    cur_date = dated[0][1].date()
+    cur_indices = [dated[0][0]]
+    for idx, dt in dated[1:]:
+        d = dt.date()
+        if d == cur_date:
+            cur_indices.append(idx)
+        else:
+            runs.append((cur_date, cur_indices))
+            cur_date = d
+            cur_indices = [idx]
+    runs.append((cur_date, cur_indices))
+
+    if len(runs) < 3:
+        return samples
+
+    drop: set[int] = set()
+    for r in range(1, len(runs) - 1):
+        run_date, run_indices = runs[r]
+        left_date = runs[r - 1][0]
+        right_date = runs[r + 1][0]
+        if (
+            left_date.year == right_date.year
+            and run_date.year != left_date.year
+            and run_date.month == left_date.month
+            and run_date.month == right_date.month
+        ):
+            drop.update(run_indices)
+
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
 def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S) -> list[float]:
     """
     Drop any cut that would produce a clip shorter than min_clip_s, merging it
@@ -1452,6 +1501,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
 
     samples = drop_date_islands(samples)
+    samples = drop_year_misread_runs(samples)
     samples = drop_digit_drop_runs(samples)
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
     boundaries = find_all_boundaries(filtered, gap_s=config.gap)

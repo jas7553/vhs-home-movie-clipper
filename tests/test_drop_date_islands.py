@@ -11,7 +11,7 @@ a misread surrounded only by None gaps is still detectable as an island.
 """
 from datetime import datetime
 
-from split_homevideo import drop_date_islands, drop_digit_drop_runs
+from split_homevideo import drop_date_islands, drop_digit_drop_runs, drop_year_misread_runs
 
 
 def mk(*days):
@@ -203,3 +203,72 @@ class TestDropDigitDropRuns:
     def test_passthrough_all_same(self):
         s = mk92(26, 26, 26, 26)
         assert drop_digit_drop_runs(s) == s
+
+
+# ---------------------------------------------------------------------------
+# drop_year_misread_runs — catches in-range year misreads that form ≥2-reading
+# runs (e.g. 1990-04-29 → 1999-04-29 ×2 → 1990-04-29), which survive
+# drop_date_islands because a run of 2 looks like a genuine short session.
+# ---------------------------------------------------------------------------
+
+def mk_yr(year_day_pairs):
+    """Build (t, datetime) from [(year, month, day), ...] or None."""
+    out = []
+    for i, v in enumerate(year_day_pairs):
+        if v is None:
+            out.append((float(i * 10), None))
+        else:
+            y, m, d = v
+            out.append((float(i * 10), datetime(y, m, d, 12, 0)))
+    return out
+
+
+def ymd(samples):
+    """Extract (year, month, day) from samples, skipping None."""
+    return [(dt.year, dt.month, dt.day) for _, dt in samples if dt is not None]
+
+
+class TestDropYearMisreadRuns:
+    def test_two_reading_year_misread_dropped(self):
+        # 1990-04-29 ×2, 1999-04-29 ×2, 1990-04-29 ×2 — same month, outer year matches
+        s = mk_yr([(1990,4,29),(1990,4,29),(1999,4,29),(1999,4,29),(1990,4,29),(1990,4,29)])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,4,29)] * 4
+
+    def test_single_reading_year_misread_dropped(self):
+        # Even a single reading is dropped (also caught by drop_date_islands, but verify)
+        s = mk_yr([(1990,7,8),(1990,7,8),(1998,7,8),(1990,7,8),(1990,7,8)])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,7,8)] * 4
+
+    def test_day_off_by_one_still_dropped(self):
+        # 1991-04-28 between 1990-04-29 runs — year and day differ, same month → drop
+        s = mk_yr([(1990,4,29),(1990,4,29),(1991,4,28),(1991,4,28),(1990,4,29),(1990,4,29)])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,4,29)] * 4
+
+    def test_genuine_new_year_boundary_kept(self):
+        # 1990-12-31 → 1991-01-01: year changes AND month changes → not dropped
+        s = mk_yr([(1990,12,31),(1990,12,31),(1991,1,1),(1991,1,1),(1991,1,2),(1991,1,2)])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,12,31),(1990,12,31),(1991,1,1),(1991,1,1),(1991,1,2),(1991,1,2)]
+
+    def test_outer_years_differ_not_dropped(self):
+        # 1990-Apr → 1991-Apr → 1992-Apr: outer years differ (1990 ≠ 1992) → keep all
+        s = mk_yr([(1990,4,29),(1990,4,29),(1991,4,29),(1991,4,29),(1992,4,29),(1992,4,29)])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,4,29),(1990,4,29),(1991,4,29),(1991,4,29),(1992,4,29),(1992,4,29)]
+
+    def test_none_gaps_around_misread_run_still_caught(self):
+        # None gaps around the year-misread run don't protect it
+        s = mk_yr([(1990,4,29),(1990,4,29),None,(1999,4,29),(1999,4,29),None,(1990,4,29),(1990,4,29)])
+        result = ymd(drop_year_misread_runs(s))
+        assert result == [(1990,4,29)] * 4
+
+    def test_passthrough_too_short(self):
+        s = mk_yr([(1990,4,29),(1999,4,29)])
+        assert drop_year_misread_runs(s) == s
+
+    def test_passthrough_all_same_year(self):
+        s = mk_yr([(1990,4,29),(1990,4,29),(1990,4,29),(1990,4,29)])
+        assert drop_year_misread_runs(s) == s
