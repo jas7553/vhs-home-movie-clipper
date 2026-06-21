@@ -49,7 +49,8 @@ ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refine
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (vision/anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
-_CACHE_FORMAT = 3              # increment when cache schema changes; forces re-scan on old caches
+_CACHE_FORMAT = 4              # increment when cache schema changes; forces re-scan on old caches
+                              # (4: crop-primary scan with preprocessing fallback — supersedes v3 all-preprocessed)
 _VISUAL_CACHE_FORMAT = 1
 _MIN_GAP_S = 60               # minimum camera-time jump to emit a boundary (internal, not user-tunable)
 
@@ -58,9 +59,14 @@ VIDEO_TIMESCALE = 29970  # matches source tbn; same on all segs/concat to preven
 MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fps≈0.033s)
                          # produce zero video frames and corrupt the concat — skip them.
 
-# OCR preprocessing filter chain (applied after fps filter in bulk scan, standalone in refinement).
+# OCR preprocessing filter chain — FALLBACK ONLY, not primary.
 # yadif: deinterlaces VHS comb artifacts; format=gray: removes color noise Vision ignores anyway;
 # scale 4×: more glyph detail than 3×; unsharp: crisp edges post-scale; eq: harden contrast.
+# Measured on Converse 1990.mp4 (150 frames spread across the file): crop-only OCR parses
+# 46% of frames, this chain only 33% — the unsharp+contrast=2.0 blows out the timestamp on a
+# large class of (brighter/lower-contrast) frames, turning readable footage into all-None
+# "dead zones". So scan() runs crop-only first and only applies this chain to buckets crop-only
+# could not read (it uniquely recovers ~5% that crop-only misses). See scan().
 _VF_PREPROCESS = "yadif,format=gray,scale=iw*4:ih*4:flags=lanczos,unsharp=5:5:2.0,eq=contrast=2.0:brightness=0.05"
 FRAMES_PER_SAMPLE = 3  # frames extracted per interval window; majority vote → fewer misreads
 
@@ -144,8 +150,15 @@ def parse_timestamp(text: str) -> datetime | None:
 # Frame extraction + OCR
 # ------------------------------------------------------------------ #
 
-def extract_frame(video: str, t: float, crop: str, tmpdir: str) -> str | None:
-    """Extract one cropped frame to a BMP; return path or None on failure."""
+def extract_frame(video: str, t: float, crop: str, tmpdir: str, preprocess: bool = False) -> str | None:
+    """Extract one cropped frame to a BMP; return path or None on failure.
+
+    Default is crop-only: it has a higher OCR yield than the _VF_PREPROCESS chain
+    (46% vs 33% on the test file), so it is the primary path everywhere — including
+    refinement, which calls this without overriding the default. preprocess=True is
+    the fallback applied only to frames crop-only cannot read (see scan()).
+    """
+    vf = f"crop={crop},{_VF_PREPROCESS}" if preprocess else f"crop={crop}"
     frame_path = os.path.join(tmpdir, f"frame_{t:.3f}.bmp")
     cmd = [
         "ffmpeg", "-loglevel", "error",
@@ -153,7 +166,7 @@ def extract_frame(video: str, t: float, crop: str, tmpdir: str) -> str | None:
         "-ss", str(t),
         "-i", video,
         "-vframes", "1",
-        "-vf", f"crop={crop},{_VF_PREPROCESS}",
+        "-vf", vf,
         "-update", "1",
         "-y", frame_path,
     ]
@@ -163,13 +176,22 @@ def extract_frame(video: str, t: float, crop: str, tmpdir: str) -> str | None:
     return frame_path
 
 
-def extract_all_frames(video: str, interval: int, crop: str, tmpdir: str) -> list[str]:
-    """Single-pass: decode video sequentially at 1/interval fps, crop each frame."""
+def extract_all_frames(
+    video: str, interval: int, crop: str, tmpdir: str, preprocess: bool = False
+) -> list[str]:
+    """Single-pass: decode video sequentially at 1/interval fps, crop each frame.
+
+    Default crop-only (the higher-yield primary path); preprocess=True appends
+    _VF_PREPROCESS for the scan() fallback pass.
+    """
+    vf = f"fps={FRAMES_PER_SAMPLE}/{interval},crop={crop}"
+    if preprocess:
+        vf += f",{_VF_PREPROCESS}"
     out_pattern = os.path.join(tmpdir, "frame_%06d.bmp")
     cmd = [
         "ffmpeg", "-loglevel", "error",
         "-i", video,
-        "-vf", f"fps={FRAMES_PER_SAMPLE}/{interval},crop={crop},{_VF_PREPROCESS}",
+        "-vf", vf,
         "-start_number", "0",
         "-y", out_pattern,
     ]
@@ -181,6 +203,25 @@ def frame_index(path: str) -> int:
     m = re.search(r"frame_(\d+)\.bmp", os.path.basename(path))
     assert m is not None, f"unexpected frame filename: {path}"
     return int(m.group(1))
+
+
+def _bucket_frames(paths: list[str]) -> dict[int, list[str]]:
+    """Group extracted frames into interval windows by frame index (FRAMES_PER_SAMPLE per window)."""
+    buckets: dict[int, list[str]] = {}
+    for path in paths:
+        buckets.setdefault(frame_index(path) // FRAMES_PER_SAMPLE, []).append(path)
+    return buckets
+
+
+def _vote_bucket(paths: list[str], ocr: dict[str, str]) -> tuple[datetime, str] | None:
+    """Majority-vote the parseable readings in one window. Returns (winner_dt, raw_text) or None."""
+    parsed = [(p, text, parse_timestamp(text)) for p in paths for text in (ocr.get(p, ""),)]
+    valid = [(p, text, dt) for p, text, dt in parsed if dt is not None]
+    if not valid:
+        return None
+    winner_dt = Counter(dt for _, _, dt in valid).most_common(1)[0][0]
+    winner_text = next(text for _, text, dt in valid if dt == winner_dt)
+    return winner_dt, winner_text
 
 
 def ocr_batch(paths: list[str]) -> dict[str, str]:
@@ -243,38 +284,51 @@ def scan(
             ]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Phase 1: single-pass extraction
-        print(f"  Extracting frames (single pass, {FRAMES_PER_SAMPLE} frames/{interval}s)...", flush=True)
-        frame_paths = extract_all_frames(video, interval, crop, tmpdir)
-        print(f"  Extracted {len(frame_paths)} frames.", flush=True)
+        # Phase 1: crop-only extraction (PRIMARY — higher OCR yield than preprocessing; see _VF_PREPROCESS).
+        crop_dir = os.path.join(tmpdir, "crop")
+        os.makedirs(crop_dir)
+        print(f"  Extracting frames (crop-only, {FRAMES_PER_SAMPLE} frames/{interval}s)...", flush=True)
+        crop_paths = extract_all_frames(video, interval, crop, crop_dir, preprocess=False)
+        print(f"  Extracted {len(crop_paths)} frames. Running OCR (batch)...", flush=True)
+        crop_ocr = ocr_batch(crop_paths)
+        crop_buckets = _bucket_frames(crop_paths)
 
-        # Phase 2: batch OCR
-        print(f"  Running OCR on {len(frame_paths)} frames (batch)...", flush=True)
-        ocr_results = ocr_batch(frame_paths)
-
-        # Phase 3: group frames by interval window, majority-vote on OCR reading.
-        # Key: bucket start label (used only for grouping, not stored in results).
-        interval_frames: dict[float, list[str]] = {}
-        for path in frame_paths:
-            bucket = float((frame_index(path) // FRAMES_PER_SAMPLE) * interval)
-            interval_frames.setdefault(bucket, []).append(path)
-
-        # (t_last_frame, datetime|None, raw_text|None) — t_last_frame is the actual
-        # video time of the last extracted frame in the bucket (a true upper bound on
-        # when any event in that bucket was observed), not the bucket-start label.
-        # raw_text is stored in cache so parse_timestamp fixes propagate without re-scanning.
-        results: dict[float, tuple[datetime | None, str | None]] = {}
-        for _bucket, paths in interval_frames.items():
-            t_last = float(max(frame_index(p) for p in paths)) * interval / FRAMES_PER_SAMPLE
-            frame_data = [(p, ocr_results.get(p, "")) for p in paths]
-            parsed = [(p, text, parse_timestamp(text)) for p, text in frame_data]
-            valid = [(p, text, dt) for p, text, dt in parsed if dt is not None]
-            if not valid:
-                results[t_last] = (None, None)
+        # Per-window majority vote; remember which windows crop-only could not read.
+        readings: dict[int, tuple[datetime, str]] = {}
+        unsolved: list[int] = []
+        for bk, paths in crop_buckets.items():
+            won = _vote_bucket(paths, crop_ocr)
+            if won is not None:
+                readings[bk] = won
             else:
-                winner_dt = Counter(dt for _, _, dt in valid).most_common(1)[0][0]
-                winner_text = next(text for _, text, dt in valid if dt == winner_dt)
-                results[t_last] = (winner_dt, winner_text)
+                unsolved.append(bk)
+
+        # Phase 2: preprocessing FALLBACK — second pass, used only for windows crop-only failed on.
+        # Preprocessing hurts most frames but uniquely recovers some; restrict it to true gaps.
+        if unsolved:
+            pp_dir = os.path.join(tmpdir, "pp")
+            os.makedirs(pp_dir)
+            print(f"  {len(unsolved)} windows unread; preprocessing fallback pass...", flush=True)
+            pp_paths = extract_all_frames(video, interval, crop, pp_dir, preprocess=True)
+            # Index alignment between passes holds only if both yield the same frame count.
+            if len(pp_paths) == len(crop_paths):
+                pp_ocr = ocr_batch(pp_paths)
+                pp_buckets = _bucket_frames(pp_paths)
+                for bk in unsolved:
+                    won = _vote_bucket(pp_buckets.get(bk, []), pp_ocr)
+                    if won is not None:
+                        readings[bk] = won
+            else:
+                print(f"  (skipped fallback: frame-count mismatch "
+                      f"{len(pp_paths)} != {len(crop_paths)})", flush=True)
+
+        # Assemble results keyed by t_last_frame of each window — the actual video time of the
+        # last extracted frame in the window (a true upper bound on when any event was observed),
+        # not the window-start label. raw_text is cached so parser fixes propagate without re-scan.
+        results: dict[float, tuple[datetime | None, str | None]] = {}
+        for bk, paths in crop_buckets.items():
+            t_last = float(max(frame_index(p) for p in paths)) * interval / FRAMES_PER_SAMPLE
+            results[t_last] = readings.get(bk) or (None, None)
 
     sorted_results = sorted(results.items())
     samples = [(t, dt) for t, (dt, _) in sorted_results]

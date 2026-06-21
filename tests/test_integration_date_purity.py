@@ -88,9 +88,12 @@ def test_no_cross_date_contamination(tmp_path):
         offsets = _sample_offsets(duration, SAMPLE_INTERVAL)
 
         with tempfile.TemporaryDirectory() as frame_dir:
+            # crop-only OCR is the trustworthy ground truth here: the _VF_PREPROCESS chain
+            # blanks a large class of readable frames (see _VF_PREPROCESS note), which would
+            # blind this purity check to exactly the cross-date contamination it must catch.
             paths = [
                 p for t in offsets
-                if (p := extract_frame(str(clip), t, DEFAULT_CROP, frame_dir)) is not None
+                if (p := extract_frame(str(clip), t, DEFAULT_CROP, frame_dir, preprocess=False)) is not None
             ]
             if not paths:
                 continue
