@@ -11,7 +11,7 @@ a misread surrounded only by None gaps is still detectable as an island.
 """
 from datetime import datetime
 
-from split_homevideo import drop_date_islands
+from split_homevideo import drop_date_islands, drop_digit_drop_runs
 
 
 def mk(*days):
@@ -122,3 +122,84 @@ class TestKeepsRealSessions:
         # Two same-date readings with None gaps around them — real session, not an island.
         s = mk(1, 1, None, 9, 9, None, 2, 2)
         assert days(drop_date_islands(s)) == [1, 1, 9, 9, 2, 2]
+
+
+# ---------------------------------------------------------------------------
+# drop_digit_drop_runs — catches multi-window digit-drop misreads that survive
+# the single-island filter (e.g. NOV. 26 → NOV 6 persisting 2+ windows).
+# ---------------------------------------------------------------------------
+
+def mk92(*specs):
+    """Build (t, datetime) samples for 1992-style word-month (Style B) tests.
+
+    Each spec is one of:
+      int           → 1992-11-<day>
+      (month, day)  → 1992-<month>-<day>
+      None          → failed OCR window
+    """
+    out = []
+    for i, s in enumerate(specs):
+        if s is None:
+            out.append((float(i * 10), None))
+        else:
+            month, day = s if isinstance(s, tuple) else (11, s)
+            out.append((float(i * 10), datetime(1992, month, day, 12, 0)))
+    return out
+
+
+def days92(samples):
+    """Extract (month, day) pairs from samples, skipping None."""
+    return [(dt.month, dt.day) for _, dt in samples if dt is not None]
+
+
+class TestDropDigitDropRuns:
+    def test_two_window_nov6_inside_nov26_dropped(self):
+        # NOV26 NOV26 NOV6 NOV6 NOV26 NOV26 — verified 1992-tape misread pattern
+        s = mk92(26, 26, 6, 6, 26, 26)
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(11, 26)] * 4
+
+    def test_two_window_nov2_inside_nov27_dropped(self):
+        # NOV27 NOV27 NOV2 NOV2 NOV27 NOV27
+        s = mk92(27, 27, 2, 2, 27, 27)
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(11, 27)] * 4
+
+    def test_single_island_already_handled_by_other_filter(self):
+        # Single-window misread — drop_digit_drop_runs should also catch it
+        # (the outer runs on both sides match and digit-drop holds).
+        s = mk92(26, 26, 6, 26, 26)
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(11, 26)] * 4
+
+    def test_none_gaps_around_digit_drop_run_still_caught(self):
+        # None gaps between runs don't protect the misread.
+        s = mk92(26, 26, None, 6, 6, None, 26, 26)
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(11, 26)] * 4
+
+    def test_genuine_outoforder_different_month_kept(self):
+        # SEP 1 between MAR 25 and APR 8 — different months, not a digit drop.
+        s = mk92((3, 25), (3, 25), (9, 1), (9, 1), (4, 8), (4, 8))
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(3, 25), (3, 25), (9, 1), (9, 1), (4, 8), (4, 8)]
+
+    def test_genuine_same_month_different_ones_digit_kept(self):
+        # NOV26 → NOV13 → NOV26: 26%10=6 ≠ 13 — not a digit drop, keep.
+        s = mk92(26, 26, 13, 13, 26, 26)
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(11, 26), (11, 26), (11, 13), (11, 13), (11, 26), (11, 26)]
+
+    def test_outer_context_must_match_both_sides(self):
+        # NOV26 → NOV6 → NOV27: outer sides differ, not a digit-drop bracket.
+        s = mk92(26, 26, 6, 6, 27, 27)
+        result = days92(drop_digit_drop_runs(s))
+        assert result == [(11, 26), (11, 26), (11, 6), (11, 6), (11, 27), (11, 27)]
+
+    def test_passthrough_too_short(self):
+        s = mk92(26, 6)
+        assert drop_digit_drop_runs(s) == s
+
+    def test_passthrough_all_same(self):
+        s = mk92(26, 26, 26, 26)
+        assert drop_digit_drop_runs(s) == s

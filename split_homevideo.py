@@ -32,7 +32,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
@@ -703,6 +703,69 @@ def drop_date_islands(
         d = dt.date()
         if d != dated[j - 1][1].date() and d != dated[j + 1][1].date():
             drop.add(idx)
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
+def drop_digit_drop_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[float, "datetime | None"]]:
+    """Drop multi-window digit-drop misreads that survive drop_date_islands.
+
+    Word-month OCR (Style B, e.g. NOV. 26 1992) sometimes drops the tens digit
+    of the day: NOV. 26 → NOV 6, NOV. 27 → NOV 2. When such a misread spans
+    ≥2 consecutive windows it looks like a genuine session (the ≥2 rule in
+    drop_date_islands) and survives the island filter.
+
+    A run is flagged as a digit-drop misread when all three hold:
+      1. The run is bracketed on both sides by the same outer date.
+      2. The run's date has the same month and year as the outer date.
+      3. The outer day is ≥10 and either its ones-digit or its tens-digit
+         equals the run's day (e.g. outer=26 → ones=6 ✓; outer=27 → tens=2 ✓).
+
+    Genuine out-of-order sessions (different month, different year, or ones-digit
+    mismatch) are not dropped — the 9/01-between-3/25-and-4/08 case survives.
+    None entries are skipped when forming runs, matching drop_date_islands semantics.
+    """
+    dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
+    if len(dated) < 3:
+        return samples
+
+    # Group consecutive same-date readings into runs (None gaps are invisible here).
+    runs: list[tuple[date, list[int]]] = []
+    cur_date = dated[0][1].date()
+    cur_idx = [dated[0][0]]
+    for idx, dt in dated[1:]:
+        d = dt.date()
+        if d == cur_date:
+            cur_idx.append(idx)
+        else:
+            runs.append((cur_date, cur_idx))
+            cur_date = d
+            cur_idx = [idx]
+    runs.append((cur_date, cur_idx))
+
+    if len(runs) < 3:
+        return samples
+
+    drop: set[int] = set()
+    for r in range(1, len(runs) - 1):
+        run_date, run_indices = runs[r]
+        left_date = runs[r - 1][0]
+        right_date = runs[r + 1][0]
+        if left_date != right_date:
+            continue
+        outer = left_date
+        if (
+            run_date.month == outer.month
+            and run_date.year == outer.year
+            and outer.day >= 10
+            and (
+                outer.day % 10 == run_date.day  # drop tens digit: 26 → 6
+                or outer.day // 10 == run_date.day  # drop ones digit: 27 → 2
+            )
+        ):
+            drop.update(run_indices)
+
     return [s for i, s in enumerate(samples) if i not in drop]
 
 
@@ -1384,6 +1447,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
 
     samples = drop_date_islands(samples)
+    samples = drop_digit_drop_runs(samples)
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
     boundaries = find_all_boundaries(filtered, gap_s=config.gap)
 
