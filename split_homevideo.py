@@ -39,7 +39,8 @@ from typing import NamedTuple, Protocol
 # --- defaults ---
 DEFAULT_INTERVAL = 10          # sample every N seconds
 DEFAULT_GAP = 3600             # 1-hour camera-time gap = new clip (empirically tuned; see golden_labels analysis)
-DEFAULT_CROP = "250:110:385:370"  # w:h:x:y for 640x480 bottom-right timestamp
+DEFAULT_CROP = "560:130:40:350"   # w:h:x:y; full bottom band, 640x480 source
+                                  # (was 250:110:385:370 — right-anchored, clipped off-center overlays)
 DEFAULT_MODE = "daily"
 DEFAULT_SCENE_THRESHOLD = 0.4
 DEFAULT_BLACK_MIN_DURATION = 0.1
