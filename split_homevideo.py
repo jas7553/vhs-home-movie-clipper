@@ -144,6 +144,14 @@ class PipelineResult(NamedTuple):
 DATE_PATTERN = re.compile(
     r"(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{2,4})"
 )
+WORD_MONTH_PATTERN = re.compile(
+    r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[.\-]?\s+(\d{1,2})\s+(\d{2,4})",
+    re.IGNORECASE,
+)
+_MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
 TIME_PATTERN = re.compile(
     r"(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?", re.IGNORECASE
 )
@@ -155,13 +163,19 @@ def parse_timestamp(text: str) -> datetime | None:
     flat = re.sub(r"[\n\r]+", " ", text)
     flat = re.sub(r" +", " ", flat).strip()
     date_m = DATE_PATTERN.search(flat)
+    wm_m = None if date_m else WORD_MONTH_PATTERN.search(flat)
     time_m = TIME_PATTERN.search(flat)
-    if not date_m:
+    if not date_m and not wm_m:
         return None
-    month, day, year = int(date_m.group(1)), int(date_m.group(2)), int(date_m.group(3))
-    # Reject implausible dates (month > 12, day > 31)
-    if month > 12 or day > 31:
-        return None
+    if date_m:
+        month, day, year = int(date_m.group(1)), int(date_m.group(2)), int(date_m.group(3))
+        # Reject implausible dates (month > 12, day > 31)
+        if month > 12 or day > 31:
+            return None
+    else:
+        assert wm_m is not None
+        month = _MONTH_MAP[wm_m.group(1).upper()]
+        day, year = int(wm_m.group(2)), int(wm_m.group(3))
     if year < 100:
         year += 1900 if year >= 80 else 2000
     # Reject implausible years for home VHS footage (1985–2005)
