@@ -73,3 +73,5 @@ Default canonical label strings (`needs-triage`, `needs-info`, `ready-for-agent`
 ### Domain docs
 
 Single-context layout: `CONTEXT.md` at root + `docs/adr/`. See `docs/agents/domain.md`.
+
+Dated empirical discoveries go in `docs/findings/NNN-slug.md` (evidence, not goals/decisions) — see `docs/findings/README.md` for how it relates to specs/ADRs/requirements.
