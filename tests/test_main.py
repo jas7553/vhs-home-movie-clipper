@@ -42,12 +42,16 @@ class TestMainOcrBinMissing:
                 main()
 
 
+_MOCK_CROP = "560:130:40:350"
+
+
 class TestMainDryRun:
     def test_does_not_call_split_video(self, tmp_path):
         video = tmp_path / "vid.mp4"
         video.touch()
         with mock.patch("sys.argv", ["prog", str(video), "--dry-run"]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
+             mock.patch("split_homevideo.calibrate", return_value=_MOCK_CROP), \
              mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT), \
              mock.patch("split_homevideo.split_video") as m_sv:
             main()
@@ -60,6 +64,7 @@ class TestMainFullRun:
         video.touch()
         with mock.patch("sys.argv", ["prog", str(video)]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
+             mock.patch("split_homevideo.calibrate", return_value=_MOCK_CROP), \
              mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT), \
              mock.patch("split_homevideo.split_video") as m_sv:
             main()
@@ -70,8 +75,22 @@ class TestMainFullRun:
         video.touch()
         with mock.patch("sys.argv", ["prog", str(video)]), \
              mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
+             mock.patch("split_homevideo.calibrate", return_value=_MOCK_CROP), \
              mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT) as m_run, \
              mock.patch("split_homevideo.split_video"):
             main()
         config: PipelineConfig = m_run.call_args[0][0]
         assert config.cache.endswith("myvid_ocr_cache.json")
+
+    def test_explicit_crop_bypasses_calibration(self, tmp_path):
+        video = tmp_path / "vid.mp4"
+        video.touch()
+        with mock.patch("sys.argv", ["prog", str(video), "--crop", "100:50:10:200"]), \
+             mock.patch("split_homevideo.OCR_BIN", _mock_ocr_bin()), \
+             mock.patch("split_homevideo.calibrate") as m_calib, \
+             mock.patch("split_homevideo.run", return_value=_EMPTY_RESULT) as m_run, \
+             mock.patch("split_homevideo.split_video"):
+            main()
+        m_calib.assert_not_called()
+        config: PipelineConfig = m_run.call_args[0][0]
+        assert config.crop == "100:50:10:200"

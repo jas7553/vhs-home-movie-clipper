@@ -12,7 +12,7 @@ Arguments:
     --mode      Clip grouping mode: scene, session, or daily (default)
     --out-dir   Output directory for clips (default: <input>_clips/)
     --crop      ffmpeg crop string "w:h:x:y" for timestamp region
-                (default tuned for 640x480 with bottom-right overlay)
+                (default: auto-detected per tape via calibration pass)
     --dry-run   Print split points without cutting
 """
 
@@ -50,6 +50,8 @@ ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refine
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (vision/anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
+_CALIB_CACHE_FORMAT = 1        # increment to force re-calibration on all tapes
+_CALIB_N_SAMPLES = 20         # frames sampled during calibration to verify OCR yield
 _CACHE_FORMAT = 5              # increment when cache schema changes; forces re-scan on old caches
                               # (5: date-only readings accepted — _vote_bucket now stores date-only
                               #  text that v4 discarded, so old caches must be regenerated)
@@ -341,6 +343,81 @@ def ocr_batch(paths: list[str]) -> dict[str, str]:
 # ------------------------------------------------------------------ #
 # Main logic
 # ------------------------------------------------------------------ #
+
+def _get_video_dimensions(video: str) -> tuple[int, int]:
+    """Return (width, height) of the first video stream."""
+    r = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        video,
+    ], capture_output=True, text=True, check=True)
+    line = r.stdout.strip().splitlines()[0]
+    w, h = line.split(",")
+    return int(w), int(h)
+
+
+def _bottom_band_crop(w: int, h: int) -> str:
+    """Wide bottom-band crop proportionally scaled from the 640×480 reference.
+
+    Reference crop 560:130:40:350 on 640×480 covers the bottom 130px starting
+    at x=40 — wide enough to capture left/center/right overlay positions.
+    Scales linearly for other frame dimensions.
+    """
+    crop_h = max(60, round(h * 130 / 480))
+    crop_w = max(100, round(w * 560 / 640))
+    crop_x = round(w * 40 / 640)
+    crop_y = h - crop_h
+    crop_x = max(0, min(crop_x, w - crop_w))
+    return f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"
+
+
+def calibrate(video: str, cache_path: str | None = None) -> str:
+    """Auto-detect overlay crop for the given tape. Returns a crop string.
+
+    Derives a wide bottom-band crop scaled to the tape's frame dimensions,
+    then verifies it against a spread of sampled frames. Falls back to
+    DEFAULT_CROP if dimensions cannot be probed. Result is cached per tape.
+    """
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cached = json.load(f)
+        if cached.get("calib_format") == _CALIB_CACHE_FORMAT:
+            print(f"  (loaded from calib cache: {cache_path})")
+            return str(cached["crop"])
+
+    try:
+        w, h = _get_video_dimensions(video)
+    except (subprocess.CalledProcessError, ValueError):
+        print(f"  calib warn=dimension-probe-failed fallback={DEFAULT_CROP}")
+        return DEFAULT_CROP
+
+    crop = _bottom_band_crop(w, h)
+
+    duration = get_duration(video)
+    step = duration / (_CALIB_N_SAMPLES + 1)
+    sample_times = [step * (i + 1) for i in range(_CALIB_N_SAMPLES)]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = [p for t in sample_times if (p := extract_frame(video, t, crop, tmpdir)) is not None]
+        raw = ocr_batch(paths) if paths else {}
+
+    hits = sum(
+        1 for text in raw.values()
+        if parse_timestamp(text) is not None or _parse_time_only(text) is not None
+    )
+    yield_pct = hits / max(1, len(paths))
+    print(f"calib frame={w}x{h} crop={crop} sample={len(paths)} hits={hits} yield={yield_pct:.0%}")
+
+    if cache_path:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump({"calib_format": _CALIB_CACHE_FORMAT, "crop": crop, "w": w, "h": h}, f)
+        print(f"  (calib cached to {cache_path})")
+
+    return crop
+
 
 def get_duration(video: str) -> float:
     r = subprocess.run(
@@ -1415,8 +1492,11 @@ def main() -> None:
     ap.add_argument("--mode", choices=["scene", "session", "daily"], default=DEFAULT_MODE,
                     help="Clip grouping mode (default: daily)")
     ap.add_argument("--out-dir", default=None)
-    ap.add_argument("--crop", default=DEFAULT_CROP,
-                    help="ffmpeg crop 'w:h:x:y' for timestamp region")
+    ap.add_argument("--crop", default=None,
+                    help="ffmpeg crop 'w:h:x:y' for timestamp region "
+                         "(default: auto-detected via calibration pass)")
+    ap.add_argument("--calib-cache", default=None,
+                    help="JSON file to cache per-tape calibration result (crop auto-detection)")
     ap.add_argument("--cache", default=None,
                     help="JSON file to cache OCR scan results (saves time on re-runs)")
     ap.add_argument("--visual-cache", default=None,
@@ -1448,15 +1528,21 @@ def main() -> None:
 
     out_dir = args.out_dir or (Path(video).stem + "_clips")
     out_dir = os.path.abspath(out_dir)
+    calib_cache = args.calib_cache or (Path(video).stem + "_calib_cache.json")
     cache = args.cache or (Path(video).stem + "_ocr_cache.json")
     visual_cache = args.visual_cache or (Path(video).stem + "_visual_cache.json")
+
+    if args.crop is not None:
+        crop = args.crop
+    else:
+        crop = calibrate(video, calib_cache)
 
     config = PipelineConfig(
         video=video,
         interval=args.interval,
         gap=args.gap,
         mode=args.mode,
-        crop=args.crop,
+        crop=crop,
         cache=cache,
         visual_cache=visual_cache,
         enable_visual_fusion=args.enable_visual_fusion,
