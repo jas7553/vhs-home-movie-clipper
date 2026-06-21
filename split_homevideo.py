@@ -38,7 +38,8 @@ from typing import NamedTuple, Protocol
 
 # --- defaults ---
 DEFAULT_INTERVAL = 10          # sample every N seconds
-DEFAULT_GAP = 3600             # 1-hour camera-time gap = new clip (empirically tuned; see golden_labels analysis)
+DEFAULT_GAP = 3600             # 1-hour camera-time gap = new clip (empirically tuned)
+
 DEFAULT_CROP = "560:130:40:350"   # w:h:x:y; full bottom band, 640x480 source
                                   # (was 250:110:385:370 — right-anchored, clipped off-center overlays)
 DEFAULT_MODE = "daily"
@@ -47,7 +48,7 @@ DEFAULT_BLACK_MIN_DURATION = 0.1
 DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
 DEFAULT_MIN_CLIP_S = 120.0     # clips shorter than this are merged into prior clip; validated on golden set
 ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refinement-collision slivers
-SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (vision/anchor applies);
+SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (visual anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
 _CALIB_CACHE_FORMAT = 1        # increment to force re-calibration on all tapes
@@ -637,11 +638,10 @@ def filter_ocr_outliers(
 
 def find_all_boundaries(
     samples: list[tuple[float, datetime]],
-    min_gap_s: int = _MIN_GAP_S,
     gap_s: int = DEFAULT_GAP,
 ) -> list["Boundary"]:
     """
-    Stage 1: emit every candidate boundary at a low detection floor (min_gap_s).
+    Stage 3: emit every candidate boundary at a low detection floor (_MIN_GAP_S).
 
     Accepts pre-filtered samples (no None entries) — call filter_ocr_outliers first.
     Returns Boundary objects sorted by video_t. Type 'large_gap' when the camera
@@ -654,7 +654,7 @@ def find_all_boundaries(
             prev_t, prev_dt = prev
             video_advance = t - prev_t
             cam_advance = (dt - prev_dt).total_seconds()
-            jumped_forward = cam_advance > video_advance + min_gap_s
+            jumped_forward = cam_advance > video_advance + _MIN_GAP_S
             jumped_backward = cam_advance < -1800
             if jumped_forward or jumped_backward:
                 is_large = cam_advance > video_advance + gap_s or jumped_backward
@@ -789,15 +789,16 @@ def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S)
     return merged
 
 
-def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[float]:
+def group_clips(boundaries: list["Boundary"], mode: str) -> list[float]:
     """
-    Stage 2: decide which boundaries become cut points based on mode.
+    Stage 4: decide which boundaries become cut points based on mode.
 
     Returns list[float] of video_t values with 0.0 prepended.
       scene   — all boundaries (gap + large_gap)
       session — large_gap only
-      daily   — only confirmed date changes or backward jumps; unknown-date
-                boundaries are skipped (avoids splitting same-day footage)
+      daily   — only confirmed date changes; unknown-date boundaries are skipped
+                (avoids splitting same-day footage; backward jumps are cut only
+                when they cross a date boundary)
 
     Daily mode cuts on every date change in tape order, so a date that recurs
     later on the tape (out-of-order re-recording) yields a separate clip each
@@ -1380,7 +1381,7 @@ def _reading_confirmed(filtered: list[tuple[float, datetime]], i: int) -> bool:
 def _label_for(
     filtered: list[tuple[float, datetime]],
     start: float,
-    mode: str = "session",
+    mode: str = DEFAULT_MODE,
     boundary_map: dict[float, Boundary] | None = None,
 ) -> str:
     """Return a label string for the clip starting at `start` seconds."""
@@ -1409,7 +1410,7 @@ def _label_for(
 
 def split_video(
     video: str, splits: list[float], out_dir: str, filtered: list[tuple[float, datetime]],
-    mode: str = "session", boundary_map: dict[float, Boundary] | None = None
+    mode: str = DEFAULT_MODE, boundary_map: dict[float, Boundary] | None = None
 ):
     os.makedirs(out_dir, exist_ok=True)
     duration = get_duration(video)
@@ -1466,7 +1467,7 @@ def run(config: PipelineConfig) -> PipelineResult:
             boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, config.fuse_window)
             print(f"visual_fusion confirmed={len(boundaries)} total={before} window={config.fuse_window:.0f}")
 
-    cut_ts = group_clips(boundaries, config.mode, config.gap)
+    cut_ts = group_clips(boundaries, config.mode)
     boundary_map: dict[float, Boundary] = {b.video_t: b for b in boundaries}
     duration = get_duration(config.video)
     effective_min_clip = ARTIFACT_MIN_S if config.mode == "daily" else config.min_clip
@@ -1575,7 +1576,8 @@ def main() -> None:
     ap.add_argument("--fuse-window", type=float, default=DEFAULT_FUSE_WINDOW,
                     help="Seconds of padding around [prev_t, video_t] to search for a corroborating visual signal")
     ap.add_argument("--min-clip", type=float, default=DEFAULT_MIN_CLIP_S,
-                    help="Clips shorter than this (seconds) are merged into the prior clip")
+                    help="Clips shorter than this (seconds) are merged into the prior clip "
+                         "(ignored in daily mode, which uses a 3s floor to catch only refinement slivers)")
     ap.add_argument("--scene-threshold", type=float, default=DEFAULT_SCENE_THRESHOLD,
                     help="ffmpeg scene-change detection threshold (0-1)")
     ap.add_argument("--black-min-duration", type=float, default=DEFAULT_BLACK_MIN_DURATION,
