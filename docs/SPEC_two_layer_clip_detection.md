@@ -1,6 +1,12 @@
 # SPEC: Two-Layer Clip Detection
 
-## Status: DECISIONS FINALIZED — ready for implementation
+## Status: IMPLEMENTED (historical spec) — defaults since changed
+
+> The two-layer design (`find_all_boundaries` + `group_clips` + `--mode`) shipped.
+> Two CLI defaults stated below are **out of date**: the current default mode is
+> **`daily`** (not `session`) and the default `--gap` is **3600** (not 300). See
+> CLAUDE.md / README.md for current behavior. The AM/PM-required note in
+> "Pre-implementation fixes" was also later reversed (see the inline note there).
 
 ---
 
@@ -17,6 +23,13 @@ Two bugs found during OCR analysis of `test_15min.mp4` and fixed before spec was
 **1. `parse_timestamp` month misread** — `DATE_PATTERN` used `[/\s]+` as separator, allowing `11 5/90` to parse as November instead of rejecting it (slash misread as `1`, then space as separator). Fix: changed to `\s*/\s*` — requires a literal `/`, allows optional surrounding whitespace. `11 5/90` now returns None.
 
 **2. `parse_timestamp` AM/PM required** — `(AM|PM)?` was optional. When OCR dropped the PM indicator, `7:14` parsed as 7 AM, creating phantom 12-hour backward jumps that clustered and survived `filter_ocr_outliers`. Fix: `if not ampm: return None`.
+
+> **Superseded (2026-06-21):** `if not ampm: return None` was later reversed. A
+> time without AM/PM (or no time at all) now falls back to **midnight** and keeps
+> the date, because the camcorder overlay can be set to date-only for long spans
+> and rejecting those reads collapsed multiple real dates into one clip. The
+> 12-hour-jump hazard is still avoided — the ambiguous *time* is dropped, not used
+> as 7 AM. See `.scratch/issue-005-date-only-span-contamination.md`.
 
 **3. `filter_ocr_outliers` consecutive boundaries** — original rule "keep if consistent with prev OR next" drops real readings caught between two consecutive boundaries (e.g. 11:44 AM between an overnight jump before it and a 96-min jump after it — fails both checks and was wrongly discarded). Fix: when a reading fails both checks, additionally test whether prev and next are consistent with *each other*. If they are → isolated outlier, drop. If they aren't → reading is between two real boundaries, keep.
 

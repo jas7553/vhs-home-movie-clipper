@@ -1,6 +1,15 @@
 # Vision-refine prototype
 
-**Status:** prototype (opt-in). Default pipeline unchanged.
+> **REMOVED — historical record only.** This prototype and all its CLI flags
+> (`--vision-refine`, `--vision-export*`, `--vision-readings`) were deleted from
+> `split_homevideo.py` on 2026-06-20 (commit `03a88c2`); see
+> **`docs/adr/0002-remove-vision-prototype.md`** for the decision and what was
+> removed. None of the functions, constants, or flags described below exist in the
+> code anymore. Kept only to preserve the design rationale and measurements. The
+> production refinement path is `ocr_refinement` (`LongDeadZonePolicy` /
+> `ShortSpanPolicy`).
+
+**Status:** removed (was: prototype, opt-in). Superseded by ADR 0002.
 
 Reads the camera timestamp in the refinement window with a vision model instead of the
 OCR binary + scene-cut anchor. Goal: read degraded / transitioning / head-switch-noise

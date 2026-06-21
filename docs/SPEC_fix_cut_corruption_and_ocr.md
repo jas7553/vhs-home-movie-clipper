@@ -170,6 +170,15 @@ and by the date range / split count staying sane.
 
 ### OCR improvement postmortem
 
+> **Superseded (architecture later reversed).** This postmortem credits the
+> preprocessing filter chain as the primary-path win. That was overturned: once
+> crop-only scanning was measured *with* 3-frame majority voting, preprocessing was
+> found to **lower** yield (crop-only ~67% vs preprocessed ~45% per frame) — it blows
+> out the timestamp on brighter/lower-contrast frames. The chain is now **fallback-only**
+> (`_VF_PREPROCESS`), applied only to windows crop-only could not read (commit
+> `7c523eb`). Current per-window yield is ~86% (after date-only acceptance too). See
+> CLAUDE.md and the `_VF_PREPROCESS` comment in `split_homevideo.py`.
+
 - **Result: 1393/2128 = 65.5%** (was 960/2128 = 44%). +21.5pp, 49% relative improvement.
 - All three filter-chain improvements were implemented (`yadif` + `scale=iw*3` + `eq=contrast=1.5`).
 - The "optional" 3-frames-per-interval consensus voting was also implemented; frames are grouped by

@@ -45,14 +45,18 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
 ## How It Works
 
 1. **OCR scan**: Extract 3 frames per `--interval` window via a single ffmpeg pass
-   (no per-frame seeks). Crop the bottom-right region (`250:110:385:370` for 640×480),
-   apply deinterlace + 4× upscale + contrast enhancement, batch through `ocr_timestamp`
-   (Apple Vision, M4-native). Majority vote within each window. Results cached as raw
-   OCR text to `<stem>_ocr_cache.json` — parser fixes re-apply at load time, no rescan needed.
+   (no per-frame seeks). Crop the bottom-right region (`250:110:385:370` for 640×480)
+   and batch through `ocr_timestamp` (Apple Vision, M4-native). The scan is **crop-only
+   first** — that has the higher OCR yield (~67% vs ~45% per frame); the deinterlace +
+   4× upscale + contrast `_VF_PREPROCESS` chain runs only as a **fallback** on windows
+   crop-only could not read (it uniquely recovers a few %). Majority vote within each
+   window. Results cached as raw OCR text to `<stem>_ocr_cache.json` — parser fixes
+   re-apply at load time, no rescan needed.
 
-2. **Parse**: Extract date (`M/ D/YY`) and time (`H:MM AM/PM`) from OCR text.
-   Timestamps where AM/PM is absent are discarded — optional AM/PM caused 12-hour
-   backward phantom jumps. Years outside 1985–2005 are rejected as hallucinations.
+2. **Parse**: Extract date (`M/ D/YY`) and time (`H:MM AM/PM`) from OCR text. A reading
+   with no time, or a time with no AM/PM, falls back to **midnight** and keeps the date —
+   the camcorder overlay can be set to date-only for long spans, and daily-mode cuts on
+   the date. Years outside 1985–2005 are rejected as hallucinations.
 
 3. **Outlier filter**: Remove isolated misreads and consecutive misread runs. A reading
    is kept if it is consistent (within 900s drift) with EITHER its previous OR next
@@ -64,12 +68,14 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
    - `cam_advance < -1800s` (backward jump, new tape segment)
    Type is `large_gap` when jump exceeds `--gap` threshold (default 3600s camera-time).
 
+   Phantom date-change boundaries from isolated OCR misreads are prevented **upstream**
+   by `drop_date_islands` (a single reading whose date differs from both neighbours is
+   dropped before boundary detection), so grouping never sees them.
+
 5. **Grouping**: Filter boundaries to cut points by `--mode`:
    - `daily` (default) — only confirmed calendar date changes; no date split across clips
    - `session` — `large_gap` boundaries only
    - `scene` — all detected pauses
-   After grouping, `_collapse_revert_phantoms` removes phantom clips from OCR misreads
-   (misread year/month creates a short clip with opposite-sign cam jumps on both sides).
 
 6. **Refinement**: For each `large_gap` boundary, dense 1s scan of the preceding
    `[prev_sample, coarse_t]` window in parallel. Cuts at the last confirmed old-session
@@ -92,27 +98,34 @@ not wall-clock seconds. `--gap 3600` (1 camera-hour) is empirically validated on
 false-positive rates.
 
 ### OCR reliability
-Success rate on the 5.9hr Converse 1990 tape: 1096/2128 samples (51%). Fails when:
+Per-window success rate on the 5.9hr Converse 1990 tape: 1824/2128 windows (~86%) —
+crop-only primary + preprocessing fallback + 3-frame majority vote + date-only
+acceptance. Fails when:
 - Timestamp region is in motion (pan/shake)
 - Lighting is very dark or very bright
-- The `1/` separator splits across OCR lines
+- Head-switch noise at a tape splice blanks the overlay entirely (Splice Dead Zone)
 
-The outlier filter and `None`-skipping logic make the pipeline robust to ~50% failure.
+The outlier filter and `None`-skipping logic make the pipeline robust to the rest.
 
-### Phantom clip collapse (daily mode)
-OCR misreads that survive the outlier filter (e.g., reading "1999" instead of "1990"
-for a single frame in a transition zone) create a phantom short clip. In `daily` mode,
-these phantom clips are detected and removed by `_collapse_revert_phantoms`: a clip
-shorter than `min_clip_s` (120s) whose bounding boundaries have opposite-sign
-`cam_jump_s` values is a misread — a forward jump to the wrong date immediately
-followed by a backward jump back. Validated on Converse 1990.mp4: removed 8 phantom
-clips including `1999-05-19`, `1999-07-21`, `1990-01-22` (misread month), and
-`1990-09-01` (misread in an April sequence).
+### Date-island removal (daily mode)
+An isolated OCR misread (e.g. reading "1999" instead of "1990", or a wrong day, for a
+single frame in a transition zone) would otherwise create a phantom date-change
+boundary. `drop_date_islands` removes these **before** boundary detection: a single
+reading whose date differs from **both** neighbours is a misread and is dropped. A real
+session is a contiguous run of ≥2 same-date readings and is never dropped, so genuine
+short / out-of-order sessions survive (e.g. a `9/01` run physically between `3/25` and
+`4/08` on a re-recorded tape). This replaced the earlier cut-level
+`_collapse_revert_phantoms` heuristic, which mis-merged two real sessions when a misread
+landed exactly on a real session change.
 
 ### Timestamp format
 `M/ D/YY` on bottom line, `H:MM AM/PM` on top line. Single-digit months/days use a
-leading space (`1/ 4/90` not `01/04/90`). AM/PM is required — when absent the parser
-returns `None` (optional AM/PM caused phantom 12-hour backward jumps).
+leading space (`1/ 4/90` not `01/04/90`). A reading with no time — or a time with no
+AM/PM — falls back to **midnight** and keeps the date (the overlay can be set to
+date-only for long spans). Earlier the parser required AM/PM and returned `None`
+otherwise; that discarded real date-only spans and collapsed multiple dates into one
+clip, so the guard was replaced by the midnight fallback (the 12-hour-jump hazard it
+guarded against is avoided by dropping the ambiguous time, not the date).
 
 ### Split accuracy
 Coarse boundaries land within ±`interval`s of the actual cut. The refinement step

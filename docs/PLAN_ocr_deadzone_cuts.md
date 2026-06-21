@@ -117,7 +117,9 @@ Both errors are a direct consequence of unreadable OCR in the transition zone. T
 ## Domain Facts Relevant to This Work
 
 - Camera clock runs ~2× real time. `gap_s=3600` is the validated threshold.
-- OCR success rate ~44% overall; lower in transition zones.
-- Timestamp format: `M/ D/YY` bottom line, `H:MM AM/PM` top line.
+- OCR success rate ~86% per-window (was ~44% when this plan was written, before
+  crop-only-primary scanning and date-only acceptance); still lower in transition zones.
+- Timestamp format: `M/ D/YY` bottom line, `H:MM AM/PM` top line (the time line may be
+  absent — date-only reads are accepted and fall back to midnight).
 - Default crop `250:110:385:370` for 640×480 source.
 - Visual cache key: scene_threshold + black_min_duration (see `detect_visual_boundaries`).
