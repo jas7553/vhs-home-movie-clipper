@@ -108,6 +108,40 @@ class TestDateOnly:
         assert parse_timestamp("1/ 1/84") is None    # 1984, below floor
 
 
+class TestWordMonthFormats:
+    """Style B overlays: word month + separator + day + year."""
+
+    @pytest.mark.parametrize("text,expected", [
+        # original separators (issue-010)
+        ("NOV. 25 1992",  (1992, 11, 25)),
+        ("NOV- 26 1992",  (1992, 11, 26)),
+        ("dec. 3 1990",   (1990, 12, 3)),
+        # no-space after separator (issue-016)
+        ("DEC.24 1992",   (1992, 12, 24)),
+        # comma misread (issue-016)
+        ("DEC,13 1992",   (1992, 12, 13)),
+        # colon misread (issue-016)
+        ("DEC:24 1992",   (1992, 12, 24)),
+    ])
+    def test_parses(self, text: str, expected: tuple):
+        result = parse_timestamp(text)
+        assert result is not None
+        assert (result.year, result.month, result.day) == expected
+
+    def test_time_only_not_misparsed(self):
+        # "8:08:56 PM" has no month token — must return None (time without date)
+        assert parse_timestamp("8:08:56 PM") is None
+
+    def test_invalid_month_token_rejected(self):
+        assert parse_timestamp("XYZ. 24 1992") is None
+
+    def test_day_out_of_range_rejected(self):
+        assert parse_timestamp("DEC. 32 1992") is None
+
+    def test_year_out_of_range_rejected(self):
+        assert parse_timestamp("DEC. 24 1984") is None
+
+
 @pytest.mark.parametrize("text", [
     "",
     "blurry static ~~~",

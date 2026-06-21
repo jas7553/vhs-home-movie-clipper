@@ -147,7 +147,7 @@ DATE_PATTERN = re.compile(
     r"(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{2,4})"
 )
 WORD_MONTH_PATTERN = re.compile(
-    r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[.\-]?\s+(\d{1,2})\s+(\d{2,4})",
+    r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[.,:\-]?\s*(\d{1,2})\s+(\d{2,4})",
     re.IGNORECASE,
 )
 _MONTH_MAP = {
