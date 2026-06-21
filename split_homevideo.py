@@ -495,33 +495,38 @@ def find_all_boundaries(
 
 
 def drop_date_islands(
-    samples: list[tuple[float, datetime]],
-) -> list[tuple[float, datetime]]:
-    """Drop 'date islands' — a reading whose date differs from BOTH neighbours.
+    samples: list[tuple[float, datetime | None]],
+) -> list[tuple[float, datetime | None]]:
+    """Drop 'date islands' — a dated reading whose date differs from BOTH nearest dated neighbours.
+
+    Operates on raw samples (None entries for failed OCR windows are skipped when
+    searching for neighbours). This allows the filter to catch misreads that are
+    surrounded only by None gaps — which would survive if we ran only after
+    None-stripping, since they'd appear isolated with no neighbours to compare.
 
     A real recording session is a contiguous run of same-date readings. A single
-    isolated reading of a date that neither the previous nor the next reading
-    shares is an OCR misread (wrong day/month/year). Removing these here, before
-    boundary detection, stops them from creating spurious boundaries — crucially
-    including a misread that lands exactly on a real session change, which would
-    otherwise look like a phantom and cause two real sessions to be merged.
+    isolated reading of a date that neither the previous nor the next *dated*
+    reading shares is an OCR misread (wrong day/month/year). Removing these here,
+    before boundary detection, stops them from creating spurious boundaries —
+    crucially including a misread that lands exactly on a real session change,
+    which would otherwise look like a phantom and cause two real sessions to merge.
 
     Replaces the old cut-level phantom collapse: unlike that heuristic (which
     keyed on opposite-sign camera jumps + short duration), this never merges a
     genuine short session — e.g. an out-of-order date run on a re-recorded tape —
-    into its neighbour. A real session has >= 2 consecutive readings and so is
-    never an island.
+    into its neighbour. A real session has >= 2 consecutive *dated* readings and
+    so is never an island.
     """
-    if len(samples) < 3:
+    dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
+    if len(dated) < 3:
         return samples
-    kept = [samples[0]]
-    for i in range(1, len(samples) - 1):
-        d = samples[i][1].date()
-        if d != samples[i - 1][1].date() and d != samples[i + 1][1].date():
-            continue
-        kept.append(samples[i])
-    kept.append(samples[-1])
-    return kept
+    drop: set[int] = set()
+    for j in range(1, len(dated) - 1):
+        idx, dt = dated[j]
+        d = dt.date()
+        if d != dated[j - 1][1].date() and d != dated[j + 1][1].date():
+            drop.add(idx)
+    return [s for i, s in enumerate(samples) if i not in drop]
 
 
 def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S) -> list[float]:
@@ -1201,8 +1206,8 @@ def run(config: PipelineConfig) -> PipelineResult:
     date_range = f" date_range={valid[0][1].date()}:{valid[-1][1].date()}" if valid else ""
     print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
 
+    samples = drop_date_islands(samples)
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
-    filtered = drop_date_islands(filtered)
     boundaries = find_all_boundaries(filtered, gap_s=config.gap)
 
     visual_times: list[float] = []
