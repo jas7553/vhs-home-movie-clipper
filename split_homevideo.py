@@ -446,6 +446,36 @@ def find_all_boundaries(
     return boundaries
 
 
+def drop_date_islands(
+    samples: list[tuple[float, datetime]],
+) -> list[tuple[float, datetime]]:
+    """Drop 'date islands' — a reading whose date differs from BOTH neighbours.
+
+    A real recording session is a contiguous run of same-date readings. A single
+    isolated reading of a date that neither the previous nor the next reading
+    shares is an OCR misread (wrong day/month/year). Removing these here, before
+    boundary detection, stops them from creating spurious boundaries — crucially
+    including a misread that lands exactly on a real session change, which would
+    otherwise look like a phantom and cause two real sessions to be merged.
+
+    Replaces the old cut-level phantom collapse: unlike that heuristic (which
+    keyed on opposite-sign camera jumps + short duration), this never merges a
+    genuine short session — e.g. an out-of-order date run on a re-recorded tape —
+    into its neighbour. A real session has >= 2 consecutive readings and so is
+    never an island.
+    """
+    if len(samples) < 3:
+        return samples
+    kept = [samples[0]]
+    for i in range(1, len(samples) - 1):
+        d = samples[i][1].date()
+        if d != samples[i - 1][1].date() and d != samples[i + 1][1].date():
+            continue
+        kept.append(samples[i])
+    kept.append(samples[-1])
+    return kept
+
+
 def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S) -> list[float]:
     """
     Drop any cut that would produce a clip shorter than min_clip_s, merging it
@@ -466,51 +496,21 @@ def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S)
     return merged
 
 
-def _collapse_revert_phantoms(
-    cuts: list[float],
-    boundary_map: dict[float, "Boundary"],
-    min_phantom_s: float = DEFAULT_MIN_CLIP_S,
-) -> list[float]:
-    """
-    Collapse phantom clips in daily mode: a short clip whose bounding boundaries
-    have opposite-sign cam_jump_s values is an OCR misread in a transition zone —
-    the camera jumped forward to a hallucinated date then immediately reverted.
-
-    Same-date violations (A→B→A with B being a misread year) and near-same-date
-    violations (A→B→C where B is a wildly wrong month/year and A≈C) both trigger
-    because in every such case one jump is large-positive and the next is
-    large-negative. Genuine short clips on a new date are always bracketed by
-    same-sign (both positive) jumps.
-    """
-    if len(cuts) <= 2:
-        return cuts
-    result = [cuts[0]]
-    i = 1
-    while i < len(cuts):
-        if i + 1 < len(cuts):
-            b1 = boundary_map.get(cuts[i])
-            b2 = boundary_map.get(cuts[i + 1])
-            clip_dur = cuts[i + 1] - cuts[i]
-            if (b1 is not None and b2 is not None
-                    and clip_dur < min_phantom_s
-                    and b1.cam_jump_s * b2.cam_jump_s < 0):  # opposite-sign jumps
-                i += 2  # skip both jump-in and revert-out cuts
-                continue
-        result.append(cuts[i])
-        i += 1
-    return result
-
-
 def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[float]:
     """
     Stage 2: decide which boundaries become cut points based on mode.
 
-    Returns list[float] of video_t values with 0.0 prepended. In daily mode,
-    phantom clips from OCR misreads are collapsed before returning.
+    Returns list[float] of video_t values with 0.0 prepended.
       scene   — all boundaries (gap + large_gap)
       session — large_gap only
       daily   — only confirmed date changes or backward jumps; unknown-date
                 boundaries are skipped (avoids splitting same-day footage)
+
+    Daily mode cuts on every date change in tape order, so a date that recurs
+    later on the tape (out-of-order re-recording) yields a separate clip each
+    time — it is not regrouped with its earlier occurrence. OCR misreads that
+    would create spurious date changes are removed upstream by drop_date_islands,
+    so no cut-level phantom collapse is needed here.
     """
     cuts = [0.0]
     for b in boundaries:
@@ -526,9 +526,6 @@ def group_clips(boundaries: list["Boundary"], mode: str, gap_s: int) -> list[flo
             )
             if date_change:
                 cuts.append(b.video_t)
-    if mode == "daily":
-        boundary_map = {b.video_t: b for b in boundaries}
-        cuts = _collapse_revert_phantoms(cuts, boundary_map)
     return cuts
 
 
@@ -1101,6 +1098,7 @@ def main() -> None:
     print(f"ocr ocr_success={len(valid)} ocr_total={len(samples)}{date_range}")
 
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
+    filtered = drop_date_islands(filtered)
     boundaries = find_all_boundaries(filtered, gap_s=args.gap)
 
     visual_times: list[float] = []
