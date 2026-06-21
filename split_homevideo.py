@@ -1502,8 +1502,11 @@ def run(config: PipelineConfig) -> PipelineResult:
         print("dry_run=true")
         return PipelineResult(splits, filtered, boundary_map, phase_times)
 
-    large_gap_count = sum(1 for vt in cut_ts[1:] if boundary_map.get(vt) and boundary_map[vt].type == "large_gap")
-    print(f"refine count={large_gap_count}")
+    refine_count = sum(
+        1 for vt in cut_ts[1:]
+        if (b := boundary_map.get(vt)) and b.prev_t is not None and b.prev_dt is not None
+    )
+    print(f"refine count={refine_count}")
     t_refine = time.perf_counter()
     refined_boundary_map: dict[float, Boundary] = {}
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1511,7 +1514,7 @@ def run(config: PipelineConfig) -> PipelineResult:
         splits = [0.0]
         for vt in cut_ts[1:]:
             b = boundary_map.get(vt)
-            if b and b.type == "large_gap" and b.prev_t is not None and b.prev_dt is not None:
+            if b and b.prev_t is not None and b.prev_dt is not None:
                 t_b = time.perf_counter()
                 rr = strategy(config.video, b)
                 elapsed_b = time.perf_counter() - t_b
