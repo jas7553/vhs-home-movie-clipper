@@ -120,3 +120,58 @@ class TestFuseBoundaries:
         b2 = _boundary(500.0)
         result = fuse_boundaries([b1, b2], scene_cuts=[101.0], black_frames=[], window_s=5.0)
         assert result == [b1]
+
+
+class TestDetectVisualBoundariesStaleCacheReason:
+    """Stale-cache diagnostic messages — each mismatch field logs its own reason."""
+
+    def _write_cache(self, path, scene_threshold=0.4, black_min_duration=0.1):
+        with open(path, "w") as f:
+            json.dump({
+                "cache_format": _VISUAL_CACHE_FORMAT,
+                "scene_threshold": scene_threshold,
+                "black_min_duration": black_min_duration,
+                "scene_cuts": [],
+                "black_frames": [],
+            }, f)
+
+    def test_black_min_duration_mismatch_triggers_rescan(self, tmp_path):
+        # Covers line 861: black_min_duration mismatch prints stale-cache reason.
+        cache_path = str(tmp_path / "vcache.json")
+        self._write_cache(cache_path, black_min_duration=0.5)  # stored: 0.5, requested: 0.1
+        with mock.patch("subprocess.run", return_value=mock.Mock(stderr="")) as m_run:
+            detect_visual_boundaries(
+                "fake.mp4", scene_threshold=0.4, black_min_duration=0.1,
+                cache_path=cache_path,
+            )
+        m_run.assert_called_once()
+
+    def test_cache_format_mismatch_triggers_rescan(self, tmp_path):
+        # Covers line 857: wrong cache_format adds to the why list.
+        from split_homevideo import _VISUAL_CACHE_FORMAT
+        cache_path = str(tmp_path / "vcache.json")
+        with open(cache_path, "w") as f:
+            json.dump({
+                "cache_format": _VISUAL_CACHE_FORMAT - 1,  # stale format
+                "scene_threshold": 0.4,
+                "black_min_duration": 0.1,
+                "scene_cuts": [],
+                "black_frames": [],
+            }, f)
+        with mock.patch("subprocess.run", return_value=mock.Mock(stderr="")) as m_run:
+            detect_visual_boundaries(
+                "fake.mp4", scene_threshold=0.4, black_min_duration=0.1,
+                cache_path=cache_path,
+            )
+        m_run.assert_called_once()
+
+    def test_scene_threshold_mismatch_reason_logged(self, tmp_path, capsys):
+        # Covers line 857: scene_threshold mismatch generates a stale-cache message.
+        cache_path = str(tmp_path / "vcache.json")
+        self._write_cache(cache_path, scene_threshold=0.9)
+        with mock.patch("subprocess.run", return_value=mock.Mock(stderr="")):
+            detect_visual_boundaries(
+                "fake.mp4", scene_threshold=0.4, cache_path=cache_path,
+            )
+        captured = capsys.readouterr()
+        assert "scene_threshold" in captured.out

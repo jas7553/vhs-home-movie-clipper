@@ -10,6 +10,7 @@ from split_homevideo import (
     Boundary,
     Reading,
     _gap_date_class,
+    _lenient_months,
     _place_content_aware,
     ocr_refinement,
 )
@@ -584,3 +585,44 @@ class TestContentAwareEndToEnd:
         )
         assert t == 6.0
         assert method == "ocr"
+
+
+class TestLenientMonths:
+    def test_month_over_12_retries_trailing_digit(self):
+        # "15/" → group(1)="15" > 12 → line 994: retry trailing digit → 5
+        assert _lenient_months("15/90") == {5}
+
+    def test_normal_month_not_retried(self):
+        assert _lenient_months("4/90") == {4}
+
+    def test_empty_string_returns_empty(self):
+        assert _lenient_months("") == set()
+
+
+class TestOcrRefinementNoPrev:
+    def test_boundary_with_no_prev_t_returns_coarse(self):
+        # line 1182: prev_t=None → immediate coarse fallback with reason "no-prev"
+        b = Boundary(
+            video_t=100.0, type="large_gap",
+            cam_before=None, cam_after=None, cam_jump_s=0.0,
+            prev_t=None, prev_dt=None,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = ocr_refinement(_GAP, _CROP, tmpdir, 10, None)
+            result = strategy("vid.mp4", b)
+        assert result.t == 100.0
+        assert result.method == "coarse"
+        assert result.detail == "no-prev"
+
+    def test_boundary_with_no_prev_dt_returns_coarse(self):
+        b = Boundary(
+            video_t=100.0, type="large_gap",
+            cam_before=None, cam_after=None, cam_jump_s=0.0,
+            prev_t=90.0, prev_dt=None,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = ocr_refinement(_GAP, _CROP, tmpdir, 10, None)
+            result = strategy("vid.mp4", b)
+        assert result.t == 100.0
+        assert result.method == "coarse"
+        assert result.detail == "no-prev"

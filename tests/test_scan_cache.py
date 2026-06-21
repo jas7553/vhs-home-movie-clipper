@@ -181,3 +181,92 @@ class TestScanReturnsTLastFrame:
             result2 = scan("fake.mp4", _INTERVAL, _CROP, cache_path=cache_path)
         ext.assert_not_called()
         assert result1[0][0] == pytest.approx(result2[0][0])
+
+
+class TestScanPreprocessingFallback:
+    """Phase-2 preprocessing path: unsolved buckets get a second OCR pass."""
+
+    def _make_frames(self, base_dir, count, subdir="."):
+        import os
+        d = os.path.join(str(base_dir), subdir)
+        os.makedirs(d, exist_ok=True)
+        paths = [os.path.join(d, f"frame_{i:06d}.bmp") for i in range(count)]
+        for p in paths:
+            open(p, "w").close()
+        return paths
+
+    def test_phase1_timeonly_reading_stored_and_returned(self, tmp_path):
+        # Phase 1: all frames return time-only text ("8:00 PM") → no dated reading,
+        # but text is parseable as time-only → goes into timeonly_map (line 522).
+        # Assembly uses timeonly_map (line 556).
+        frame_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE)
+        ocr_map = {p: "8:00 PM" for p in frame_paths}
+        with mock.patch("split_homevideo.extract_all_frames", return_value=frame_paths), \
+             mock.patch("split_homevideo.ocr_batch", return_value=ocr_map):
+            result = scan("fake.mp4", _INTERVAL, _CROP)
+        # fill_timeonly_dates has no predecessor date → stays None
+        assert result[0][1] is None
+
+    def test_phase2_fallback_recovers_dated_reading(self, tmp_path):
+        # Phase 1: garbage OCR → bucket unsolved.
+        # Phase 2 (preprocess): same frame count, OCR returns dated text → line 540.
+        phase1_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE, "p1")
+        phase2_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE, "p2")
+        dated_ocr = "5:01 PM\n 1/ 4/90"
+
+        def fake_extract(video, interval, crop, tmpdir, preprocess=False):
+            return phase2_paths if preprocess else phase1_paths
+
+        ocr_map_phase2 = {p: dated_ocr for p in phase2_paths}
+        call_num = [0]
+
+        def fake_ocr(paths):
+            call_num[0] += 1
+            if call_num[0] == 1:
+                return {p: "garbage" for p in paths}
+            return ocr_map_phase2
+
+        with mock.patch("split_homevideo.extract_all_frames", side_effect=fake_extract), \
+             mock.patch("split_homevideo.ocr_batch", side_effect=fake_ocr):
+            result = scan("fake.mp4", _INTERVAL, _CROP)
+        assert result[0][1] == datetime(1990, 1, 4, 17, 1)
+
+    def test_phase2_fallback_stores_timeonly_when_no_date(self, tmp_path):
+        # Phase 1: garbage OCR → bucket unsolved.
+        # Phase 2 (preprocess): time-only OCR ("8:00 PM") → line 542 fires.
+        # Result: fill_timeonly_dates has no predecessor → stays None.
+        phase1_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE, "p1")
+        phase2_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE, "p2")
+
+        def fake_extract(video, interval, crop, tmpdir, preprocess=False):
+            return phase2_paths if preprocess else phase1_paths
+
+        call_num = [0]
+
+        def fake_ocr(paths):
+            call_num[0] += 1
+            if call_num[0] == 1:
+                return {p: "garbage" for p in paths}
+            return {p: "8:00 PM" for p in paths}
+
+        with mock.patch("split_homevideo.extract_all_frames", side_effect=fake_extract), \
+             mock.patch("split_homevideo.ocr_batch", side_effect=fake_ocr):
+            result = scan("fake.mp4", _INTERVAL, _CROP)
+        assert result[0][1] is None
+
+    def test_phase2_frame_count_mismatch_skips_fallback(self, tmp_path):
+        # Phase 1 returns N frames; phase 2 returns N+1 → mismatch prints warning
+        # and skips fallback (lines 542-544). Bucket stays unsolved → (None, None).
+        phase1_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE, "p1")
+        phase2_paths = self._make_frames(tmp_path, FRAMES_PER_SAMPLE + 1, "p2")
+
+        def fake_extract(video, interval, crop, tmpdir, preprocess=False):
+            return phase2_paths if preprocess else phase1_paths
+
+        def fake_ocr(paths):
+            return {}
+
+        with mock.patch("split_homevideo.extract_all_frames", side_effect=fake_extract), \
+             mock.patch("split_homevideo.ocr_batch", side_effect=fake_ocr):
+            result = scan("fake.mp4", _INTERVAL, _CROP)
+        assert result[0][1] is None

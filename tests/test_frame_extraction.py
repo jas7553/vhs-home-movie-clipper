@@ -50,6 +50,14 @@ class TestExtractAllFrames:
         assert "fps=3/10" in " ".join(cmd)
         assert result == sorted([str(bmp_a), str(bmp_b)])
 
+    def test_preprocess_flag_appends_vf_preprocess(self, tmp_path):
+        from split_homevideo import _VF_PREPROCESS
+        with mock.patch("subprocess.run") as m:
+            extract_all_frames("vid.mp4", 10, "250:110:385:370", str(tmp_path), preprocess=True)
+        cmd = m.call_args[0][0]
+        vf_arg = cmd[cmd.index("-vf") + 1]
+        assert _VF_PREPROCESS in vf_arg
+
 
 class TestFrameIndex:
     def test_parses_six_digit_index(self):

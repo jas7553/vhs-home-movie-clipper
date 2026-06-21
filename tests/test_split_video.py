@@ -92,6 +92,25 @@ class TestLabelFor:
         filtered = [(0.0, a), (60.0, b)]
         assert _label_for(filtered, 0.0, mode="session") == a.strftime("%Y-%m-%d_%H%M")
 
+    def test_skips_reading_matching_cam_before_date(self):
+        # line 1400: when boundary.cam_before.date() == dt.date() the reading is
+        # skipped; the next confirmed reading (different date) becomes the label.
+        from split_homevideo import Boundary
+        old_dt = datetime(1990, 1, 4, 17, 0)
+        new_dt = datetime(1990, 1, 5, 9, 0)
+        boundary = Boundary(
+            video_t=50.0, type="large_gap",
+            cam_before=old_dt, cam_after=new_dt,
+            cam_jump_s=57600.0, prev_t=40.0, prev_dt=old_dt,
+        )
+        filtered = [
+            (50.0, old_dt),   # date matches cam_before → skip
+            (60.0, new_dt),   # new date, confirmed by next
+            (70.0, new_dt),
+        ]
+        result = _label_for(filtered, 50.0, mode="daily", boundary_map={50.0: boundary})
+        assert result == "1990-01-05"
+
 
 class TestSplitVideo:
     def test_creates_output_dir(self, tmp_path):
