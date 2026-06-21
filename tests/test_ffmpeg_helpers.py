@@ -34,6 +34,14 @@ class TestFfmpegEncodeSeg:
         assert "18" in cmd
         assert "aac" in cmd
 
+    def test_no_b_frames(self):
+        with mock.patch("subprocess.run") as m:
+            _ffmpeg_encode_seg("vid.mp4", 10.0, 15.0, "/out/seg.mp4", crf=18)
+        cmd = m.call_args[0][0]
+        assert "-bf" in cmd
+        bf_idx = cmd.index("-bf")
+        assert cmd[bf_idx + 1] == "0"
+
     def test_duration_computed_correctly(self):
         with mock.patch("subprocess.run") as m:
             _ffmpeg_encode_seg("vid.mp4", 10.0, 13.5, "/out/seg.mp4", crf=18)
