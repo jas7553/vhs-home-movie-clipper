@@ -1247,24 +1247,44 @@ class ShortSpanPolicy:
             )
             return RefinementResult(cut, "ocr", "")
 
-        # Old-session confirmed but new-session OCR garbled (frames after last_old_t
-        # returned None — extracted but parse_timestamp rejected them, e.g. missing day field).
-        # Guard: gap after last confirmed old > 10s (1 coarse interval) to avoid triggering
-        # on normal end-of-window sparseness.
-        if (any_ocr
-                and (coarse_t - last_old_t) > 10
-                and any((r := readings.get(t)) is None or r.dt is None
-                        for t in window if t > int(last_old_t))):
-            return RefinementResult(last_old_t + 1.0, "ocr", f"garbled-new after {last_old_t:.0f}s")
+        if any_ocr:
+            # Dense scan confirmed old-session content but no clean new-session frame.
+            # When cam_after confirms a real date change, coarse_t is the t_last of the
+            # first new-session coarse bucket and may already contain new-date frames —
+            # returning coarse_t would leak them into the outgoing clip.
+            # Search for the first garbled frame after last_old_t that contains new-date
+            # digit evidence; treat it as the upper bound for _place_content_aware so the
+            # gap before it is classified (old garble stays with old clip per ADR-0001).
+            # If no such frame exists, cut just after the last confirmed old-session frame.
+            # Without cam_after (no confirmed new date) fall through to coarse_t — the
+            # boundary may be spurious and we have no placement evidence.
+            cam_after = boundary.cam_after
+            if cam_after is not None and prev_dt.date() != cam_after.date():
+                first_garbled_new = next(
+                    (t for t in window if t > last_old_t
+                     and readings[t].raw
+                     and _gap_date_class(readings[t].raw, prev_dt, cam_after) == "new"),
+                    None,
+                )
+                if first_garbled_new is not None:
+                    cut = _place_content_aware(
+                        window, readings, last_old_t, float(first_garbled_new),
+                        prev_dt, cam_after, self._visual_times,
+                    )
+                else:
+                    cut = last_old_t + 1.0
+                return RefinementResult(cut, "ocr", "garbled-boundary")
+            # any_ocr=True but no confirmed new date (cam_after absent or same-date):
+            # boundary may be spurious; return coarse_t as safe fallback.
+            return RefinementResult(coarse_t, "coarse", "all-old-in-window")
 
-        # Splice Dead Zone: anchor to LAST visual event within [prev_t, coarse_t).
-        if not any_ocr and self._visual_times:
+        # Pure OCR dead zone (Splice Dead Zone): anchor to LAST visual event.
+        if self._visual_times:
             anchors = [vt for vt in self._visual_times if prev_t <= vt < coarse_t]
             if anchors:
                 return RefinementResult(max(anchors), "visual", "")
 
-        detail = f"SDZ {span:.0f}s no-anchor" if not any_ocr else "all-old-in-window"
-        return RefinementResult(coarse_t, "coarse", detail)
+        return RefinementResult(coarse_t, "coarse", f"SDZ {span:.0f}s no-anchor")
 
 
 def ocr_refinement(

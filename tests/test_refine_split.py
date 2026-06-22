@@ -160,10 +160,12 @@ class TestRefineSplit:
         assert method == "coarse"
 
     def test_garbled_new_session_after_confirmed_old(self):
-        # Old session confirmed at t=5; garbled frames extracted at t=18,19 (coarse_t=20).
-        # Gap = coarse_t - last_old_t = 20-5 = 15 > 10 → substantial gap, fix fires.
+        # Old session confirmed at t=5; garbled frame at t=18 (coarse_t=20).
+        # cam_after=1/5 triggers the fix: first_garbled_new=18; gap [6..17] is pure
+        # noise → _place_content_aware returns last_old_t+1=6.
         path5 = "/tmp/frame_5.000.bmp"
         path18 = "/tmp/frame_18.000.bmp"
+        cam_after = datetime(1990, 1, 5, 11, 43)
 
         def extract(v, t, c, d):
             if t == 5:
@@ -179,13 +181,15 @@ class TestRefineSplit:
                 path5:  "5:04 PM\n 1/ 4/90",  # old session (cam_advance=240s < 4+300)
                 path18: "11:43 AM 5/90",        # garbled new-session (missing day)
             },
+            cam_after=cam_after,
         )
-        assert t == 6.0    # last_old_t(5) + 1; gap=15 > 10 → fix fires
+        assert t == 6.0    # first_garbled_new=18; gap [6..17] pure noise → last_old_t+1=6
         assert method == "ocr"
 
     def test_garbled_small_gap_falls_back_to_coarse(self):
         # Old session confirmed at t=17; garbled frame at t=18 (coarse_t=20).
-        # Gap = 20-17 = 3 ≤ 10 → normal end-of-window sparseness, fix must NOT fire.
+        # cam_after=None → no confirmed new-session date → cannot place cut safely;
+        # fall back to coarse_t=20.  (Boundary may be spurious or same-date jump.)
         path17 = "/tmp/frame_17.000.bmp"
         path18 = "/tmp/frame_18.000.bmp"
 
@@ -204,8 +208,51 @@ class TestRefineSplit:
                 path18: "11:43 AM 5/90",
             },
         )
-        assert t == 20.0   # gap=3 ≤ 10 → coarse_t
+        assert t == 20.0   # cam_after=None → coarse fallback; no placement evidence
         assert method == "coarse"
+
+    def test_tail_leak_prevented_when_dense_ocr_misses_new_session(self):
+        # Mirrors the real clip02/clip59 tail-leak class: old session clear at t=13;
+        # dense OCR fails on frames 14-20 (coarse bucket 18-20 = new-session).
+        # cam_after=1/5 confirms a real date change → cut at last_old_t+1=14, not coarse=20.
+        # Without fix: returned coarse_t=20, including new-session frames 18-20 in outgoing.
+        path13 = "/tmp/tail_f13.bmp"
+        cam_after = datetime(1990, 1, 5, 11, 0)
+
+        def extract(v, t, c, d):
+            return path13 if t == 13 else None  # 14-20 fail extraction
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map={path13: "5:03 PM\n 1/ 4/90"},
+            cam_after=cam_after,
+        )
+        assert t == 14.0   # last_old_t(13) + 1; new-session frames 18-20 stay in new clip
+        assert method == "ocr"
+
+    def test_tail_leak_garbled_new_date_uses_place_content_aware(self):
+        # Garbled frame at t=16 contains new-date digit evidence (first_garbled_new=16).
+        # Gap between last_old_t=13 and first_garbled_new=16 is pure noise [14,15] →
+        # _place_content_aware returns last_old_t+1=14.  Old garble in gap would push
+        # the cut later (tested separately in TestPlaceContentAware).
+        # old 1/4, new 1/5 → day 5 is the discriminating digit; "5/90" garble → 'new'.
+        path13 = "/tmp/tg_f13.bmp"
+        path16 = "/tmp/tg_f16.bmp"
+        cam_after = datetime(1990, 1, 5, 11, 0)
+
+        def extract(v, t, c, d):
+            return {13: path13, 16: path16}.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map={path13: "5:03 PM\n 1/ 4/90", path16: "11:40 AM 5/90"},
+            cam_after=cam_after,
+        )
+        # first_garbled_new=16; gap [14,15] pure noise → last_old_t(13)+1=14
+        assert t == 14.0
+        assert method == "ocr"
 
     def test_false_positive_new_session_rejected_by_revert(self):
         # Frame t=14 reads new-session (5/19) but t=15 reverts to old (5/12) → false
