@@ -1002,6 +1002,7 @@ def _scan_for_transition(
     prev_dt: datetime,
     prev_t: float,
     gap_s: int,
+    expected_new_date: date | None = None,
 ) -> tuple[bool, float, float | None]:
     """Walk frame timestamps in order. Return (any_ocr, last_old_t, first_new_t).
     first_new_t is None if no new-session frame was found.
@@ -1010,7 +1011,13 @@ def _scan_for_transition(
     single garbled frame misread as the new date (a false positive) is rejected
     when the very next legible frame reverts to the old session.  The returned
     first_new_t is the first *sustained* new-session reading — one not immediately
-    followed by an old-session reading."""
+    followed by an old-session reading.
+
+    expected_new_date: when set (from the coarse boundary's cam_after date after
+    island filtering), frames that look 'new' but whose date doesn't match are
+    treated as intermediate content and kept with the outgoing clip.  This prevents
+    isolated intermediate-date footage (e.g. 4 frames of 5/12 between 5/09 and
+    5/19 sessions) from being misidentified as the new session start."""
     any_ocr = False
     last_old_t: float = prev_t
     candidate_new_t: float | None = None
@@ -1024,7 +1031,12 @@ def _scan_for_transition(
         video_advance = float(t) - prev_t
         is_new = cam_advance > video_advance + gap_s or cam_advance < -1800
         if is_new:
-            if candidate_new_t is None:
+            if expected_new_date is not None and dt.date() != expected_new_date:
+                # Intermediate date: looks new relative to old session but doesn't
+                # match the expected boundary target.  Keep with outgoing clip.
+                candidate_new_t = None
+                last_old_t = float(t)
+            elif candidate_new_t is None:
                 candidate_new_t = float(t)
         else:
             # Old-session frame after a candidate jump → false positive; reset.
@@ -1167,12 +1179,13 @@ class LongDeadZonePolicy:
         assert prev_t is not None and prev_dt is not None
         span = coarse_t - prev_t
 
+        expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
         window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
         step = max(2, len(window) // 50)
         coarse_times = window[::step]
         readings: dict[int, Reading] = dict(ocr_fn(coarse_times))
         any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
-            coarse_times, readings, prev_dt, prev_t, self._gap_s,
+            coarse_times, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
         if first_new_c is not None:
             lo, hi = int(last_old_c), int(first_new_c)
@@ -1186,7 +1199,7 @@ class LongDeadZonePolicy:
         # else: all-None coarse → true LDZ; fall through to coarse_t fallback
 
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
-            window, readings, prev_dt, prev_t, self._gap_s,
+            window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
         if first_new_t is not None:
             new_dt = readings[int(first_new_t)].dt
@@ -1219,10 +1232,11 @@ class ShortSpanPolicy:
         assert prev_t is not None and prev_dt is not None
         span = coarse_t - prev_t
 
+        expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
         window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
         readings = ocr_fn(window)
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
-            window, readings, prev_dt, prev_t, self._gap_s,
+            window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
 
         if first_new_t is not None:

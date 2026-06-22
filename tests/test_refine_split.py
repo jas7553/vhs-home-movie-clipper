@@ -20,17 +20,17 @@ _GAP = 300
 _PREV_DT = datetime(1990, 1, 4, 17, 0)
 
 
-def _boundary(coarse_t, prev_t, prev_dt=_PREV_DT):
+def _boundary(coarse_t, prev_t, prev_dt=_PREV_DT, cam_after=None):
     return Boundary(
         video_t=coarse_t, type="large_gap",
-        cam_before=prev_dt, cam_after=None, cam_jump_s=0.0,
+        cam_before=prev_dt, cam_after=cam_after, cam_jump_s=0.0,
         prev_t=prev_t, prev_dt=prev_dt,
     )
 
 
 def _run(coarse_t, prev_t, extract_side_effect, ocr_map, visual_times=None, interval=10,
-         prev_dt=_PREV_DT):
-    b = _boundary(coarse_t, prev_t, prev_dt)
+         prev_dt=_PREV_DT, cam_after=None):
+    b = _boundary(coarse_t, prev_t, prev_dt, cam_after=cam_after)
     with tempfile.TemporaryDirectory() as tmpdir:
         strategy = ocr_refinement(_GAP, _CROP, tmpdir, interval, visual_times)
         with mock.patch("split_homevideo.extract_frame", side_effect=extract_side_effect), \
@@ -231,6 +231,38 @@ class TestRefineSplit:
         # or max(11,13)=13 depending on gap classification.
         # With fix 1: first_new_t=18, last_old_t=15.  Gap [16,17] pure noise → 16.
         assert t == 16.0
+        assert method == "ocr"
+
+    def test_intermediate_date_kept_with_outgoing_clip(self):
+        # Mirrors the real 5/09→5/19 head-leak: 4 frames of 5/12 appear in the
+        # dense scan between the 5/09 and 5/19 sessions.  cam_after=5/19 means
+        # expected_new_date=5/19; the 5/12 frames look 'new' (big cam jump from
+        # 5/09) but don't match → treated as intermediate content kept with the
+        # outgoing clip.  last_old_t advances through 5/12 frames; first_new_t is
+        # the first 5/19 frame.  Gap between last-5/12 (t=16) and first-5/19
+        # (t=18) is pure noise (t=17 → None) → cut = last_old_t+1 = 17.
+        prev_dt = datetime(1990, 5, 9, 14, 59)
+        cam_after = datetime(1990, 5, 19, 13, 36)
+        _OLD = "2:59 PM\n 5/ 9/90"
+        _MID = "2:36 PM\n 5/12/90"   # intermediate: looks new vs 5/09 but ≠ cam_after date
+        _NEW = "1:37 PM\n 5/19/90"
+        paths = {13: "/tmp/im_f13.bmp", 15: "/tmp/im_f15.bmp",
+                 16: "/tmp/im_f16.bmp", 18: "/tmp/im_f18.bmp"}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0, prev_dt=prev_dt, cam_after=cam_after,
+            extract_side_effect=extract,
+            ocr_map={paths[13]: _OLD, paths[15]: _MID, paths[16]: _MID, paths[18]: _NEW},
+            interval=10,
+        )
+        # Without fix: 5/12 frames at t=15,16 trigger first_new_t=15; cut=14
+        #   → 5/12 frames appear at 1-2s into 5/19 clip (head leak).
+        # With fix: 5/12 kept as intermediate → last_old_t=16, first_new_t=18;
+        #   gap [17] is pure noise → cut = 16+1 = 17.
+        assert t == 17.0
         assert method == "ocr"
 
     def test_garbled_new_session_long_dead_zone_falls_back_to_coarse(self):
