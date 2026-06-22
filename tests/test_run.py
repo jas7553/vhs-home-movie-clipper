@@ -290,3 +290,36 @@ class TestRunIssue018GapRefinement:
         # Error from true transition (195) is 1s — at the 1s floor (REQUIREMENTS L23)
         refined_t = next(t for t in result.splits if t > 0)
         assert abs(refined_t - 195.0) <= 1.0
+
+
+class TestRunBoundaryWithNoPrevT:
+    """Boundary whose prev_t/prev_dt is None skips refinement but still enters refined_boundary_map."""
+
+    def test_boundary_no_prev_t_passes_through_and_maps(self, tmp_path):
+        # A boundary with prev_t=None cannot be refined (the if-guard at line 1649 rejects it).
+        # The else-branch appends coarse_t to splits, and because b is truthy, line 1662
+        # stores it in refined_boundary_map[vt] = b so downstream cut logic can still access it.
+        video = tmp_path / "v.mp4"
+        video.touch()
+        b = Boundary(
+            video_t=100.0, type="large_gap",
+            cam_before=_DT, cam_after=_DT2,
+            cam_jump_s=57600.0,
+            prev_t=None, prev_dt=None,  # no prior sample → refinement skipped
+        )
+        fake_strategy = mock.Mock()
+        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
+             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
+             mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
+             mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
+             mock.patch("split_homevideo.get_duration", return_value=200.0), \
+             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
+             mock.patch("split_homevideo.ocr_refinement", return_value=fake_strategy):
+            result = run(_config(video))
+        # Strategy never called — prev_t guard prevents refinement
+        fake_strategy.assert_not_called()
+        # Coarse position kept in splits
+        assert 100.0 in result.splits
+        # Boundary still recorded in boundary_map (line 1662 — the refined_boundary_map
+        # that PipelineResult returns as .boundary_map)
+        assert result.boundary_map.get(100.0) is b
