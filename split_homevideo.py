@@ -1385,6 +1385,12 @@ def cut_clip_with_boundary_encode(
         with open(list_path, "w") as f:
             for seg in segs:
                 f.write(f"file '{seg}'\n")
+        # Note: 3-seg clips (lead+body+trail) produce ~3-23 decoder-layer DTS warnings
+        # ("non monotonic") in the first ~0.4s when decoded with `ffmpeg -f null -`.
+        # Root cause: VFR source PTS irregularities in the stream-copied body propagate
+        # through +igndts into the decoder's DTS sequence at the lead→body seam.
+        # Container DTS is clean (ffprobe finds 0 non-monotonic events); players are
+        # unaffected. Accepted as benign — see docs/adr/0003.
         subprocess.run([
             "ffmpeg", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
