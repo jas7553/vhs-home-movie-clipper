@@ -3,15 +3,14 @@
 Split a home video into logical clips by reading the burned-in timestamp.
 
 Usage:
-    python3 split_homevideo.py <input.mp4> [--interval 10] [--gap 3600] [--out-dir ./clips]
+    python3 split_homevideo.py <input.mp4> [--dry-run] [--gap 3600] [--mode daily]
 
 Arguments:
-    --interval  Seconds between sampled frames (default: 10)
-    --gap       Time gap (seconds) between consecutive timestamps that
-                triggers a new clip, even on the same date (default: 3600)
+    --gap       Camera timestamp gap (seconds) that triggers a new clip (default: 3600)
     --mode      Clip grouping mode: scene, session, or daily (default)
+    --interval  Seconds between sampled frames (default: 10)
     --out-dir   Output directory for clips (default: <input>_clips/)
-    --crop      ffmpeg crop string "w:h:x:y" for timestamp region
+    --crop      ffmpeg crop "w:h:x:y" for timestamp region
                 (default: auto-detected per tape via calibration pass)
     --dry-run   Print split points without cutting
 """
@@ -144,10 +143,6 @@ class PipelineConfig:
     enable_visual_fusion: bool = False
     enable_scene_snap: bool = False
     no_visual_anchor: bool = False
-    fuse_window: float = DEFAULT_FUSE_WINDOW
-    min_clip: float = DEFAULT_MIN_CLIP_S
-    scene_threshold: float = DEFAULT_SCENE_THRESHOLD
-    black_min_duration: float = DEFAULT_BLACK_MIN_DURATION
     dry_run: bool = False
 
 
@@ -1682,7 +1677,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     if not config.dry_run and not config.no_visual_anchor:
         t_vis = time.perf_counter()
         scene_cuts, black_frames = detect_visual_boundaries(
-            config.video, config.scene_threshold, config.black_min_duration,
+            config.video, DEFAULT_SCENE_THRESHOLD, DEFAULT_BLACK_MIN_DURATION,
             cache_path=config.visual_cache,
         )
         visual_times = sorted(scene_cuts + black_frames)
@@ -1690,13 +1685,13 @@ def run(config: PipelineConfig) -> PipelineResult:
         print(f"visual scene_cuts={len(scene_cuts)} black_frames={len(black_frames)}")
         if config.enable_visual_fusion:
             before = len(boundaries)
-            boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, config.fuse_window)
-            print(f"visual_fusion confirmed={len(boundaries)} total={before} window={config.fuse_window:.0f}")
+            boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, DEFAULT_FUSE_WINDOW)
+            print(f"visual_fusion confirmed={len(boundaries)} total={before} window={DEFAULT_FUSE_WINDOW:.0f}")
 
     cut_ts = group_clips(boundaries, config.mode)
     boundary_map: dict[float, Boundary] = {b.video_t: b for b in boundaries}
     duration = get_duration(config.video)
-    effective_min_clip = ARTIFACT_MIN_S if config.mode == "daily" else config.min_clip
+    effective_min_clip = ARTIFACT_MIN_S if config.mode == "daily" else DEFAULT_MIN_CLIP_S
 
     if config.dry_run:
         splits: list[float] = [0.0] + list(cut_ts[1:])
@@ -1799,12 +1794,6 @@ def main() -> None:
     ap.add_argument("--crop", default=None,
                     help="ffmpeg crop 'w:h:x:y' for timestamp region "
                          "(default: auto-detected via calibration pass)")
-    ap.add_argument("--calib-cache", default=None,
-                    help="JSON file to cache per-tape calibration result (crop auto-detection)")
-    ap.add_argument("--cache", default=None,
-                    help="JSON file to cache OCR scan results (saves time on re-runs)")
-    ap.add_argument("--visual-cache", default=None,
-                    help="JSON file to cache scene-cut/black-frame detection (saves time on re-runs)")
     ap.add_argument("--enable-visual-fusion", action="store_true", default=False,
                     help="Drop OCR boundaries lacking visual corroboration (scene cut or black frame). "
                          "Off by default — VHS pause/resume often has no visual discontinuity so "
@@ -1817,18 +1806,7 @@ def main() -> None:
     ap.add_argument("--no-visual-anchor", action="store_true", default=False,
                     help="Skip visual detection entirely (disables splice dead-zone anchoring; faster, "
                          "but cuts at splice boundaries may be misplaced)")
-    ap.add_argument("--fuse-window", type=float, default=DEFAULT_FUSE_WINDOW,
-                    help="Seconds of padding around [prev_t, video_t] to search for a corroborating visual signal")
-    ap.add_argument("--min-clip", type=float, default=DEFAULT_MIN_CLIP_S,
-                    help="Clips shorter than this (seconds) are merged into the prior clip "
-                         "(ignored in daily mode, which uses a 3s floor to catch only refinement slivers)")
-    ap.add_argument("--scene-threshold", type=float, default=DEFAULT_SCENE_THRESHOLD,
-                    help="ffmpeg scene-change detection threshold (0-1)")
-    ap.add_argument("--black-min-duration", type=float, default=DEFAULT_BLACK_MIN_DURATION,
-                    help="Minimum duration (s) of a black frame run to count as a boundary signal")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--skip-cut", action="store_true",
-                    help="Run full refinement (including scene-snap) but skip the actual cut step")
     args = ap.parse_args()
 
     video = os.path.abspath(args.input)
@@ -1840,9 +1818,9 @@ def main() -> None:
 
     out_dir = args.out_dir or (Path(video).stem + "_clips")
     out_dir = os.path.abspath(out_dir)
-    calib_cache = args.calib_cache or (Path(video).stem + "_calib_cache.json")
-    cache = args.cache or (Path(video).stem + "_ocr_cache.json")
-    visual_cache = args.visual_cache or (Path(video).stem + "_visual_cache.json")
+    calib_cache = Path(video).stem + "_calib_cache.json"
+    cache = Path(video).stem + "_ocr_cache.json"
+    visual_cache = Path(video).stem + "_visual_cache.json"
 
     if args.crop is not None:
         crop = args.crop
@@ -1860,17 +1838,13 @@ def main() -> None:
         enable_visual_fusion=args.enable_visual_fusion,
         enable_scene_snap=args.enable_scene_snap,
         no_visual_anchor=args.no_visual_anchor,
-        fuse_window=args.fuse_window,
-        min_clip=args.min_clip,
-        scene_threshold=args.scene_threshold,
-        black_min_duration=args.black_min_duration,
         dry_run=args.dry_run,
     )
 
     t0 = time.perf_counter()
     result = run(config)
 
-    if args.dry_run or args.skip_cut:
+    if args.dry_run:
         return
 
     print(f"cutting out_dir={out_dir}")

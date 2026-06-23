@@ -25,7 +25,7 @@ python3 split_homevideo.py "YourFile.mp4"
 python3 split_homevideo.py "YourFile.mp4" --gap 3600
 ```
 
-Key flags: `--interval N` (OCR sample rate, default 10s), `--gap N` (camera-time jump threshold, default 3600s), `--mode {scene,session,daily}` (default daily), `--crop W:H:X:Y` (timestamp region), `--cache PATH`, `--out-dir DIR`.
+Key flags: `--interval N` (OCR sample rate, default 10s), `--gap N` (camera-time jump threshold, default 3600s), `--mode {scene,session,daily}` (default daily), `--crop W:H:X:Y` (timestamp region), `--out-dir DIR`.
 
 ## Architecture
 
