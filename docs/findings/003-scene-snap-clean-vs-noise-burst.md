@@ -1,6 +1,6 @@
 # Finding 003: shot-change snap fixes clean cuts but mis-handles noise-burst splices
 
-**Status:** implemented, pending visual spot-check (2026-06-24)
+**Status:** implemented and spot-checked (2026-06-24)
 **Trigger:** spike of a PySceneDetect-based "ultra-refinement" pass — snap each OCR-refined
 cut onto a precise shot-change frame to remove the 0.5–4s of a neighbour's session that leaks
 across most clip boundaries.
@@ -98,8 +98,19 @@ Implemented in `snap_to_scene_cut()` with new constants `SCENE_SNAP_AFTER_S=2.0`
 - All other 12 movers: negative or zero (backward clean snaps or cut-exactly-at-t).
 - 1 positive offset total across 81 boundaries — exactly the known burst.
 
-Visual spot-check of the +0.73s mover (coarse=3506) still needed before enabling by default.
-Flag remains `--enable-scene-snap`, default off.
+Full spot-check of all 13 non-zero-offset snaps (2026-06-24):
+
+- **c3506** (+0.73s burst): burst-end at 3505.73 fully clean (5/22/90), burst excluded. ✓
+- **c2984** (−0.05s), **c8363** (−0.21s), **c13679** (−0.24s), **c17342** (−0.28s): all correctly
+  landed on genuine content-change frames — before=old session, snap=new session. ✓
+- **c21041** (−0.89s): verified clean cut (finding 003 showcase). Now a no-op under v3 (0.89s >
+  ACCEPT_S=0.5s tight window). Acceptable: loses 0.89s improvement at one boundary.
+- **6 wrong cases** (c3119, c5663, c11783, c13442, c15863, c17915): all −0.59 to −0.96s, all
+  snapped into old-session content (mid-session AdaptiveDetector decoys). Eliminated by v3 split
+  windows (tight ACCEPT_S=0.5s for clean cuts, wide BURST_ACCEPT_S=3.0s for burst detection only).
+
+v3 constants: `SCENE_SNAP_ACCEPT_S=0.5`, `SCENE_SNAP_BURST_ACCEPT_S=3.0`. Flag still default-off;
+spot-check passed on 1990 tape — no verified regressions remain.
 
 ## Implication / candidate design (implemented)
 

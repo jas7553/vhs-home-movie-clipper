@@ -55,10 +55,14 @@ SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (visual
 # precise shot-change frame. v2 anchor rule (finding 003):
 #   - Detect in [t-context_s, t+after_s] so AdaptiveDetector sees burst-end cuts past t.
 #   - Two cuts bracketing a short span → noise burst; anchor to LATER cut (end-of-burst, ADR 0001).
-#   - Single cut ≤ t → clean content change; snap backward (removes old-session tail).
+#     Burst detection uses a wide before-window (BURST_ACCEPT_S) because burst-start can be 2-3s
+#     before the OCR-refined t.
+#   - Single cut within tight before-window (ACCEPT_S=0.5s) → clean content change; snap backward.
+#     0.5s separates real content-change cuts (≤0.28s from t) from mid-old-session decoys (0.59-0.96s).
 #   - Neither → no-op (VHS pause/resume often has no visual discontinuity).
 SCENE_SNAP_CONTEXT_S = 20.0    # decode this much before t so AdaptiveDetector has rolling context
-SCENE_SNAP_ACCEPT_S = 3.0      # accept a shot cut only within [t-this, t+after_s]; decoy guard
+SCENE_SNAP_ACCEPT_S = 0.5      # tight before-window for clean cuts; blocks mid-old-session decoys
+SCENE_SNAP_BURST_ACCEPT_S = 3.0  # wide before-window for burst detection (burst-start up to 3s before t)
 SCENE_SNAP_AFTER_S = 2.0       # extend detection past t to catch burst-end cuts (noise splices)
 SCENE_SNAP_BURST_MAX_S = 6.0   # two close cuts within this span → noise burst, not two scenes
 SCENE_SNAP_ADAPTIVE_THRESHOLD = 3.0
@@ -1384,6 +1388,7 @@ def snap_to_scene_cut(
     prev_t: float | None,
     context_s: float = SCENE_SNAP_CONTEXT_S,
     accept_s: float = SCENE_SNAP_ACCEPT_S,
+    burst_accept_s: float = SCENE_SNAP_BURST_ACCEPT_S,
     after_s: float = SCENE_SNAP_AFTER_S,
 ) -> tuple[float, float | None]:
     """
@@ -1391,14 +1396,14 @@ def snap_to_scene_cut(
     (finding 003). Returns (snapped_t, offset) where offset is snapped_t - t (negative = backward,
     positive = forward for burst-end), or None if nothing was snapped.
 
-    Detection window: [t-context_s, t+after_s] — wide enough for AdaptiveDetector rolling context
-    and to capture burst-end cuts that land just past t. Accept window: [max(prev_t, t-accept_s),
-    t+after_s] — tight to block decoy mid-clip cuts.
+    Detection window: [t-context_s, t+after_s] — wide for rolling context and burst-end coverage.
 
-    Branch logic:
-      1. Two cuts bracketing a short span (≤BURST_MAX_S) → noise burst; anchor to LATER cut so
-         the new clip starts after the burst (ADR 0001). May move cut forward.
-      2. Single cut ≤ t → clean content change; snap backward (removes old-session tail).
+    Branch logic uses split accept windows:
+      1. Burst: two cuts bracketing a short span (≤BURST_MAX_S), burst-start within
+         [t-burst_accept_s, t] — noise burst; anchor to LATER cut (ADR 0001). Wide window because
+         burst-start can sit 2-3s before t (beyond the noise-blanked OCR zone).
+      2. Clean cut: single cut within tight [t-accept_s, t] — snap backward. Tight window blocks
+         mid-old-session decoys (AdaptiveDetector firing on in-scene motion 0.59-0.96s before t).
       3. Neither → no-op.
     """
     global _PYSCENEDETECT_WARNED
@@ -1412,11 +1417,6 @@ def snap_to_scene_cut(
 
     lo = max(0.0, t - context_s)
     hi = t + after_s
-    accept_lo = max(lo, t - accept_s)
-    if prev_t is not None:
-        accept_lo = max(accept_lo, prev_t)
-    if accept_lo >= hi:
-        return t, None
 
     det = AdaptiveDetector(
         adaptive_threshold=SCENE_SNAP_ADAPTIVE_THRESHOLD,
@@ -1425,21 +1425,27 @@ def snap_to_scene_cut(
     scenes = detect(video, det, start_time=lo, end_time=hi)
     # Each scene's start (after the first) is a detected shot-change frame.
     cuts = [s[0].get_seconds() for s in scenes[1:]]
-    accepted = [c for c in cuts if accept_lo <= c <= hi]
 
-    before = [c for c in accepted if c <= t]
-    after  = [c for c in accepted if c > t]
-
-    if before and after:
-        burst_start = max(before)
-        burst_end   = min(after)
+    # Burst detection: wide before-window, any after-cut within (t, hi].
+    burst_lo = max(lo, t - burst_accept_s)
+    if prev_t is not None:
+        burst_lo = max(burst_lo, prev_t)
+    burst_before = [c for c in cuts if burst_lo <= c <= t]
+    burst_after  = [c for c in cuts if t < c <= hi]
+    if burst_before and burst_after:
+        burst_start = max(burst_before)
+        burst_end   = min(burst_after)
         if burst_end - burst_start <= SCENE_SNAP_BURST_MAX_S:
             # Noise burst: anchor to end so new clip starts clean (ADR 0001).
             return burst_end, burst_end - t
 
-    if before:
-        # Clean content change: snap backward to remove old-session tail.
-        snapped = max(before)
+    # Clean-cut detection: tight before-window only.
+    clean_lo = max(lo, t - accept_s)
+    if prev_t is not None:
+        clean_lo = max(clean_lo, prev_t)
+    clean_before = [c for c in cuts if clean_lo <= c <= t]
+    if clean_before:
+        snapped = max(clean_before)
         return snapped, snapped - t
 
     return t, None
