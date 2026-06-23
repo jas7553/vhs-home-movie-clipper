@@ -1743,7 +1743,7 @@ def run(config: PipelineConfig) -> PipelineResult:
                 snap_note = ""
                 if config.enable_scene_snap:
                     snapped, off = snap_to_scene_cut(config.video, rr.t, b.prev_t)
-                    if off is not None:
+                    if off is not None and off != 0.0:
                         snap_note = f" snap={off:+.2f}s"
                         cut_t, method = snapped, "snap"
                 elapsed_b = time.perf_counter() - t_b
@@ -1809,12 +1809,11 @@ def main() -> None:
                     help="Drop OCR boundaries lacking visual corroboration (scene cut or black frame). "
                          "Off by default — VHS pause/resume often has no visual discontinuity so "
                          "this filter would delete real boundaries.")
-    ap.add_argument("--enable-scene-snap", action="store_true", default=False,
-                    help="Ultra-refinement (pass 3): snap each OCR-refined cut backward onto a precise "
-                         "shot-change frame within 3s, if one exists. Tightens session boundaries where "
-                         "OCR placement leaks a few seconds of the old session into the next clip. "
-                         "Monotonic-safe (only tightens; no-op where no shot change exists). "
-                         "Off by default pending placement measurement.")
+    ap.add_argument("--enable-scene-snap", action=argparse.BooleanOptionalAction, default=True,
+                    help="Ultra-refinement (pass 3): snap each OCR-refined cut onto a precise "
+                         "shot-change frame. Handles both clean cuts (backward snap ≤0.5s) and "
+                         "noise-burst splices (forward to burst-end). No-op where no shot change "
+                         "exists. On by default; use --no-enable-scene-snap to disable.")
     ap.add_argument("--no-visual-anchor", action="store_true", default=False,
                     help="Skip visual detection entirely (disables splice dead-zone anchoring; faster, "
                          "but cuts at splice boundaries may be misplaced)")
