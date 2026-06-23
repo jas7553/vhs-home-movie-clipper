@@ -1,6 +1,6 @@
 # Issue 020: Non-monotonic DTS warnings in 3-seg concat (lead + body + trail)
 
-**Status:** needs-triage
+**Status:** closed — accepted as benign (Option C). Decision recorded in docs/adr/0003. Decoder-layer DTS warnings (up to ~100/clip on long stream-copy bodies) do not affect playback: container DTS/PTS strictly increasing, 0 duplicate PTS, frame count complete (verified at interval=10 and interval=3). Description in earlier sections overstated the fix scope — see ADR 0003 for the corrected facts.
 **Labels:** ready-for-agent
 **Context:** cut stage — `cut_clip_with_boundary_encode()` / concat demuxer in
 `split_homevideo.py`. Residual from issue-017 (partially fixed). Affects clips

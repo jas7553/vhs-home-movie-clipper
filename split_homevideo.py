@@ -51,6 +51,19 @@ ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refine
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (visual anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
+# Scene-snap (ultra-refinement, pass 3): after OCR refinement places a cut, snap it onto a
+# precise shot-change frame. v2 anchor rule (finding 003):
+#   - Detect in [t-context_s, t+after_s] so AdaptiveDetector sees burst-end cuts past t.
+#   - Two cuts bracketing a short span → noise burst; anchor to LATER cut (end-of-burst, ADR 0001).
+#   - Single cut ≤ t → clean content change; snap backward (removes old-session tail).
+#   - Neither → no-op (VHS pause/resume often has no visual discontinuity).
+SCENE_SNAP_CONTEXT_S = 20.0    # decode this much before t so AdaptiveDetector has rolling context
+SCENE_SNAP_ACCEPT_S = 3.0      # accept a shot cut only within [t-this, t+after_s]; decoy guard
+SCENE_SNAP_AFTER_S = 2.0       # extend detection past t to catch burst-end cuts (noise splices)
+SCENE_SNAP_BURST_MAX_S = 6.0   # two close cuts within this span → noise burst, not two scenes
+SCENE_SNAP_ADAPTIVE_THRESHOLD = 3.0
+SCENE_SNAP_MIN_SCENE_LEN = 8   # frames
+
 _CALIB_CACHE_FORMAT = 1        # increment to force re-calibration on all tapes
 _CALIB_N_SAMPLES = 20         # frames sampled during calibration to verify OCR yield
 _CACHE_FORMAT = 5              # increment when cache schema changes; forces re-scan on old caches
@@ -125,6 +138,7 @@ class PipelineConfig:
     cache: str | None = None
     visual_cache: str | None = None
     enable_visual_fusion: bool = False
+    enable_scene_snap: bool = False
     no_visual_anchor: bool = False
     fuse_window: float = DEFAULT_FUSE_WINDOW
     min_clip: float = DEFAULT_MIN_CLIP_S
@@ -1361,6 +1375,76 @@ def snap_to_keyframe_forward(video: str, t: float, look_ahead: float = 30.0) -> 
     return t
 
 
+_PYSCENEDETECT_WARNED = False
+
+
+def snap_to_scene_cut(
+    video: str,
+    t: float,
+    prev_t: float | None,
+    context_s: float = SCENE_SNAP_CONTEXT_S,
+    accept_s: float = SCENE_SNAP_ACCEPT_S,
+    after_s: float = SCENE_SNAP_AFTER_S,
+) -> tuple[float, float | None]:
+    """
+    Snap an OCR-refined cut time `t` onto a precise shot-change frame using the v2 anchor rule
+    (finding 003). Returns (snapped_t, offset) where offset is snapped_t - t (negative = backward,
+    positive = forward for burst-end), or None if nothing was snapped.
+
+    Detection window: [t-context_s, t+after_s] — wide enough for AdaptiveDetector rolling context
+    and to capture burst-end cuts that land just past t. Accept window: [max(prev_t, t-accept_s),
+    t+after_s] — tight to block decoy mid-clip cuts.
+
+    Branch logic:
+      1. Two cuts bracketing a short span (≤BURST_MAX_S) → noise burst; anchor to LATER cut so
+         the new clip starts after the burst (ADR 0001). May move cut forward.
+      2. Single cut ≤ t → clean content change; snap backward (removes old-session tail).
+      3. Neither → no-op.
+    """
+    global _PYSCENEDETECT_WARNED
+    try:
+        from scenedetect import AdaptiveDetector, detect
+    except ImportError:
+        if not _PYSCENEDETECT_WARNED:
+            print("  (scene-snap disabled: pyscenedetect not installed — pip install scenedetect)")
+            _PYSCENEDETECT_WARNED = True
+        return t, None
+
+    lo = max(0.0, t - context_s)
+    hi = t + after_s
+    accept_lo = max(lo, t - accept_s)
+    if prev_t is not None:
+        accept_lo = max(accept_lo, prev_t)
+    if accept_lo >= hi:
+        return t, None
+
+    det = AdaptiveDetector(
+        adaptive_threshold=SCENE_SNAP_ADAPTIVE_THRESHOLD,
+        min_scene_len=SCENE_SNAP_MIN_SCENE_LEN,
+    )
+    scenes = detect(video, det, start_time=lo, end_time=hi)
+    # Each scene's start (after the first) is a detected shot-change frame.
+    cuts = [s[0].get_seconds() for s in scenes[1:]]
+    accepted = [c for c in cuts if accept_lo <= c <= hi]
+
+    before = [c for c in accepted if c <= t]
+    after  = [c for c in accepted if c > t]
+
+    if before and after:
+        burst_start = max(before)
+        burst_end   = min(after)
+        if burst_end - burst_start <= SCENE_SNAP_BURST_MAX_S:
+            # Noise burst: anchor to end so new clip starts clean (ADR 0001).
+            return burst_end, burst_end - t
+
+    if before:
+        # Clean content change: snap backward to remove old-session tail.
+        snapped = max(before)
+        return snapped, snapped - t
+
+    return t, None
+
+
 def _ffmpeg_copy_seg(video: str, seg_start: float, seg_end: float, out: str):
     subprocess.run([
         "ffmpeg", "-loglevel", "error",
@@ -1649,13 +1733,23 @@ def run(config: PipelineConfig) -> PipelineResult:
             if b and b.prev_t is not None and b.prev_dt is not None:
                 t_b = time.perf_counter()
                 rr = strategy(config.video, b)
+                cut_t, method = rr.t, rr.method
+                snap_note = ""
+                if config.enable_scene_snap:
+                    snapped, off = snap_to_scene_cut(config.video, rr.t, b.prev_t)
+                    if off is not None:
+                        snap_note = f" snap={off:+.2f}s"
+                        cut_t, method = snapped, "snap"
                 elapsed_b = time.perf_counter() - t_b
                 reason = f" reason={rr.detail}" if rr.detail else ""
-                print(f"boundary coarse={vt:.0f} refined={rr.t:.0f} saved={vt - rr.t:.0f}"
-                      f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
-                      f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f} method={rr.method}{reason}")
-                splits.append(rr.t)
-                refined_boundary_map[rr.t] = b
+                print(
+                    f"boundary coarse={vt:.0f} refined={cut_t:.0f} saved={vt - cut_t:.0f}"
+                    f" win={int(vt - b.prev_t)} cam_jump={b.cam_jump_s:+.0f}"
+                    f" date={b.prev_dt.strftime('%Y-%m-%d')} elapsed={elapsed_b:.1f}"
+                    f" method={method}{snap_note}{reason}"
+                )
+                splits.append(cut_t)
+                refined_boundary_map[cut_t] = b
             else:
                 splits.append(vt)
                 if b:
@@ -1709,6 +1803,12 @@ def main() -> None:
                     help="Drop OCR boundaries lacking visual corroboration (scene cut or black frame). "
                          "Off by default — VHS pause/resume often has no visual discontinuity so "
                          "this filter would delete real boundaries.")
+    ap.add_argument("--enable-scene-snap", action="store_true", default=False,
+                    help="Ultra-refinement (pass 3): snap each OCR-refined cut backward onto a precise "
+                         "shot-change frame within 3s, if one exists. Tightens session boundaries where "
+                         "OCR placement leaks a few seconds of the old session into the next clip. "
+                         "Monotonic-safe (only tightens; no-op where no shot change exists). "
+                         "Off by default pending placement measurement.")
     ap.add_argument("--no-visual-anchor", action="store_true", default=False,
                     help="Skip visual detection entirely (disables splice dead-zone anchoring; faster, "
                          "but cuts at splice boundaries may be misplaced)")
@@ -1722,6 +1822,8 @@ def main() -> None:
     ap.add_argument("--black-min-duration", type=float, default=DEFAULT_BLACK_MIN_DURATION,
                     help="Minimum duration (s) of a black frame run to count as a boundary signal")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--skip-cut", action="store_true",
+                    help="Run full refinement (including scene-snap) but skip the actual cut step")
     args = ap.parse_args()
 
     video = os.path.abspath(args.input)
@@ -1751,6 +1853,7 @@ def main() -> None:
         cache=cache,
         visual_cache=visual_cache,
         enable_visual_fusion=args.enable_visual_fusion,
+        enable_scene_snap=args.enable_scene_snap,
         no_visual_anchor=args.no_visual_anchor,
         fuse_window=args.fuse_window,
         min_clip=args.min_clip,
@@ -1762,7 +1865,7 @@ def main() -> None:
     t0 = time.perf_counter()
     result = run(config)
 
-    if args.dry_run:
+    if args.dry_run or args.skip_cut:
         return
 
     print(f"cutting out_dir={out_dir}")
