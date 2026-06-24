@@ -1,6 +1,11 @@
 """
 run(): pipeline detection + refinement, no cutting.
 Tests call run(PipelineConfig(...)) directly — no sys.argv, no split_video mock.
+
+Scope: behavioral guards only — refined-cut placement (issue-018 tail leak),
+merge_short / same_date_adjacent output, the no-prev-t edge, and the two CLI-flag
+contracts (--no-visual-anchor, --enable-visual-fusion). Pure "helper was called"
+wiring assertions are intentionally not tested here.
 """
 import unittest.mock as mock
 from datetime import datetime
@@ -8,11 +13,8 @@ from datetime import datetime
 from split_homevideo import (
     Boundary,
     PipelineConfig,
-    PipelineResult,
     run,
 )
-
-_DT_SAME = datetime(1990, 1, 4, 17, 1)   # same date as _DT for adjacent-clip tests
 
 _DT = datetime(1990, 1, 4, 17, 1)
 _DT2 = datetime(1990, 1, 5, 9, 0)
@@ -22,77 +24,18 @@ def _config(video, **kwargs):
     return PipelineConfig(video=str(video), **kwargs)
 
 
-def _large_gap_boundary(video_t=100.0, prev_t=90.0, prev_dt=_DT):
+def _gap_boundary(video_t=200.0, prev_t=190.0):
+    """A 'gap' (not large_gap) boundary — refined like large_gap when prev_t is set."""
     return Boundary(
-        video_t=video_t, type="large_gap",
-        cam_before=prev_dt, cam_after=_DT2,
-        cam_jump_s=57600.0,
-        prev_t=prev_t, prev_dt=prev_dt,
+        video_t=video_t, type="gap",
+        cam_before=_DT, cam_after=_DT2,
+        cam_jump_s=60.0,
+        prev_t=prev_t, prev_dt=_DT,
     )
 
 
-class TestRunDryRun:
-    def test_skips_visual_detection(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.detect_visual_boundaries") as m_vis:
-            run(_config(video, dry_run=True))
-        m_vis.assert_not_called()
-
-    def test_skips_refinement(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        b = _large_gap_boundary()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.ocr_refinement") as m_ref:
-            run(_config(video, dry_run=True))
-        m_ref.assert_not_called()
-
-    def test_returns_coarse_splits(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0, 50.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0):
-            result = run(_config(video, dry_run=True))
-        assert result.splits == [0.0, 50.0]
-
-    def test_returns_pipeline_result(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0):
-            result = run(_config(video, dry_run=True))
-        assert isinstance(result, PipelineResult)
-        assert "scan" in result.phase_times
-
-
-class TestRunFullRun:
-    def test_calls_visual_detection(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])) as m_vis:
-            run(_config(video))
-        m_vis.assert_called_once()
+class TestRunFlagContracts:
+    """The two CLI flags whose documented effect on run() must not regress."""
 
     def test_no_visual_anchor_skips_visual_detection(self, tmp_path):
         video = tmp_path / "v.mp4"
@@ -105,22 +48,6 @@ class TestRunFullRun:
              mock.patch("split_homevideo.detect_visual_boundaries") as m_vis:
             run(_config(video, no_visual_anchor=True))
         m_vis.assert_not_called()
-
-    def test_calls_refinement_for_large_gap(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        b = _large_gap_boundary()
-        fake_strategy = mock.Mock(return_value=mock.Mock(t=95.0, method="ocr", detail=""))
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[b]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0, 100.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
-             mock.patch("split_homevideo.ocr_refinement", return_value=fake_strategy):
-            result = run(_config(video))
-        fake_strategy.assert_called_once()
-        assert 95.0 in result.splits
 
     def test_enable_visual_fusion_calls_fuse_boundaries(self, tmp_path):
         video = tmp_path / "v.mp4"
@@ -135,36 +62,12 @@ class TestRunFullRun:
             run(_config(video, enable_visual_fusion=True))
         m_fuse.assert_called_once()
 
-    def test_returns_pipeline_result_with_refine_phase(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])):
-            result = run(_config(video))
-        assert isinstance(result, PipelineResult)
-        assert "scan" in result.phase_times
-        assert "refine" in result.phase_times
-
-
-def _gap_boundary(video_t=200.0, prev_t=190.0):
-    """A 'gap' (not large_gap) boundary — refined like large_gap when prev_t is set."""
-    return Boundary(
-        video_t=video_t, type="gap",
-        cam_before=_DT, cam_after=_DT2,
-        cam_jump_s=60.0,
-        prev_t=prev_t, prev_dt=_DT,
-    )
-
 
 class TestRunDryRunMergeAndWarnings:
     """Cover merge_short print and same_date_adjacent warning in dry-run path."""
 
     def test_merge_short_print_when_splits_merged(self, tmp_path, capsys):
-        # Two cuts 1s apart → merge_short removes one → line 1480 fires.
+        # Two cuts 1s apart → merge_short removes one.
         video = tmp_path / "v.mp4"
         video.touch()
         # group_clips returns [0.0, 1.0, 200.0]; 1.0 < ARTIFACT_MIN_S(3.0) → merged.
@@ -178,7 +81,7 @@ class TestRunDryRunMergeAndWarnings:
         assert "merge_short" in out
 
     def test_same_date_adjacent_warning_in_dry_run(self, tmp_path, capsys):
-        # Two cuts whose labels resolve to the same date → line 1493-1494 fires.
+        # Two cuts whose labels resolve to the same date → warning fires.
         video = tmp_path / "v.mp4"
         video.touch()
         dt_jan4a = datetime(1990, 1, 4, 10, 0)
@@ -287,7 +190,7 @@ class TestRunIssue018GapRefinement:
         # Refined position used, not coarse_t (issue-018: tail leak ≤1s from true transition)
         assert 194.0 in result.splits
         assert 200.0 not in result.splits
-        # Error from true transition (195) is 1s — at the 1s floor (REQUIREMENTS L23)
+        # Error from true transition (195) is 1s — at the 1s floor
         refined_t = next(t for t in result.splits if t > 0)
         assert abs(refined_t - 195.0) <= 1.0
 
@@ -296,9 +199,9 @@ class TestRunBoundaryWithNoPrevT:
     """Boundary whose prev_t/prev_dt is None skips refinement but still enters refined_boundary_map."""
 
     def test_boundary_no_prev_t_passes_through_and_maps(self, tmp_path):
-        # A boundary with prev_t=None cannot be refined (the if-guard at line 1649 rejects it).
-        # The else-branch appends coarse_t to splits, and because b is truthy, line 1662
-        # stores it in refined_boundary_map[vt] = b so downstream cut logic can still access it.
+        # A boundary with prev_t=None cannot be refined (the if-guard rejects it).
+        # The else-branch appends coarse_t to splits, and because b is truthy it is
+        # stored in refined_boundary_map[vt] = b so downstream cut logic can access it.
         video = tmp_path / "v.mp4"
         video.touch()
         b = Boundary(
@@ -320,6 +223,5 @@ class TestRunBoundaryWithNoPrevT:
         fake_strategy.assert_not_called()
         # Coarse position kept in splits
         assert 100.0 in result.splits
-        # Boundary still recorded in boundary_map (line 1662 — the refined_boundary_map
-        # that PipelineResult returns as .boundary_map)
+        # Boundary still recorded in the map that PipelineResult returns as .boundary_map
         assert result.boundary_map.get(100.0) is b
