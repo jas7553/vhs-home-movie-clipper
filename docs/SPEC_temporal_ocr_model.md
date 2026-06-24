@@ -179,7 +179,7 @@ In `_extract_and_ocr_window` (the dense 1s scan), apply the segment model to pre
 times for frames where OCR returns `None`. This directly improves the `_resolve_*` cut
 logic inside Splice Dead Zones — more readings to anchor the last-old-session frame.
 
-Start with A only. Validate on the golden set. Then B. Then C.
+Start with A only. Validate by clip date-purity audit. Then B. Then C.
 
 ## Open questions for investigation
 
@@ -190,9 +190,9 @@ Start with A only. Validate on the golden set. Then B. Then C.
 2. **What residual threshold catches phantom misreads without dropping real boundaries?**
    A real boundary looks like a large residual (camera time jumps). The threshold must be
    above the expected drift from the ~2× rate variation but below a session-change jump
-   (min ~3600s camera seconds = 1800s video). Start at 300s and tune on the golden set.
+   (min ~3600s camera seconds = 1800s video). Start at 300s and tune by date-purity audit.
 
-3. **Does gap-filling change the F1 on the 215-boundary golden set?** Run before/after.
+3. **Does gap-filling change clip date-purity?** Run before/after.
    The risk is that predicted readings in a real `None` span might create phantom
    boundaries — measure this.
 

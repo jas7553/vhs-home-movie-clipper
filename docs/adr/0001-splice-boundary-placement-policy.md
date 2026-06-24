@@ -10,7 +10,7 @@ At a tape **Splice**, head-switch noise blanks the timestamp overlay (OCR return
 
 This produced a long churn of fixes that kept moving the error from one side to the other ("cut late" → patch → "cut early" → patch). Root causes:
 
-1. **Two distinct problems shared one name.** "Wrong boundary" meant both **Detection** (does a boundary exist near t? — measured, F1=0.920 on the 215-label golden set) and **Placement** (given a real boundary, what second do we cut? — *unmeasured*). Tuning detection while the pain was placement guaranteed circular fixes.
+1. **Two distinct problems shared one name.** "Wrong boundary" meant both **Detection** (does a boundary exist near t?) and **Placement** (given a real boundary, what second do we cut?). Tuning detection while the pain was placement guaranteed circular fixes.
 2. **The boundary at a splice is not a frame.** It is an **Ambiguity Window** no available signal resolves finer.
 
 ## Decision
@@ -20,7 +20,7 @@ This produced a long churn of fixes that kept moving the error from one side to 
 - **Anchor rule:** cut at the **last** visual event within the all-`None` span of the dense refine scan. Fallback when the span has no visual event: cut at the **end of the None-span** (just before the first clean new-date frame). Never `coarse_t` for a confirmed splice.
 - **Scope:** policy applies only to **Splice Dead Zones** (≲120s of `None`). **Long Dead Zones** (up to 2160s of genuinely unreadable footage) are a separate, out-of-scope concept.
 - **Visual anchoring is always-on; the drop-filter is opt-in.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates during refinement. `fuse_boundaries` — which *drops* OCR boundaries lacking visual corroboration — stays behind `--enable-visual-fusion`, default **off**, because VHS pause/resume frequently has no visual discontinuity and the filter would delete real boundaries.
-- **Placement is measured by clip content audit, not per-boundary ground truth.** The clip audit (vision-based sampling of frame content vs. filename date) is the primary quality signal. Human-labeling of per-boundary true-change seconds is deprecated — the audit directly answers "is the content correct?" which is the real objective. The Detection F1 golden set (`archive/Converse 1990_golden_labels.jsonl`) is retained as a regression guard for boundary detection only — AI-labeled (machine-generated verdicts), so treat it as indicative, not authoritative.
+- **Quality is measured by clip-content (date-purity) audit, not a labeled boundary set.** Sampling frame content vs. filename date directly answers "is the content correct?" — the real objective. The former AI-labeled Detection golden set (`Converse 1990_golden_labels.jsonl`, once cited at F1=0.920) was **abandoned**: machine-generated verdicts gave false confidence and never reconciled with hand spot-checks. Per-boundary ground-truth labeling is deprecated.
 
 ## Considered options
 

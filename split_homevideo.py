@@ -45,7 +45,7 @@ DEFAULT_MODE = "daily"
 DEFAULT_SCENE_THRESHOLD = 0.4
 DEFAULT_BLACK_MIN_DURATION = 0.1
 DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
-DEFAULT_MIN_CLIP_S = 120.0     # clips shorter than this are merged into prior clip; validated on golden set
+DEFAULT_MIN_CLIP_S = 120.0     # merge clips shorter than this (session/scene modes; daily ignores it)
 ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refinement-collision slivers
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (visual anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)

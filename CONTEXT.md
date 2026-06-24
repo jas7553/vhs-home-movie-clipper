@@ -33,7 +33,7 @@ The `[prev_t, coarse_t]` interval around a splice **Boundary** within which the 
 _Avoid_: error window, fuzz
 
 **Detection**:
-Judging whether a **Boundary** exists near a candidate timestamp (true/false-positive/negative). Measured by the golden set — an AI-labeled detection regression guard, indicative not authoritative (see ADR 0001).
+Judging whether a **Boundary** exists near a candidate timestamp (true/false-positive/negative). No trustworthy labeled benchmark exists — the former AI-labeled golden set was abandoned as unreliable; judged by spot-checking and clip date-purity (see ADR 0001).
 _Avoid_: accuracy (overloaded)
 
 **Placement**:
@@ -44,7 +44,7 @@ _Avoid_: accuracy, precision (overloaded)
 
 - A **Splice** causes a **Dead Zone**, which produces an **Ambiguity Window** around a **Boundary**
 - A **Cut** targets a **Boundary**; its quality splits into **Detection** (right boundary exists) and **Placement** (right second)
-- **Detection** and **Placement** are independent metrics — high **Detection** F1 says nothing about **Placement** error
+- **Detection** and **Placement** are independent — getting the right **Boundary** says nothing about landing on the right second
 
 ## Flagged ambiguities
 
