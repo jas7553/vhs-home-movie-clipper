@@ -32,8 +32,7 @@ lower priority than the scene-score result below.
 
 ## ffmpeg full-frame `scene_score` (histogram delta, reusing scan() frames)
 
-Tested on `test_15min.mp4` against the golden boundary table
-(`docs/SPEC_two_layer_clip_detection.md`), with a small prototype script
+Tested on `test_15min.mp4` against the golden boundary table, with a small prototype script
 (`prototype_scene_score.py`, deleted after evaluation — see git history if
 needed) computing `lavfi.scene_score` per frame via
 `-vf "select='gte(scene,0)',metadata=print"` and sweeping a threshold.
