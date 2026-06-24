@@ -67,7 +67,6 @@ SCENE_SNAP_BURST_MAX_S = 6.0   # two close cuts within this span → noise burst
 SCENE_SNAP_ADAPTIVE_THRESHOLD = 3.0
 SCENE_SNAP_MIN_SCENE_LEN = 8   # frames
 
-_CALIB_CACHE_FORMAT = 1        # increment to force re-calibration on all tapes
 _CALIB_N_SAMPLES = 20         # frames sampled during calibration to verify OCR yield
 _CACHE_FORMAT = 5              # increment when cache schema changes; forces re-scan on old caches
                               # (5: date-only readings accepted — _vote_bucket now stores date-only
@@ -387,20 +386,13 @@ def _bottom_band_crop(w: int, h: int) -> str:
     return f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"
 
 
-def calibrate(video: str, cache_path: str | None = None) -> str:
+def calibrate(video: str) -> str:
     """Auto-detect overlay crop for the given tape. Returns a crop string.
 
     Derives a wide bottom-band crop scaled to the tape's frame dimensions,
     then verifies it against a spread of sampled frames. Falls back to
-    DEFAULT_CROP if dimensions cannot be probed. Result is cached per tape.
+    DEFAULT_CROP if dimensions cannot be probed.
     """
-    if cache_path and os.path.exists(cache_path):
-        with open(cache_path) as f:
-            cached = json.load(f)
-        if cached.get("calib_format") == _CALIB_CACHE_FORMAT:
-            print(f"  (loaded from calib cache: {cache_path})")
-            return str(cached["crop"])
-
     try:
         w, h = _get_video_dimensions(video)
     except (subprocess.CalledProcessError, ValueError):
@@ -423,13 +415,6 @@ def calibrate(video: str, cache_path: str | None = None) -> str:
     )
     yield_pct = hits / max(1, len(paths))
     print(f"calib frame={w}x{h} crop={crop} sample={len(paths)} hits={hits} yield={yield_pct:.0%}")
-
-    if cache_path:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump({"calib_format": _CALIB_CACHE_FORMAT, "crop": crop, "w": w, "h": h}, f)
-        print(f"  (calib cached to {cache_path})")
-
     return crop
 
 
@@ -1851,14 +1836,13 @@ def main() -> None:
 
     out_dir = args.out_dir or (Path(video).stem + "_clips")
     out_dir = os.path.abspath(out_dir)
-    calib_cache = Path(video).stem + "_calib_cache.json"
     cache = Path(video).stem + "_ocr_cache.json"
     visual_cache = Path(video).stem + "_visual_cache.json"
 
     if args.crop is not None:
         crop = args.crop
     else:
-        crop = calibrate(video, calib_cache)
+        crop = calibrate(video)
 
     config = PipelineConfig(
         video=video,

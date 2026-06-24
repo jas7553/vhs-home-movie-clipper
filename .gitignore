@@ -12,7 +12,6 @@ coverage.json
 *_ocr_cache.json
 *_visual_cache.json
 *_scene_score_cache.json
-*_calib_cache.json
 !tests/fixtures/*_ocr_cache.json
 
 # Compiled binary — build from ocr_timestamp.swift
