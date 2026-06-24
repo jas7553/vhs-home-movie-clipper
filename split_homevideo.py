@@ -1461,7 +1461,30 @@ def _ffmpeg_copy_seg(video: str, seg_start: float, seg_end: float, out: str):
     ], check=True)
 
 
-def _ffmpeg_encode_seg(video: str, seg_start: float, seg_end: float, out: str, crf: int):
+def _seg_has_video_frames(path: str) -> bool:
+    """True if `path` contains at least one decoded video packet.
+
+    A boundary re-encode over a sub-frame VFR window can catch zero video
+    frames — libx264 then writes an audio-only segment. The concat demuxer
+    copies its stream layout from the FIRST file, so an audio-only lead drops
+    video from the whole clip. Callers must verify before concatenating.
+    """
+    r = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-count_packets",
+        "-show_entries", "stream=nb_read_packets",
+        "-of", "csv=p=0",
+        path,
+    ], capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip()) > 0
+    except ValueError:
+        return False  # no video stream at all
+
+
+def _ffmpeg_encode_seg(video: str, seg_start: float, seg_end: float, out: str, crf: int) -> bool:
+    """Re-encode [seg_start, seg_end]. Returns True iff the output has video frames."""
     subprocess.run([
         "ffmpeg", "-loglevel", "error",
         "-ss", f"{seg_start:.3f}",
@@ -1475,6 +1498,7 @@ def _ffmpeg_encode_seg(video: str, seg_start: float, seg_end: float, out: str, c
         "-avoid_negative_ts", "make_zero",
         "-y", out,
     ], check=True)
+    return _seg_has_video_frames(out)
 
 
 def cut_clip_with_boundary_encode(
@@ -1501,8 +1525,14 @@ def cut_clip_with_boundary_encode(
             body_start = kf_after
             if kf_after - exact_start >= MIN_BOUNDARY_SEG:
                 seg = os.path.join(tmpdir, "seg_0_lead.mp4")
-                _ffmpeg_encode_seg(video, exact_start, kf_after, seg, crf)
-                segs.append(seg)
+                # The MIN_BOUNDARY_SEG floor is necessary but not sufficient: a
+                # window above the floor can still catch zero video frames once
+                # -ss/-t are rounded onto a VFR keyframe (e.g. clip03 of
+                # Converse 1992, 0.1001s lead → 0 frames). An audio-only lead
+                # would make the concat demuxer drop video from the whole clip,
+                # so only keep the seg if it actually has frames.
+                if _ffmpeg_encode_seg(video, exact_start, kf_after, seg, crf):
+                    segs.append(seg)
             # else: sub-frame gap — re-encoding it yields ZERO video frames
             # (libx264 over <1 frame), which corrupts the concat. Drop the
             # <1-frame remainder; body starts on the keyframe.
@@ -1514,8 +1544,11 @@ def cut_clip_with_boundary_encode(
             kf_before = snap_to_keyframe(video, exact_end)
             body_end = kf_before
             if exact_end - kf_before >= MIN_BOUNDARY_SEG:
-                trail_seg = os.path.join(tmpdir, "seg_2_trail.mp4")
-                _ffmpeg_encode_seg(video, kf_before, exact_end, trail_seg, crf)
+                cand = os.path.join(tmpdir, "seg_2_trail.mp4")
+                # Same zero-video-frame hazard as the lead (see above): only
+                # keep the trail seg if the re-encode produced frames.
+                if _ffmpeg_encode_seg(video, kf_before, exact_end, cand, crf):
+                    trail_seg = cand
             # else: sub-frame gap — skip (same zero-frame hazard as above).
 
         # Body: stream copy [body_start, body_end]

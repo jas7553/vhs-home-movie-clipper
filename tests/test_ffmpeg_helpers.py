@@ -34,10 +34,12 @@ class TestFfmpegCopySeg:
 
 
 class TestFfmpegEncodeSeg:
+    # _ffmpeg_encode_seg makes two subprocess.run calls: [0] the ffmpeg encode,
+    # [1] the ffprobe video-frame check (_seg_has_video_frames). Assert on [0].
     def test_calls_ffmpeg_with_libx264(self):
         with mock.patch("subprocess.run") as m:
             _ffmpeg_encode_seg("vid.mp4", 10.0, 15.0, "/out/seg.mp4", crf=18)
-        cmd = m.call_args[0][0]
+        cmd = m.call_args_list[0][0][0]
         assert "libx264" in cmd
         assert "18" in cmd
         assert "aac" in cmd
@@ -45,7 +47,7 @@ class TestFfmpegEncodeSeg:
     def test_no_b_frames(self):
         with mock.patch("subprocess.run") as m:
             _ffmpeg_encode_seg("vid.mp4", 10.0, 15.0, "/out/seg.mp4", crf=18)
-        cmd = m.call_args[0][0]
+        cmd = m.call_args_list[0][0][0]
         assert "-bf" in cmd
         bf_idx = cmd.index("-bf")
         assert cmd[bf_idx + 1] == "0"
@@ -53,5 +55,19 @@ class TestFfmpegEncodeSeg:
     def test_duration_computed_correctly(self):
         with mock.patch("subprocess.run") as m:
             _ffmpeg_encode_seg("vid.mp4", 10.0, 13.5, "/out/seg.mp4", crf=18)
-        cmd = m.call_args[0][0]
+        cmd = m.call_args_list[0][0][0]
         assert "3.500" in cmd
+
+    def test_returns_true_when_probe_reports_frames(self):
+        with mock.patch("subprocess.run", side_effect=[
+            mock.Mock(),                    # ffmpeg encode
+            mock.Mock(stdout="5\n"),        # ffprobe frame count
+        ]):
+            assert _ffmpeg_encode_seg("vid.mp4", 10.0, 13.5, "/out/seg.mp4", crf=18) is True
+
+    def test_returns_false_when_probe_reports_zero_frames(self):
+        with mock.patch("subprocess.run", side_effect=[
+            mock.Mock(),                    # ffmpeg encode
+            mock.Mock(stdout="0\n"),        # ffprobe frame count
+        ]):
+            assert _ffmpeg_encode_seg("vid.mp4", 10.0, 13.5, "/out/seg.mp4", crf=18) is False
