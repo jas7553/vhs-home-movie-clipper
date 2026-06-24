@@ -33,11 +33,11 @@ The `[prev_t, coarse_t]` interval around a splice **Boundary** within which the 
 _Avoid_: error window, fuzz
 
 **Detection**:
-Judging whether a **Boundary** exists near a candidate timestamp (true/false-positive/negative). Measured by the 215-label golden set; current F1=0.920.
+Judging whether a **Boundary** exists near a candidate timestamp (true/false-positive/negative). Measured by the golden set — an AI-labeled detection regression guard, indicative not authoritative (see ADR 0001).
 _Avoid_: accuracy (overloaded)
 
 **Placement**:
-Judging, given a real **Boundary**, how many seconds the **Cut** lands from the true session change. Currently **unmeasured** — distinct from **Detection**.
+Judging, given a real **Boundary**, how many seconds the **Cut** lands from the true session change. Measured by **clip-content audit** (frame content vs filename date), per ADR 0001 — distinct from **Detection**.
 _Avoid_: accuracy, precision (overloaded)
 
 ## Relationships

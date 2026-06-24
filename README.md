@@ -34,7 +34,7 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
 # Key flags:
 #   --interval N          Seconds between OCR samples (default: 10)
 #   --gap N               Camera-time jump threshold in seconds (default: 3600,
-#                         empirically validated on 215-boundary golden set; F1=0.920)
+#                         empirically validated on a labeled boundary set)
 #   --mode {scene,session,daily}  Clip grouping mode (default: daily)
 #   --crop W:H:X:Y        ffmpeg crop for timestamp region (default tuned for 640×480)
 #   --cache PATH          Override default cache file location
@@ -45,7 +45,7 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
 ## How It Works
 
 1. **OCR scan**: Extract 3 frames per `--interval` window via a single ffmpeg pass
-   (no per-frame seeks). Crop the bottom-right region (`250:110:385:370` for 640×480)
+   (no per-frame seeks). Crop the bottom overlay band (`560:130:40:350` for 640×480)
    and batch through `ocr_timestamp` (Apple Vision, M4-native). The scan is **crop-only
    first** — that has the higher OCR yield (~67% vs ~45% per frame); the deinterlace +
    4× upscale + contrast `_VF_PREPROCESS` chain runs only as a **fallback** on windows
@@ -94,7 +94,7 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
 The camcorder's internal clock advances at ~2× real time relative to video playback.
 60s of video ≈ 2 min of camera time. Effect: `gap_s` thresholds are in camera-seconds,
 not wall-clock seconds. `--gap 3600` (1 camera-hour) is empirically validated on a
-215-boundary golden label set (F1=0.920). Prior values of 300 and 900 had unacceptable
+labeled boundary set (a detection regression guard; see `docs/adr/0001-splice-boundary-placement-policy.md`). Prior values of 300 and 900 had unacceptable
 false-positive rates.
 
 ### OCR reliability

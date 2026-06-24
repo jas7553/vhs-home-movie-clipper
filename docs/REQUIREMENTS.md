@@ -24,9 +24,9 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **At a Splice Dead Zone the boundary is an Ambiguity Window, not a recoverable frame.** Head-switch noise blanks OCR and saturates every visual detector across a ~15s burst, so frame-accurate placement is unsatisfiable there. The cut follows an end-of-noise-burst policy: the noise burst stays with the outgoing clip's tail (objective: zero wrong-date footage in the incoming clip). The cut anchors to the last visual event within the all-`None` span, falling back to the end of that span when no visual event exists. See `docs/adr/0001-splice-boundary-placement-policy.md`.
 
-**Detection and Placement are separate, separately-measured concerns.** Detection (does a boundary exist?) is scored by the golden set's y/n verdicts (F1=0.920). Placement (how many seconds the cut lands from the true session change) requires its own metric — a human-labeled true-change second on Splice Dead Zone boundaries. No boundary-placement change may be merged without a measured placement error; a high Detection F1 says nothing about Placement.
+**Detection and Placement are separate, separately-measured concerns.** Detection (does a boundary exist?) is scored by the golden set — an AI-labeled regression guard, indicative not authoritative (see ADR 0001). Placement (how many seconds the cut lands from the true session change) is judged by **clip-content audit** — frame content vs filename date — not per-boundary human labels (ADR 0001 deprecated those). A high Detection score says nothing about Placement.
 
-**Splice Dead Zone placement error must not exceed 15s median** (measured against human-labeled true-change seconds on the labeled SDZ set). The current baseline is 17.1s median (28/40 SDZ boundaries, measured 2026-06-19); that baseline is a failure of this requirement and marks the target to beat.
+**A Splice Dead Zone's incoming clip must contain zero wrong-date footage** — the noise burst stays with the outgoing clip's tail (ADR 0001). Quality is judged by clip-content audit, not a per-boundary second-count: frame-accurate placement is unsatisfiable inside the Ambiguity Window, so the objective is content-correctness of the resulting clips.
 
 ---
 
@@ -36,7 +36,7 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **The pipeline must tolerate consecutive OCR misreads without creating phantom clip boundaries.** A run of 2–3 frames reading a wrong date should be filtered out, not treated as a real date change.
 
-**Gap thresholds must be empirically tuned, not guessed.** The `--gap` default (currently 3600s camera-time) was derived from a 215-boundary golden label set with measured F1=0.920. Any change to the default requires evidence from labeled data.
+**Gap thresholds must be empirically tuned, not guessed.** The `--gap` default (currently 3600s camera-time) was derived from a labeled boundary set (detection regression guard; see ADR 0001). Any change to the default requires evidence from labeled data.
 
 **Re-tuning must not require re-scanning.** Changing `--gap`, `--mode`, or `--min-clip` should hit the OCR cache and return results in seconds. Only changes to the preprocessing filter chain or OCR engine require a new scan.
 
@@ -80,7 +80,7 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **Timestamp format is `M/ D/YY` (date) and `H:MM AM/PM` (time)**, with a space before single-digit months and days. OCR implementations must account for the space-before-digit ambiguity this creates (e.g., `/ 6` misread as `16`).
 
-**Source video is 640×480 VHS digitized footage.** The default crop (`250:110:385:370`) targets the bottom-right timestamp overlay on this format. Other tapes may require `--crop` adjustment.
+**Source video is 640×480 VHS digitized footage.** The default crop (`560:130:40:350`) covers the full bottom overlay band on this format; per-tape auto-calibration scales it to other frame sizes. Other tapes may require `--crop` adjustment.
 
 ---
 

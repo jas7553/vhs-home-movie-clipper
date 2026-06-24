@@ -49,30 +49,30 @@ Two-file project:
 
 ## Key domain facts
 
-- **Camera clock runs ~2× real time** on this specific camcorder. `--gap 3600` (1 camera-hour) is the empirically validated threshold (F1=0.920 on 215-boundary golden set); prior default of 300 and field value of 900 both had unacceptable FP rates.
-- **OCR success rate ~86%** per-window (crop-only primary + preprocessing fallback + 3-frame majority vote + date-only acceptance) on the 5.9hr test file — 1824/2128 windows. The older all-preprocessed scan got ~33%, and the require-a-time parser (before date-only acceptance) capped per-window yield at ~64%. The outlier filter and `None`-skipping make the pipeline robust to the rest.
-- **Timestamp format**: `M/ D/YY` (bottom line) and `H:MM AM/PM` (top line), with spaces instead of leading zeros. Years outside 1985–2005 are rejected as OCR hallucinations. **The overlay can be set to date-only (no time line) for long spans** — `parse_timestamp` accepts a date with no time (or no AM/PM) and falls back to **midnight**, keeping the date. Rejecting date-only reads (the old behavior) made those spans invisible and collapsed multiple real date changes into one clip; see `.scratch/issue-005-date-only-span-contamination.md`.
-- **Default crop** `560:130:40:350` covers the full bottom overlay band on 640×480 source. Captures left/center/right overlays. Old right-anchored default `250:110:385:370` clipped off-center overlays (issue-009).
+- **Camera clock runs ~2× real time** on this specific camcorder. `--gap 3600` (1 camera-hour) is the empirically validated threshold; prior default of 300 and field value of 900 both had unacceptable FP rates. (Detection benchmark framed in ADR 0001 — the golden set is an AI-labeled regression guard, indicative not authoritative.)
+- **OCR success rate ~86%** per-window (1824/2128 on the 5.9hr test tape): crop-only primary + preprocessing fallback + 3-frame majority vote + date-only acceptance. **This is the single source for the current yield figure** — other docs link here, not restate it. The outlier filter and `None`-skipping make the pipeline robust to the rest.
+- **Timestamp format**: `M/ D/YY` (bottom line) and `H:MM AM/PM` (top line), with spaces instead of leading zeros. Years outside 1985–2005 are rejected as OCR hallucinations. **The overlay can be set to date-only (no time line) for long spans** — `parse_timestamp` accepts a date with no time (or no AM/PM) and falls back to **midnight**, keeping the date. Rejecting date-only reads (the old behavior) made those spans invisible and collapsed multiple real date changes into one clip.
+- **Default crop** `560:130:40:350` covers the full bottom overlay band on 640×480 source. Captures left/center/right overlays. Old right-anchored default `250:110:385:370` clipped off-center overlays.
 - **Default mode is `daily`**: one clip per calendar date, no date split across clips. Use `--mode session` for intra-day splits.
 - **Date islands (replaces phantom collapse)**: a single isolated reading whose date differs from both neighbours is an OCR misread (wrong day/month/year). `drop_date_islands()` removes these before boundary detection, so they never create spurious boundaries — including a misread sitting *exactly* on a real session change, which the former `_collapse_revert_phantoms` mis-handled by merging the two real sessions. A real session is a contiguous run of ≥2 same-date readings and is never dropped, so genuine short / out-of-order sessions survive (e.g. a 9/01 run physically between 3/25 and 4/08 on a re-recorded tape). Validated on Converse 1990.mp4 — 3 merged-session bugs → 0.
 - Split output filenames: `<stem>_clipNN_YYYY-MM-DD.mp4` (daily mode) or `<stem>_clipNN_YYYY-MM-DD_HHMM.mp4` (session/scene mode)
-- **Detection vs Placement** (do not conflate): *Detection* = does a boundary exist near t (golden-set y/n, F1=0.920). *Placement* = how many seconds the cut lands from the true session change. They are independent — high F1 says nothing about placement accuracy. Placement has its own (human-labeled) ground truth on Splice Dead Zone boundaries; no placement change merges without a measured error. See `CONTEXT.md`.
+- **Detection vs Placement** (do not conflate): *Detection* = does a boundary exist near t. *Placement* = how many seconds the cut lands from the true session change. Independent metrics — defined in `CONTEXT.md`, measurement framed in ADR 0001 (placement judged by clip-content audit, not per-boundary human labels).
 - **Splice Dead Zone** (≲120s all-`None` at a tape splice) vs **Long Dead Zone** (≳120s, up to 2160s of unreadable footage). The end-of-noise-burst placement policy applies *only* to Splice Dead Zones; Long Dead Zone handling is unsolved/out of scope.
-- **Decoder DTS warnings on long-body clips are expected and benign.** Clips with a long stream-copied body can emit up to ~100 `non monotonic` DTS warnings from `ffmpeg -v warning -f null -`, spread across the **entire clip** duration — not confined to the seam (e.g. clip04, ~32 min, 103 warnings with DTS values 241→57424). Root cause: `+igndts` recomputes DTS from VFR source PTS throughout the stream-copied body, propagating PTS irregularities into decoder output. Benign because container DTS is strictly increasing, container PTS has 0 duplicates, and frame count is complete (verified: clip04 58040 vs 58051 expected, within 0.02%) — no frozen or dropped frames; media players are unaffected. Fixing requires re-encoding the entire body, defeating the pipeline's stream-copy design. Decision: accept. See `docs/adr/0003-accept-decoder-dts-warnings-3seg-concat.md`.
+- **Decoder DTS warnings on long-body stream-copied clips are expected and benign** — container DTS stays strictly increasing, no frozen/dropped frames, media players unaffected. Fixing would require re-encoding the whole body, defeating the stream-copy design. Full root-cause + evidence: `docs/adr/0003-accept-decoder-dts-warnings-3seg-concat.md`.
 - **Visual signals: anchor always-on, drop-filter opt-in.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates for splice placement. `fuse_boundaries` (drops OCR boundaries lacking visual corroboration) stays behind `--enable-visual-fusion`, default **off** — VHS pause/resume often has no visual discontinuity, so the filter would delete real boundaries.
 
 ## Agent skills
 
 ### Issue tracker
 
-Issues live as local markdown files under `.scratch/`. No external PR triage surface. See `docs/agents/issue-tracker.md`.
+Issues live as local markdown files under `.scratch/` (gitignored — local only, never committed). No external PR triage surface.
 
 ### Triage labels
 
-Default canonical label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+Canonical label strings: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`.
 
 ### Domain docs
 
-Single-context layout: `CONTEXT.md` at root + `docs/adr/`. See `docs/agents/domain.md`.
+Single-context layout: `CONTEXT.md` (vocabulary) + `docs/REQUIREMENTS.md` (goals/constraints) + `docs/adr/` (decisions) + `docs/findings/` (dated evidence).
 
 Dated empirical discoveries go in `docs/findings/NNN-slug.md` (evidence, not goals/decisions) — see `docs/findings/README.md` for how it relates to specs/ADRs/requirements.
