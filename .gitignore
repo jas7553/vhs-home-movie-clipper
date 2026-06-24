@@ -4,6 +4,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.json
 
 # Video source files and output — not part of the tool
 *.mp4
@@ -11,6 +12,7 @@ __pycache__/
 *_ocr_cache.json
 *_visual_cache.json
 *_scene_score_cache.json
+*_calib_cache.json
 !tests/fixtures/*_ocr_cache.json
 
 # Compiled binary — build from ocr_timestamp.swift
@@ -27,9 +29,6 @@ ocr_timestamp
 .env.*
 *.pem
 *_credentials.json
-
-# Vision-refine prototype scratch (exported frames + manifest)
-vision_frames/
 
 # Local scratch: caches, generated clips, preserved readings backups (multi-GB)
 archive/
