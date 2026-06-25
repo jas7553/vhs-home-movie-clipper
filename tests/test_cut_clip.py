@@ -98,7 +98,7 @@ class TestCutClipBothBoundaries:
 
 class TestCutClipZeroFrameBoundaryDropped:
     """Regression: a re-encode over a sub-frame VFR window above MIN_BOUNDARY_SEG
-    can still yield ZERO video frames (clip03, Converse 1992: 0.1001s lead → 0
+    can still yield ZERO video frames (clip03: 0.1001s lead → 0
     frames). An audio-only seg as the concat's first file drops video from the
     whole clip. Such segs must be discarded, not concatenated."""
 

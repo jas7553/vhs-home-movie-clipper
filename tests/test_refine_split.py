@@ -614,7 +614,7 @@ class TestRefineSplitTwoPass:
 # Content-aware gap placement: classify garbled gap frames as old/new/noise so
 # the cut keeps new-date content out of the outgoing clip (REQUIREMENTS L23) but
 # still keeps old-date / noise garble with it (ADR-0001). Strings below are real
-# OCR captured from Converse 1990.mp4 at the named boundaries (.scratch/probe_gaps.py).
+# OCR captured from a test tape at the named boundaries (.scratch/probe_gaps.py).
 # ---------------------------------------------------------------------------
 
 class TestGapDateClass:
