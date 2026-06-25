@@ -11,7 +11,7 @@ a misread surrounded only by None gaps is still detectable as an island.
 """
 from datetime import datetime
 
-from split_homevideo import drop_date_islands, drop_digit_drop_runs, drop_year_misread_runs
+from split_homevideo import drop_date_islands, drop_digit_drop_runs, drop_month_confusion_runs, drop_year_misread_runs
 
 
 def mk(*days):
@@ -296,3 +296,82 @@ class TestDropYearMisreadRuns:
     def test_passthrough_all_same_year(self):
         s = mk_yr([(1990,4,29),(1990,4,29),(1990,4,29),(1990,4,29)])
         assert drop_year_misread_runs(s) == s
+
+
+# ---------------------------------------------------------------------------
+# drop_month_confusion_runs — catches multi-window month-digit confusion
+# misreads where OCR swaps visually similar month digits (1↔5, 8↔9) for ≥2
+# consecutive windows, forming a bounce run that survives drop_date_islands.
+# ---------------------------------------------------------------------------
+
+def mk_mo(*specs):
+    """Build (t, datetime) samples for month-confusion tests.
+
+    Each spec is (month, day, year) or None.
+    """
+    out = []
+    for i, s in enumerate(specs):
+        if s is None:
+            out.append((float(i * 10), None))
+        else:
+            m, d, y = s
+            out.append((float(i * 10), datetime(y, m, d, 12, 0)))
+    return out
+
+
+def mdy(samples):
+    """Extract (month, day, year) from samples, skipping None."""
+    return [(dt.month, dt.day, dt.year) for _, dt in samples if dt is not None]
+
+
+class TestDropMonthConfusionRuns:
+    def test_jan_vs_may_confusion_dropped(self):
+        # 1990-01-06 ×3, 1990-05-06 ×2, 1990-01-06 ×3 — Converse 1990 clip05 pattern
+        s = mk_mo((1,6,1990),(1,6,1990),(1,6,1990),(5,6,1990),(5,6,1990),(1,6,1990),(1,6,1990),(1,6,1990))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(1,6,1990)] * 6
+
+    def test_sep_vs_aug_confusion_dropped(self):
+        # 1992-09-25 ×3, 1992-08-25 ×2, 1992-09-25 ×3 — Converse 1992 clip18 pattern
+        s = mk_mo((9,25,1992),(9,25,1992),(9,25,1992),(8,25,1992),(8,25,1992),(9,25,1992),(9,25,1992),(9,25,1992))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(9,25,1992)] * 6
+
+    def test_month_not_in_confusable_pair_kept(self):
+        # 1990-03-06 ×2, 1990-06-06 ×2, 1990-03-06 ×2 — 3 and 6 not confusable
+        s = mk_mo((3,6,1990),(3,6,1990),(6,6,1990),(6,6,1990),(3,6,1990),(3,6,1990))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(3,6,1990),(3,6,1990),(6,6,1990),(6,6,1990),(3,6,1990),(3,6,1990)]
+
+    def test_different_day_genuine_outoforder_kept(self):
+        # 1990-09-01 between 1990-03-25 and 1990-04-08 — different day, keep
+        s = mk_mo((3,25,1990),(3,25,1990),(9,1,1990),(9,1,1990),(4,8,1990),(4,8,1990))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(3,25,1990),(3,25,1990),(9,1,1990),(9,1,1990),(4,8,1990),(4,8,1990)]
+
+    def test_none_gaps_around_confusion_run_still_caught(self):
+        # None gaps don't protect the confusion run
+        s = mk_mo((1,6,1990),(1,6,1990),None,(5,6,1990),(5,6,1990),None,(1,6,1990),(1,6,1990))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(1,6,1990)] * 4
+
+    def test_outer_sides_differ_not_dropped(self):
+        # 1990-01-06 → 1990-05-06 → 1990-09-06: outer sides differ, keep all
+        s = mk_mo((1,6,1990),(1,6,1990),(5,6,1990),(5,6,1990),(9,6,1990),(9,6,1990))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(1,6,1990),(1,6,1990),(5,6,1990),(5,6,1990),(9,6,1990),(9,6,1990)]
+
+    def test_same_outer_different_day_in_confusable_pair_kept(self):
+        # Outer dates same (1990-01-06), middle run same year+confusable month BUT different day
+        # → day mismatch means genuine session, must not drop
+        s = mk_mo((1,6,1990),(1,6,1990),(5,7,1990),(5,7,1990),(1,6,1990),(1,6,1990))
+        result = mdy(drop_month_confusion_runs(s))
+        assert result == [(1,6,1990),(1,6,1990),(5,7,1990),(5,7,1990),(1,6,1990),(1,6,1990)]
+
+    def test_passthrough_too_short(self):
+        s = mk_mo((1,6,1990),(5,6,1990))
+        assert drop_month_confusion_runs(s) == s
+
+    def test_passthrough_all_same(self):
+        s = mk_mo((1,6,1990),(1,6,1990),(1,6,1990),(1,6,1990))
+        assert drop_month_confusion_runs(s) == s

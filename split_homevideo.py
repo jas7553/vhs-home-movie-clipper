@@ -767,6 +767,69 @@ def drop_digit_drop_runs(
     return [s for i, s in enumerate(samples) if i not in drop]
 
 
+_MONTH_CONFUSABLES: frozenset[frozenset[int]] = frozenset({
+    frozenset({1, 5}),  # 1 and 5 look alike on VHS overlay font
+    frozenset({8, 9}),  # 8 and 9 look alike on VHS overlay font
+})
+
+
+def drop_month_confusion_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[float, "datetime | None"]]:
+    """Drop multi-window month-digit confusion misreads that survive drop_date_islands.
+
+    VHS overlay OCR sometimes swaps visually similar month digits for ≥2 consecutive
+    windows, forming a bounce run (A A A [B B] A A A) that looks like a genuine
+    2-reading session and survives the island filter.
+
+    Confirmed confusable pairs on this font: {1, 5} and {8, 9}.
+
+    A run is flagged as a month-confusion misread when all three hold:
+      1. The run is bracketed on both sides by the same outer date.
+      2. The run's date has the same day and year as the outer date.
+      3. frozenset({run_date.month, outer.month}) is in _MONTH_CONFUSABLES.
+
+    Genuine out-of-order sessions (different day, different year, or month pair not
+    in _MONTH_CONFUSABLES) are never dropped.
+    """
+    dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
+    if len(dated) < 3:
+        return samples
+
+    runs: list[tuple[date, list[int]]] = []
+    cur_date = dated[0][1].date()
+    cur_idx = [dated[0][0]]
+    for idx, dt in dated[1:]:
+        d = dt.date()
+        if d == cur_date:
+            cur_idx.append(idx)
+        else:
+            runs.append((cur_date, cur_idx))
+            cur_date = d
+            cur_idx = [idx]
+    runs.append((cur_date, cur_idx))
+
+    if len(runs) < 3:
+        return samples
+
+    drop: set[int] = set()
+    for r in range(1, len(runs) - 1):
+        run_date, run_indices = runs[r]
+        left_date = runs[r - 1][0]
+        right_date = runs[r + 1][0]
+        if left_date != right_date:
+            continue
+        outer = left_date
+        if (
+            run_date.day == outer.day
+            and run_date.year == outer.year
+            and frozenset({run_date.month, outer.month}) in _MONTH_CONFUSABLES
+        ):
+            drop.update(run_indices)
+
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
 def drop_year_misread_runs(
     samples: list[tuple[float, datetime | None]],
 ) -> list[tuple[float, datetime | None]]:
@@ -1688,6 +1751,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     samples = drop_date_islands(samples)
     samples = drop_year_misread_runs(samples)
     samples = drop_digit_drop_runs(samples)
+    samples = drop_month_confusion_runs(samples)
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
     boundaries = find_all_boundaries(filtered, gap_s=config.gap)
 
