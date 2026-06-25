@@ -47,6 +47,8 @@ DEFAULT_BLACK_MIN_DURATION = 0.1
 DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
 DEFAULT_MIN_CLIP_S = 120.0     # merge clips shorter than this (session/scene modes; daily ignores it)
 ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refinement-collision slivers
+GARBLED_ORPHAN_MAX_S = 30.0    # two consecutive garbled-boundary cuts boxing in a span shorter than
+                               # this are suppressed: the span is a mis-labeled orphan, not a real clip
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (visual anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
 
@@ -903,6 +905,46 @@ def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S)
             continue
         merged.append(t)
     return merged
+
+
+def suppress_garbled_orphans(
+    splits: list[float],
+    garbled_cuts: set[float],
+    threshold: float = GARBLED_ORPHAN_MAX_S,
+) -> tuple[list[float], int]:
+    """Drop pairs of consecutive garbled-boundary cuts that enclose a span < threshold.
+
+    Back-to-back garbled-boundary refinements can bracket a tiny span whose date
+    label belongs to neither adjacent session. Since both bounding cuts are already
+    flagged as garbled, dropping both merges the orphan into its neighbour.
+
+    Applied iteratively so chains of 3+ garbled boundaries resolve correctly.
+    Returns (new_splits, n_dropped).
+    """
+    n_dropped = 0
+    changed = True
+    while changed:
+        changed = False
+        result: list[float] = []
+        i = 0
+        while i < len(splits):
+            t = splits[i]
+            if (
+                t in garbled_cuts
+                and i + 1 < len(splits)
+                and splits[i + 1] in garbled_cuts
+                and splits[i + 1] - t < threshold
+            ):
+                garbled_cuts.discard(t)
+                garbled_cuts.discard(splits[i + 1])
+                i += 2
+                n_dropped += 2
+                changed = True
+            else:
+                result.append(t)
+                i += 1
+        splits = result
+    return splits, n_dropped
 
 
 def group_clips(boundaries: list["Boundary"], mode: str) -> list[float]:
@@ -1808,6 +1850,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     print(f"refine count={refine_count}")
     t_refine = time.perf_counter()
     refined_boundary_map: dict[float, Boundary] = {}
+    garbled_cuts: set[float] = set()
     with tempfile.TemporaryDirectory() as tmpdir:
         strategy = ocr_refinement(config.gap, config.crop, tmpdir, config.interval, visual_times)
         splits = [0.0]
@@ -1833,11 +1876,22 @@ def run(config: PipelineConfig) -> PipelineResult:
                 )
                 splits.append(cut_t)
                 refined_boundary_map[cut_t] = b
+                if rr.detail == "garbled-boundary":
+                    garbled_cuts.add(cut_t)
             else:
                 splits.append(vt)
                 if b:
                     refined_boundary_map[vt] = b
     phase_times["refine"] = time.perf_counter() - t_refine
+
+    if garbled_cuts:
+        splits, n_suppressed = suppress_garbled_orphans(splits, garbled_cuts)
+        if n_suppressed:
+            retained = set(splits)
+            for dead in list(refined_boundary_map.keys()):
+                if dead not in retained:
+                    del refined_boundary_map[dead]
+            print(f"garbled_orphan_suppress removed={n_suppressed}")
 
     before_merge = len(splits)
     splits = merge_short_clips(splits, effective_min_clip)
