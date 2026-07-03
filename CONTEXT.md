@@ -33,11 +33,11 @@ The `[prev_t, coarse_t]` interval around a splice **Boundary** within which the 
 _Avoid_: error window, fuzz
 
 **Detection**:
-Judging whether a **Boundary** exists near a candidate timestamp (true/false-positive/negative). No trustworthy labeled benchmark exists — the former AI-labeled golden set was abandoned as unreliable; judged by spot-checking and clip date-purity (see ADR 0001).
+Judging whether a **Boundary** exists near a candidate timestamp (true/false-positive/negative). No trustworthy labeled benchmark exists — the former AI-labeled golden set was abandoned as unreliable; judged by clip date-purity and the per-boundary placement report's MISMATCH class (see ADR 0001, ADR 0004).
 _Avoid_: accuracy (overloaded)
 
 **Placement**:
-Judging, given a real **Boundary**, how many seconds the **Cut** lands from the true session change. Measured by **clip-content audit** (frame content vs filename date), per ADR 0001 — distinct from **Detection**.
+Judging, given a real **Boundary**, how many seconds the **Cut** lands from the true session change. Acceptance is per boundary class (ADR 0004: CLEAN ≤1s, visible shot change ≤0.5s, Splice Dead Zone by content purity only). Measured by the per-boundary ruler `.scratch/placement_report.py` (dense ±10s OCR around every cut, frame-audit validated) — run it before/after ANY placement change. Distinct from **Detection**.
 _Avoid_: accuracy, precision (overloaded)
 
 ## Relationships

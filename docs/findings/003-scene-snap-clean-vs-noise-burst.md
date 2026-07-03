@@ -8,6 +8,12 @@ across most clip boundaries.
 and what its anchor rule must be. Built behind `--enable-scene-snap` (default off); the target
 logic is **not** safe to default yet.
 
+> **Superseded on the default question:** the v3 rules below fixed the anchor logic and
+> finding [005] flipped the flag **default ON** (commit bb6f99a, 2026-06-24). "Default off"
+> statements in this file are historical.
+
+[005]: 005-scene-snap-earns-default-on-two-tapes.md
+
 ---
 
 ## Idea under test

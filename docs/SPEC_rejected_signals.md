@@ -4,6 +4,11 @@ Log of candidate signals evaluated for detecting session boundaries (camera
 paused/stopped) beyond the existing OCR-timestamp-jump + scdet visual-fusion
 approach. Recorded so these aren't re-investigated from scratch.
 
+> **Historical note:** evidence below cites the AI-labeled golden boundary table,
+> which was later abandoned as unreliable (ADR 0001). The rejection *conclusions*
+> stand — the failure modes (false-fire rates, saturation inside noise bursts) are
+> signal properties, not artifacts of the labels.
+
 ## ffmpeg `silencedetect`
 
 Audio dropout/pop at REC start/stop. **Rejected.** Fires ~459 times in 15

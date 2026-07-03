@@ -34,12 +34,14 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
 # Key flags:
 #   --interval N          Seconds between OCR samples (default: 10)
 #   --gap N               Camera-time jump threshold in seconds (default: 3600,
-#                         empirically validated on a labeled boundary set)
+#                         empirically validated by date-purity audit of the output)
 #   --mode {scene,session,daily}  Clip grouping mode (default: daily)
 #   --crop W:H:X:Y        ffmpeg crop for timestamp region (default tuned for 640×480)
-#   --cache PATH          Override default cache file location
 #   --out-dir DIR         Output directory (default: <stem>_clips/)
-#   --min-clip N          Merge clips shorter than N seconds (default: 120; ignored in daily mode)
+#   --enable-scene-snap / --no-enable-scene-snap   Sub-second shot-change snap (default: on)
+#   --enable-visual-fusion  Drop OCR boundaries lacking visual corroboration (default: off)
+#   --no-visual-anchor    Disable cached visual anchors for splice placement
+#   --dry-run             Preview splits without cutting
 ```
 
 ## How It Works
@@ -58,10 +60,12 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
    the camcorder overlay can be set to date-only for long spans, and daily-mode cuts on
    the date. Years outside 1985–2005 are rejected as hallucinations.
 
-3. **Outlier filter**: Remove isolated misreads and consecutive misread runs. A reading
-   is kept if it is consistent (within 900s drift) with EITHER its previous OR next
-   neighbor (within a `max_run=3` step window). Real boundary readings pass the forward
-   check; consecutive misread runs fail all neighbors and are dropped.
+3. **Filter chain**: Remove OCR misreads before boundary detection — date islands
+   (single isolated off-date reading), year-misread runs, digit-drop runs
+   (`NOV 26` → `NOV 6`), month-digit confusion runs (`1↔5`, `8↔9`), day-digit
+   confusion runs (`6↔8`, `5↔6`; droppable runs capped at `_CONFUSION_RUN_MAX`
+   readings so long real sessions are never dropped), then drift-inconsistent
+   outliers. See `CLAUDE.md` stage 2 for the exact order and rules.
 
 4. **Boundary detection**: Emit a `Boundary` for each pair where:
    - `cam_advance > video_advance + 60s` (camera paused/off), or
@@ -77,9 +81,13 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
    - `session` — `large_gap` boundaries only
    - `scene` — all detected pauses
 
-6. **Refinement**: For each `large_gap` boundary, dense 1s scan of the preceding
-   `[prev_sample, coarse_t]` window in parallel. Cuts at the last confirmed old-session
-   frame rather than the first new-session frame.
+6. **Refinement**: For each `large_gap` boundary, dense 1s scan of
+   `[prev_sample − 20s, coarse_t + interval]` in parallel (the lookback pad corrects
+   coarse-label drift; a monotonic floor stops the window crossing the previous
+   boundary's cut). Cuts at the last confirmed old-session frame rather than the first
+   new-session frame. A scene-snap pass (PySceneDetect, default on) then snaps each cut
+   sub-second onto a detected shot change — backward for clean cuts, forward to
+   burst-end at noise splices.
 
 7. **Cut**: Re-encodes only small boundary segments (~3–6s) at CRF 18 for frame accuracy;
    stream-copies everything else. Concatenates via ffmpeg concat demuxer.
@@ -93,9 +101,11 @@ python3 split_homevideo.py "YourFile.mp4" --gap 3600
 ### Camera clock rate
 The camcorder's internal clock advances at ~2× real time relative to video playback.
 60s of video ≈ 2 min of camera time. Effect: `gap_s` thresholds are in camera-seconds,
-not wall-clock seconds. `--gap 3600` (1 camera-hour) is empirically validated on a
-labeled boundary set (a detection regression guard; see `docs/adr/0001-splice-boundary-placement-policy.md`). Prior values of 300 and 900 had unacceptable
-false-positive rates.
+not wall-clock seconds. `--gap 3600` (1 camera-hour) is empirically validated by
+date-purity audit of the resulting clips — there is no labeled benchmark; the former
+AI-labeled golden set was abandoned as unreliable (see
+`docs/adr/0001-splice-boundary-placement-policy.md`). Prior values of 300 and 900 had
+unacceptable false-positive rates.
 
 ### OCR reliability
 Per-window success rate on the 5.9hr Converse 1990 tape: 1824/2128 windows (~86%) —
@@ -128,6 +138,10 @@ clip, so the guard was replaced by the midnight fallback (the 12-hour-jump hazar
 guarded against is avoided by dropping the ambiguous time, not the date).
 
 ### Split accuracy
-Coarse boundaries land within ±`interval`s of the actual cut. The refinement step
-does a dense 1s scan of `[prev_sample, coarse_sample]` and finds the last confirmed
-old-session frame. Savings range from 0s to 2180s per boundary (shown in `--dry-run`).
+Coarse boundaries land within ±`interval`s of the actual cut; refinement (dense 1s
+scan + scene-snap) brings them to the per-class acceptance spec in
+`docs/adr/0004-placement-acceptance-criteria.md`: ≤1s where OCR is legible on both
+sides, ≤0.5s at visible shot changes, content-purity-only inside splice noise bursts
+(frame-accuracy is unsatisfiable there — the burst stays with the outgoing clip's
+tail by design). Placement is measured per boundary by a local ruler tool, not
+eyeballed; see the ADR for what a correct spot-check looks like.
