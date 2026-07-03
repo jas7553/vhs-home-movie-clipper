@@ -51,6 +51,18 @@ GARBLED_ORPHAN_MAX_S = 30.0    # two consecutive garbled-boundary cuts boxing in
                                # this are suppressed: the span is a mis-labeled orphan, not a real clip
 SPLICE_DEAD_ZONE_MAX_S = 120.0 # None-span up to this = Splice Dead Zone (visual anchor applies);
                                # wider = Long Dead Zone, falls back to coarse_t (ADR 0001, out of scope)
+REFINE_LOOKBACK_PAD_S = 20     # seconds the dense refinement window looks BACK of prev_t before
+                               # scanning forward. prev_t/prev_dt come from the coarse scan's
+                               # majority-voted, fps-normalized bucket labels (stage 1) — a fresh
+                               # single-frame extraction at that same nominal time can already show
+                               # new-session content, by several seconds (fill_timeonly_dates
+                               # attributing a garbled new-session time-only read to the old date,
+                               # or plain decode-timing drift between the two extraction methods).
+                               # Without this pad the dense window starts strictly after prev_t and
+                               # can never re-examine it, so the true last-old frame is invisible and
+                               # the cut lands late (tail leak). Empirically the worst observed drift
+                               # on Converse 1990 was 11s (b42 05-25->05-26 boundary); 20s keeps
+                               # margin. See issue-018's 2026-07-03 tail-leak update.
 
 # Scene-snap (ultra-refinement, pass 3): after OCR refinement places a cut, snap it onto a
 # precise shot-change frame. v2 anchor rule (finding 003):
@@ -113,7 +125,7 @@ class RefinementResult(NamedTuple):
     method: str
     detail: str
 
-RefinementStrategy = Callable[[str, Boundary], RefinementResult]
+RefinementStrategy = Callable[[str, Boundary, float], RefinementResult]
 
 
 class Reading(NamedTuple):
@@ -129,7 +141,9 @@ OcrFn = Callable[[list[int]], dict[int, Reading]]
 
 
 class PlacementPolicy(Protocol):
-    def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult: ...
+    def place(
+        self, boundary: Boundary, ocr_fn: OcrFn, floor_t: float = 0.0
+    ) -> RefinementResult: ...
 
 
 @dataclass
@@ -823,9 +837,112 @@ def drop_month_confusion_runs(
             continue
         outer = left_date
         if (
-            run_date.day == outer.day
+            len(run_indices) <= _CONFUSION_RUN_MAX
+            and run_date.day == outer.day
             and run_date.year == outer.year
             and frozenset({run_date.month, outer.month}) in _MONTH_CONFUSABLES
+        ):
+            drop.update(run_indices)
+
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
+_CONFUSION_RUN_MAX = 3  # max readings a droppable confusion run may have. Every observed
+                        # genuine misread run is 2 windows; a long run is a real session.
+                        # Without this cap the day/month filters mis-fire on A-B-A'-B
+                        # alternation: a REAL 160s 11-26 run between a real 11-25 session
+                        # and a 2-window 11-25 misread got dropped as "confused" (1992 tape
+                        # ~1139-1301s), swallowing 164s into a mislabeled clip.
+
+_DAY_CONFUSABLES: frozenset[frozenset[int]] = frozenset({
+    frozenset({6, 8}),  # 6 and 8 look alike on VHS overlay font (1990 tape: 26 read as 28)
+    frozenset({5, 6}),  # 5 and 6 too (1992 tape: 26 read as 25 for 2 windows at ~1301s,
+                        # creating a phantom 11-25 boundary pair boxing 11-26 content)
+})
+
+
+def _day_digits_confusable(a: int, b: int) -> bool:
+    """True if a and b are equal-length numbers differing in exactly one digit
+    position, and that digit pair is a known confusable (_DAY_CONFUSABLES).
+
+    Both a and b are valid calendar days (1-31), so a tens-digit confusion of
+    6-vs-8 can never occur (no day is in the 60s or 80s) — only ones-digit (or
+    whole single-digit) confusion is reachable in practice, but the comparison
+    is done generically by digit position rather than hardcoding "ones digit".
+    """
+    sa, sb = str(a), str(b)
+    if len(sa) != len(sb):
+        return False
+    diffs = [(da, db) for da, db in zip(sa, sb, strict=True) if da != db]
+    if len(diffs) != 1:
+        return False
+    da, db = diffs[0]
+    return frozenset({int(da), int(db)}) in _DAY_CONFUSABLES
+
+
+def drop_day_confusion_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[float, "datetime | None"]]:
+    """Drop multi-window day-digit confusion misreads that survive drop_date_islands.
+
+    VHS overlay OCR sometimes swaps visually similar day digits for ≥2 consecutive
+    windows, forming a bounce run (A A A [B B] A A A) that looks like a genuine
+    2-reading session and survives the island filter — e.g. 5/26/90 read as
+    5/28/90 for two windows (issue-025, Converse 1990 clip44).
+
+    Confirmed confusable pairs on this font: {6, 8}.
+
+    A run is flagged as a day-confusion misread when all three hold:
+      1. The run is bracketed on both sides by the same outer date.
+      2. The run's date has the same month and year as the outer date.
+      3. run_date.day and outer.day are equal-length numbers differing in
+         exactly one digit position, and that digit pair is in _DAY_CONFUSABLES
+         (see `_day_digits_confusable`).
+
+    Genuine out-of-order sessions (different month, different year, or a day
+    pair not matching the confusable-digit shape) are never dropped.
+
+    Residual risk (mirrors drop_month_confusion_runs — no additional run-length
+    cap beyond "bracketed by identical outer dates," for consistency with the
+    sibling filters): a genuine short session whose day is a confusable-digit
+    twin of both its neighbours (e.g. a real 05-28 session sandwiched between
+    two real 05-26 sessions) is indistinguishable from this misread shape and
+    would incorrectly be dropped. No such case has been observed on the audited
+    tapes; if one turns up, this filter needs a length/other discriminator.
+    """
+    dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
+    if len(dated) < 3:
+        return samples
+
+    runs: list[tuple[date, list[int]]] = []
+    cur_date = dated[0][1].date()
+    cur_idx = [dated[0][0]]
+    for idx, dt in dated[1:]:
+        d = dt.date()
+        if d == cur_date:
+            cur_idx.append(idx)
+        else:
+            runs.append((cur_date, cur_idx))
+            cur_date = d
+            cur_idx = [idx]
+    runs.append((cur_date, cur_idx))
+
+    if len(runs) < 3:
+        return samples
+
+    drop: set[int] = set()
+    for r in range(1, len(runs) - 1):
+        run_date, run_indices = runs[r]
+        left_date = runs[r - 1][0]
+        right_date = runs[r + 1][0]
+        if left_date != right_date:
+            continue
+        outer = left_date
+        if (
+            len(run_indices) <= _CONFUSION_RUN_MAX
+            and run_date.month == outer.month
+            and run_date.year == outer.year
+            and _day_digits_confusable(run_date.day, outer.day)
         ):
             drop.update(run_indices)
 
@@ -1120,7 +1237,17 @@ def _scan_for_transition(
     island filtering), frames that look 'new' but whose date doesn't match are
     treated as intermediate content and kept with the outgoing clip.  This prevents
     isolated intermediate-date footage (e.g. 4 frames of 5/12 between 5/09 and
-    5/19 sessions) from being misidentified as the new session start."""
+    5/19 sessions) from being misidentified as the new session start.
+
+    Once a candidate new-session reading has been confirmed (matches
+    expected_new_date), a LATER reading whose date matches neither the old session
+    nor the expected new date is treated as OCR noise on top of continuing
+    new-session footage (e.g. a digit-confusion misread of the new date, '2/16'
+    read as '2/18') rather than a genuine third session — it is ignored rather than
+    cancelling the candidate and dragging last_old_t past real new-session content,
+    which would leak that content into the outgoing clip's tail (issue-018 tail-leak
+    update, 2026-07-03). A reading that matches the OLD session's own date still
+    cancels the candidate as before — that is a genuine reversion, not noise."""
     any_ocr = False
     last_old_t: float = prev_t
     candidate_new_t: float | None = None
@@ -1135,6 +1262,11 @@ def _scan_for_transition(
         is_new = cam_advance > video_advance + gap_s or cam_advance < -1800
         if is_new:
             if expected_new_date is not None and dt.date() != expected_new_date:
+                if candidate_new_t is not None and dt.date() != prev_dt.date():
+                    # Confirmed new-session candidate already exists, and this
+                    # reading is neither old nor expected-new: noise, not a real
+                    # reversion or third session. Ignore it (see docstring).
+                    continue
                 # Intermediate date: looks new relative to old session but doesn't
                 # match the expected boundary target.  Keep with outgoing clip.
                 candidate_new_t = None
@@ -1266,7 +1398,10 @@ class LongDeadZonePolicy:
     """Refinement for boundaries with span >= SPLICE_DEAD_ZONE_MAX_S.
 
     Two-pass hierarchical scan: coarse sub-sample (~50 pts) to bracket the
-    transition, then dense 1s scan only within [last_old, first_new].
+    transition, then dense 1s scan only within [last_old, first_new]. The overall
+    window is extended REFINE_LOOKBACK_PAD_S seconds before prev_t (see that
+    constant) so a re-verification of prev_t itself can correct for coarse-scan
+    drift, same as ShortSpanPolicy.
     If coarse is all-None (true LDZ), skips dense scan and falls back to coarse_t.
     If coarse is all-old, scans the short tail after the last coarse sample.
     """
@@ -1275,7 +1410,9 @@ class LongDeadZonePolicy:
         self._gap_s = gap_s
         self._interval = interval
 
-    def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult:
+    def place(
+        self, boundary: Boundary, ocr_fn: OcrFn, floor_t: float = 0.0
+    ) -> RefinementResult:
         coarse_t = boundary.video_t
         prev_t = boundary.prev_t
         prev_dt = boundary.prev_dt
@@ -1283,7 +1420,9 @@ class LongDeadZonePolicy:
         span = coarse_t - prev_t
 
         expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
-        window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
+        floor = int(floor_t) + 1 if floor_t > 0.0 else 0
+        window_start = max(0, int(prev_t) + 1 - REFINE_LOOKBACK_PAD_S, floor)
+        window = list(range(window_start, int(coarse_t) + self._interval))
         step = max(2, len(window) // 50)
         coarse_times = window[::step]
         readings: dict[int, Reading] = dict(ocr_fn(coarse_times))
@@ -1316,7 +1455,9 @@ class LongDeadZonePolicy:
 class ShortSpanPolicy:
     """Refinement for boundaries with span < SPLICE_DEAD_ZONE_MAX_S.
 
-    Single dense scan of the full window. Handles three outcomes in priority order:
+    Single dense scan of the full window, extended REFINE_LOOKBACK_PAD_S seconds
+    before prev_t (see that constant) so a re-verification of prev_t itself can
+    correct for coarse-scan drift. Handles three outcomes in priority order:
     1. OCR transition found → content-aware cut across the gap (_place_content_aware):
        at the first garbled-new frame, else end-of-gap when the gap is old/noise.
     2. Garbled new-session OCR (no clean new frame at all) → cut just after last old.
@@ -1328,7 +1469,9 @@ class ShortSpanPolicy:
         self._interval = interval
         self._visual_times = visual_times
 
-    def place(self, boundary: Boundary, ocr_fn: OcrFn) -> RefinementResult:
+    def place(
+        self, boundary: Boundary, ocr_fn: OcrFn, floor_t: float = 0.0
+    ) -> RefinementResult:
         coarse_t = boundary.video_t
         prev_t = boundary.prev_t
         prev_dt = boundary.prev_dt
@@ -1336,7 +1479,9 @@ class ShortSpanPolicy:
         span = coarse_t - prev_t
 
         expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
-        window = list(range(int(prev_t) + 1, int(coarse_t) + self._interval))
+        floor = int(floor_t) + 1 if floor_t > 0.0 else 0
+        window_start = max(0, int(prev_t) + 1 - REFINE_LOOKBACK_PAD_S, floor)
+        window = list(range(window_start, int(coarse_t) + self._interval))
         readings = ocr_fn(window)
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
             window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
@@ -1401,7 +1546,7 @@ def ocr_refinement(
     ldz   = LongDeadZonePolicy(gap_s, interval)
     short = ShortSpanPolicy(gap_s, interval, visual_times)
 
-    def refine(video: str, boundary: Boundary) -> RefinementResult:
+    def refine(video: str, boundary: Boundary, floor_t: float = 0.0) -> RefinementResult:
         coarse_t = boundary.video_t
         prev_t = boundary.prev_t
         prev_dt = boundary.prev_dt
@@ -1413,7 +1558,12 @@ def ocr_refinement(
         ocr_fn = make_ocr_fn(video, crop, tmpdir, workers)
         span = coarse_t - prev_t
         policy: PlacementPolicy = ldz if span >= SPLICE_DEAD_ZONE_MAX_S else short
-        return policy.place(boundary, ocr_fn)
+        # floor_t = the previous boundary's final cut. The REFINE_LOOKBACK_PAD_S
+        # window extension must never reach back across it, or this boundary can
+        # adopt a transition that belongs to its neighbour and emit a cut at or
+        # before the neighbour's cut (crossing cuts, mislabeled span — seen on
+        # the 1992 tape's back-to-back garbled pair at 1301/1307).
+        return policy.place(boundary, ocr_fn, floor_t)
 
     return refine
 
@@ -1794,6 +1944,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     samples = drop_year_misread_runs(samples)
     samples = drop_digit_drop_runs(samples)
     samples = drop_month_confusion_runs(samples)
+    samples = drop_day_confusion_runs(samples)
     filtered: list[tuple[float, datetime]] = filter_ocr_outliers(samples)
     boundaries = find_all_boundaries(filtered, gap_s=config.gap)
 
@@ -1858,7 +2009,7 @@ def run(config: PipelineConfig) -> PipelineResult:
             b = boundary_map.get(vt)
             if b and b.prev_t is not None and b.prev_dt is not None:
                 t_b = time.perf_counter()
-                rr = strategy(config.video, b)
+                rr = strategy(config.video, b, splits[-1])
                 cut_t, method = rr.t, rr.method
                 snap_note = ""
                 if config.enable_scene_snap:
@@ -1866,6 +2017,11 @@ def run(config: PipelineConfig) -> PipelineResult:
                     if off is not None and off != 0.0:
                         snap_note = f" snap={off:+.2f}s"
                         cut_t, method = snapped, "snap"
+                if cut_t <= splits[-1]:
+                    # Monotonicity backstop: no refinement or snap may cross the
+                    # previous cut (cuts partition the timeline; see the
+                    # reconstruction tenet in REQUIREMENTS.md).
+                    cut_t = min(splits[-1] + 1.0, vt)
                 elapsed_b = time.perf_counter() - t_b
                 reason = f" reason={rr.detail}" if rr.detail else ""
                 print(

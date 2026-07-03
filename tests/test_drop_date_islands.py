@@ -11,7 +11,13 @@ a misread surrounded only by None gaps is still detectable as an island.
 """
 from datetime import datetime
 
-from split_homevideo import drop_date_islands, drop_digit_drop_runs, drop_month_confusion_runs, drop_year_misread_runs
+from split_homevideo import (
+    drop_date_islands,
+    drop_day_confusion_runs,
+    drop_digit_drop_runs,
+    drop_month_confusion_runs,
+    drop_year_misread_runs,
+)
 
 
 def mk(*days):
@@ -375,3 +381,100 @@ class TestDropMonthConfusionRuns:
     def test_passthrough_all_same(self):
         s = mk_mo((1,6,1990),(1,6,1990),(1,6,1990),(1,6,1990))
         assert drop_month_confusion_runs(s) == s
+
+
+# ---------------------------------------------------------------------------
+# drop_day_confusion_runs — catches multi-window day-digit confusion misreads
+# where OCR swaps visually similar day digits (6↔8) for ≥2 consecutive
+# windows, forming a bounce run that survives drop_date_islands (issue-025:
+# Converse 1990 clip44, 5/26/90 misread as 5/28/90).
+# ---------------------------------------------------------------------------
+
+class TestDropDayConfusionRuns:
+    def test_day26_vs_day28_confusion_dropped(self):
+        # 1990-05-26 ×2, 1990-05-28 ×2, 1990-05-26 ×2 — issue-025 clip44 pattern
+        s = mk_mo((5,26,1990),(5,26,1990),(5,28,1990),(5,28,1990),(5,26,1990),(5,26,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,26,1990)] * 4
+
+    def test_single_digit_day_6_vs_8_confusion_dropped(self):
+        # 1990-05-06 ×2, 1990-05-08 ×2, 1990-05-06 ×2 — same confusable pair, single digit
+        s = mk_mo((5,6,1990),(5,6,1990),(5,8,1990),(5,8,1990),(5,6,1990),(5,6,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,6,1990)] * 4
+
+    def test_day_not_in_confusable_pair_kept(self):
+        # 1990-05-26 ×2, 1990-05-27 ×2, 1990-05-26 ×2 — 6 and 7 not confusable
+        s = mk_mo((5,26,1990),(5,26,1990),(5,27,1990),(5,27,1990),(5,26,1990),(5,26,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,26,1990),(5,26,1990),(5,27,1990),(5,27,1990),(5,26,1990),(5,26,1990)]
+
+    def test_month_differs_kept(self):
+        # Outer dates same (1990-05-26), middle run same year + confusable-shaped day
+        # BUT different month → genuine session, must not drop
+        s = mk_mo((5,26,1990),(5,26,1990),(6,28,1990),(6,28,1990),(5,26,1990),(5,26,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,26,1990),(5,26,1990),(6,28,1990),(6,28,1990),(5,26,1990),(5,26,1990)]
+
+    def test_different_day_genuine_outoforder_kept(self):
+        # 1990-09-01 between 1990-03-25 and 1990-04-08 — different month, keep
+        s = mk_mo((3,25,1990),(3,25,1990),(9,1,1990),(9,1,1990),(4,8,1990),(4,8,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(3,25,1990),(3,25,1990),(9,1,1990),(9,1,1990),(4,8,1990),(4,8,1990)]
+
+    def test_none_gaps_around_confusion_run_still_caught(self):
+        # None gaps don't protect the confusion run
+        s = mk_mo((5,26,1990),(5,26,1990),None,(5,28,1990),(5,28,1990),None,(5,26,1990),(5,26,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,26,1990)] * 4
+
+    def test_outer_sides_differ_not_dropped(self):
+        # 1990-05-26 → 1990-05-28 → 1990-05-30: outer sides differ, keep all
+        s = mk_mo((5,26,1990),(5,26,1990),(5,28,1990),(5,28,1990),(5,30,1990),(5,30,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,26,1990),(5,26,1990),(5,28,1990),(5,28,1990),(5,30,1990),(5,30,1990)]
+
+    def test_two_digit_positions_differ_kept(self):
+        # day 16 vs day 28: both tens (1 vs 2) and ones (6 vs 8) differ — not a
+        # single-digit-position confusion, must not drop even though 6/8 appear
+        s = mk_mo((5,16,1990),(5,16,1990),(5,28,1990),(5,28,1990),(5,16,1990),(5,16,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,16,1990),(5,16,1990),(5,28,1990),(5,28,1990),(5,16,1990),(5,16,1990)]
+
+    def test_digit_count_mismatch_kept(self):
+        # day 6 (1 digit) vs day 18 (2 digits): different length, must not drop
+        s = mk_mo((5,6,1990),(5,6,1990),(5,18,1990),(5,18,1990),(5,6,1990),(5,6,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,6,1990),(5,6,1990),(5,18,1990),(5,18,1990),(5,6,1990),(5,6,1990)]
+
+    def test_single_reading_island_does_not_crash(self):
+        # A lone differing reading (drop_date_islands' job, not this filter's) —
+        # must pass through without error.
+        s = mk_mo((5,26,1990),(5,26,1990),(5,28,1990),(5,26,1990),(5,26,1990))
+        result = drop_day_confusion_runs(s)
+        assert isinstance(result, list)
+
+    def test_passthrough_too_short(self):
+        s = mk_mo((5,26,1990),(5,28,1990))
+        assert drop_day_confusion_runs(s) == s
+
+    def test_passthrough_all_same(self):
+        s = mk_mo((5,26,1990),(5,26,1990),(5,26,1990),(5,26,1990))
+        assert drop_day_confusion_runs(s) == s
+
+    def test_day26_vs_day25_confusion_dropped(self):
+        # 1992 tape phantom at ~1301s: 11/26 read as 11/25 for 2 windows
+        # (day ones-digit 6 <-> 5), bracketed by 11/26 runs - created a phantom
+        # boundary pair boxing mislabeled 11-26 content
+        s = mk_mo((11,26,1992),(11,26,1992),(11,25,1992),(11,25,1992),(11,26,1992),(11,26,1992))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(11,26,1992)] * 4
+    def test_long_real_run_between_confusable_neighbours_kept(self):
+        # Alternation hazard (1992 tape ~1139-1301s): a REAL long 11-26 session
+        # sits between a real 11-25 session and a 2-window 11-25 misread. The
+        # interior 11-26 run is bracketed by identical confusable dates but is
+        # far too long to be a misread - must be kept (_CONFUSION_RUN_MAX).
+        s = mk_mo(*([(11,25,1992)]*3 + [(11,26,1992)]*8 + [(11,25,1992)]*2 + [(11,26,1992)]*4))
+        result = mdy(drop_day_confusion_runs(s))
+        # the 2-window 11-25 misread drops; the 8-reading real 11-26 run stays
+        assert result == [(11,25,1992)]*3 + [(11,26,1992)]*8 + [(11,26,1992)]*4

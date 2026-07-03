@@ -6,6 +6,7 @@ import unittest.mock as mock
 from datetime import datetime
 
 from split_homevideo import (
+    REFINE_LOOKBACK_PAD_S,
     SPLICE_DEAD_ZONE_MAX_S,
     Boundary,
     Reading,
@@ -446,14 +447,114 @@ class TestRefineSplit:
         assert t == 20.0
         assert method == "ocr"
 
+    # --- tail-leak fixes (issue-018, 2026-07-03 update) ---
+
+    def test_confirmed_candidate_not_cancelled_by_later_offdate_misread(self):
+        # Mirrors the real 2/11->2/16 tail leak (b15, 2.6s leak): a genuine
+        # new-session frame (2/16) is confirmed, but a LATER frame in the same gap
+        # misreads the day as 2/18 (digit confusion — neither the old session's
+        # date 2/11 nor the true new date 2/16) before OCR recovers 2/16 again.
+        # Before the fix, this off-date reading was treated exactly like the
+        # e0ab5bc intermediate-date case: it cancelled the confirmed candidate and
+        # dragged last_old_t past t=15's real new-session content, leaking it into
+        # the outgoing clip's tail. The fix only lets a mismatched reading cancel
+        # a candidate when candidate_new_t is still None (i.e. before any new
+        # session has been confirmed) — see _scan_for_transition.
+        prev_dt = datetime(1990, 2, 11, 8, 55)
+        cam_after = datetime(1990, 2, 16, 17, 19)
+        _OLD = "8:55 AM\n 2/11/90"
+        _NEW = "5:19 PM\n 2/16/90"
+        _MISREAD = "5:19 PM\n 2/18/90"   # day 16 misread as 18: neither old nor new
+        paths = {13: "/tmp/od_f13.bmp", 15: "/tmp/od_f15.bmp",
+                  16: "/tmp/od_f16.bmp", 18: "/tmp/od_f18.bmp"}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0, prev_dt=prev_dt, cam_after=cam_after,
+            extract_side_effect=extract,
+            ocr_map={paths[13]: _OLD, paths[15]: _NEW, paths[16]: _MISREAD, paths[18]: _NEW},
+            interval=10,
+        )
+        # Without the fix: t=16 cancels the t=15 candidate and advances
+        # last_old_t to 16; first_new_t becomes 18 -> cut lands at 17, leaking
+        # t=15's confirmed new-session frame into the outgoing clip.
+        # With the fix: t=16 is ignored (candidate already confirmed at t=15);
+        # last_old_t stays at 13, first_new_t stays at 15 -> cut = max(14, 14) = 14.
+        assert t == 14.0
+        assert method == "ocr"
+
+    def test_reversion_to_old_date_still_cancels_candidate(self):
+        # Companion to the test above: a later reading that matches the OLD
+        # session's own date (a genuine reversion, the original 606d1ca
+        # false-positive-rejection case) must still cancel the candidate — the
+        # fix only protects against a MISMATCHED (neither old nor new) reading.
+        prev_dt = datetime(1990, 2, 11, 8, 55)
+        cam_after = datetime(1990, 2, 16, 17, 19)
+        _OLD = "8:55 AM\n 2/11/90"
+        _NEW = "5:19 PM\n 2/16/90"
+        paths = {13: "/tmp/rev_f13.bmp", 15: "/tmp/rev_f15.bmp",
+                  16: "/tmp/rev_f16.bmp", 18: "/tmp/rev_f18.bmp"}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0, prev_dt=prev_dt, cam_after=cam_after,
+            extract_side_effect=extract,
+            # t=15 looks like a new-session candidate, but t=16 reverts to the
+            # OLD session's own date — a real false positive, not noise.
+            ocr_map={paths[13]: _OLD, paths[15]: _NEW, paths[16]: _OLD, paths[18]: _NEW},
+            interval=10,
+        )
+        # last_old_t=16 (reversion confirmed), first_new_t=18 -> cut = max(17, 17) = 17.
+        assert t == 17.0
+        assert method == "ocr"
+
+    def test_stale_prev_t_recovered_by_lookback_pad(self):
+        # Mirrors the real b27/b11/b47 tail leaks (6.6s/4.1s/3.0s): prev_t is a
+        # coarse-scan anchor with nothing legible from prev_t onward in the
+        # un-padded window, because the true transition happened a few seconds
+        # *before* prev_t — the coarse scan's fps-normalized bucket label can
+        # disagree with a fresh single-frame re-extraction at the same nominal
+        # time (see REFINE_LOOKBACK_PAD_S). Without the lookback pad this reads
+        # as a pure OCR dead zone and falls back to coarse_t (wrong — nowhere
+        # near the true change); with the pad, the dense scan re-examines the
+        # seconds before prev_t and finds the real old/new frames there.
+        prev_dt = datetime(1990, 6, 3, 19, 6)
+        cam_after = datetime(1990, 6, 12, 18, 32)
+        _OLD = "7:06 PM\n 6/ 3/90"
+        _NEW = "6:32 PM\n 6/12/90"
+        paths = {15: "/tmp/lb_f15.bmp", 17: "/tmp/lb_f17.bmp"}
+
+        def extract(v, t, c, d):
+            return paths.get(t)
+
+        t, method = _run(
+            coarse_t=40.0, prev_t=30.0, prev_dt=prev_dt, cam_after=cam_after,
+            extract_side_effect=extract,
+            ocr_map={paths[15]: _OLD, paths[17]: _NEW},
+            interval=10,
+        )
+        # Without the pad: window=range(31,50), nothing legible in it -> pure
+        # dead zone -> falls back to coarse_t=40 (far from the true 15/17 change).
+        # With the pad: window starts at max(0, 31-REFINE_LOOKBACK_PAD_S)=11,
+        # includes t=15 (old) and t=17 (new) -> cut = max(16, 16) = 16.
+        assert t == 16.0
+        assert method == "ocr"
+
 
 # ---------------------------------------------------------------------------
 # Two-pass hierarchical scan (LDZ-sized windows, span >= SPLICE_DEAD_ZONE_MAX_S)
 # ---------------------------------------------------------------------------
 
 # Window parameters: prev_t=0, coarse_t=200, interval=1 → span=200 >= 120 → two-pass.
-# window = range(1, 201) → 200 elements; step = max(2, 200//50) = 4.
-# coarse_times = [1, 5, 9, ..., 197] (50 elements); tail = [198, 199, 200].
+# window = range(max(0, 1-REFINE_LOOKBACK_PAD_S), 201) = range(0, 201) (prev_t=0 is near
+# the video start, so the lookback pad clamps to 0 instead of extending the full pad) →
+# 201 elements; step = max(2, 201//50) = 4.
+# coarse_times = [0, 4, 8, ..., 200] (51 elements); tail = [] (200 is both the last coarse
+# sample and the last window element).
 _LDZ_PREV_T = 0.0
 _LDZ_COARSE_T = 200.0
 _LDZ_INTERVAL = 1
@@ -541,19 +642,20 @@ class TestRefineSplitTwoPass:
         assert method == "coarse"
 
     def test_two_pass_transition_at_start(self):
-        # Transition at very first window frame t=1 → cut = coarse_t = max(0+1, 1-1)=max(1,0)=1.
-        path1 = "/tmp/f1.bmp"
+        # Transition at the very first window frame (t=0, the window start after the
+        # lookback pad clamps to 0) → cut = max(prev_t+1, t-1) = max(1, -1) = 1.
+        path0 = "/tmp/f0.bmp"
 
         def extract(v, t, c, d):
-            return path1 if int(t) == 1 else None
+            return path0 if int(t) == 0 else None
 
         t, method, calls = self._run_ldz_with_call_count(
             extract_side_effect=extract,
-            ocr_map={path1: _NEW},
+            ocr_map={path0: _NEW},
         )
-        assert t == 1.0  # max(prev_t+1, t-1) = max(1, 0) = 1
+        assert t == 1.0  # max(prev_t+1, t-1) = max(1, -1) = 1
         assert method == "ocr"
-        assert calls <= 52  # coarse only (t=1 is first coarse sample, dense = empty)
+        assert calls <= 53  # coarse only (t=0 is first coarse sample, dense = empty)
 
     def test_two_pass_all_old_in_coarse_scans_tail(self):
         # All coarse samples confirm old session; transition at t=199 (in tail).
@@ -597,9 +699,12 @@ class TestRefineSplitTwoPass:
 
     def test_two_pass_span_below_threshold_uses_full_scan(self):
         # span = SPLICE_DEAD_ZONE_MAX_S - 1 < threshold → full dense scan (SDZ path).
-        # Verify all window frames are attempted.
+        # Verify all window frames are attempted. Window start is padded back by
+        # REFINE_LOOKBACK_PAD_S (clamped at 0, so with prev_t=0 it just adds the one
+        # frame at t=0 that the un-padded window would have excluded).
         sdz_coarse_t = _LDZ_PREV_T + SPLICE_DEAD_ZONE_MAX_S - 1  # span=119 < 120
-        window_len = int(sdz_coarse_t - _LDZ_PREV_T) + _LDZ_INTERVAL - 1  # ≈119
+        window_start = max(0.0, _LDZ_PREV_T + 1 - REFINE_LOOKBACK_PAD_S)
+        window_len = int(sdz_coarse_t - window_start) + _LDZ_INTERVAL  # ≈120
 
         b = _boundary(sdz_coarse_t, _LDZ_PREV_T)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -782,3 +887,46 @@ class TestOcrRefinementNoPrev:
         assert result.t == 100.0
         assert result.method == "coarse"
         assert result.detail == "no-prev"
+
+
+class TestFloorClampsLookback:
+    """The REFINE_LOOKBACK_PAD_S window extension must never reach back across
+    the previous boundary's final cut (floor_t). Without the clamp, a boundary
+    6s after its neighbour scans ~20s back, adopts the neighbour's transition,
+    and emits a crossing cut (1992 tape, garbled pair at 1301/1307: refined
+    cuts came out 1304 then 1301, boxing a mislabeled 19-minute span)."""
+
+    def test_window_never_reaches_before_floor(self):
+        seen: list[float] = []
+
+        def recording_extract(video, t, crop, tmpdir):
+            seen.append(t)
+            return f"/tmp/floor_f{t}.bmp"
+
+        b = _boundary(106.0, 100.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = ocr_refinement(_GAP, _CROP, tmpdir, 3, None)
+            with mock.patch("split_homevideo.extract_frame", side_effect=recording_extract), \
+                 mock.patch("split_homevideo.ocr_batch", return_value={}):
+                strategy("vid.mp4", b, 104.0)
+        assert seen, "dense scan should have requested frames"
+        assert min(seen) >= 105.0, (
+            f"window reached {min(seen)}, crossing floor_t=104.0"
+        )
+
+    def test_without_floor_pad_reaches_back(self):
+        # Sanity check of the pad itself: with no floor the same boundary's
+        # window starts REFINE_LOOKBACK_PAD_S before prev_t.
+        seen: list[float] = []
+
+        def recording_extract(video, t, crop, tmpdir):
+            seen.append(t)
+            return f"/tmp/floor2_f{t}.bmp"
+
+        b = _boundary(106.0, 100.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            strategy = ocr_refinement(_GAP, _CROP, tmpdir, 3, None)
+            with mock.patch("split_homevideo.extract_frame", side_effect=recording_extract), \
+                 mock.patch("split_homevideo.ocr_batch", return_value={}):
+                strategy("vid.mp4", b)
+        assert seen and min(seen) == 101 - REFINE_LOOKBACK_PAD_S
