@@ -716,6 +716,94 @@ class TestRefineSplitTwoPass:
 
 
 # ---------------------------------------------------------------------------
+# Field-phase retry (issue-027): interlaced VHS fields can differ, so a frame
+# that reads None at integer t may be legible at t+0.5 (the other field). The
+# retry is scoped to None frames inside the gap only — see
+# _retry_gap_at_half_phase.
+# ---------------------------------------------------------------------------
+
+class TestFieldPhaseRetry:
+    def test_half_phase_read_moves_cut_earlier(self):
+        # t=14 confirms old session. t=15,16,17 are None at integer phase (extract
+        # fails), but t=15.5 is legible on the other field and confirms the jump.
+        # Without the retry, the scan would walk past the None gap to the next
+        # legible integer frame at t=18, placing first_new_t there instead.
+        path14 = "/tmp/frame_14.000.bmp"
+        path15h = "/tmp/frame_15.500.bmp"
+        path18 = "/tmp/frame_18.000.bmp"
+
+        def extract(v, t, c, d):
+            return {14: path14, 15.5: path15h, 18: path18}.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map={
+                path14: "5:00 PM\n 1/ 4/90",   # cam_advance=0 → old confirmed
+                path15h: "5:10 PM\n 1/ 4/90",  # cam_advance=600s → jump, found at 15.5
+                path18: "5:10 PM\n 1/ 4/90",   # would have been first_new_t pre-fix
+            },
+        )
+        # last_old_t=14, first_new_t=15.5 (same date) → max(15, 14.5) = 15.0.
+        # Pre-fix (no retry, first_new_t=18): max(15, 17) = 17.0 — 2s later.
+        assert t == 15.0
+        assert method == "ocr"
+
+    def test_no_none_frames_in_gap_unchanged(self):
+        # No None frames anywhere in the gap → the retry must never fire, and the
+        # result must be byte-identical to the pre-fix behavior (no half-second
+        # extract_frame calls at all).
+        path14 = "/tmp/frame_14.000.bmp"
+        path15 = "/tmp/frame_15.000.bmp"
+        calls: list[float] = []
+
+        def extract(v, t, c, d):
+            calls.append(t)
+            return {14: path14, 15: path15}.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map={
+                path14: "5:00 PM\n 1/ 4/90",
+                path15: "5:10 PM\n 1/ 4/90",
+            },
+        )
+        assert t == 15.0  # max(14+1, 15-1) = max(15, 14) = 15
+        assert method == "ocr"
+        assert all(c == int(c) for c in calls)  # never probed a half-second t
+
+    def test_half_phase_reversion_to_old_session_handled(self):
+        # t=14 old confirmed. t=15,16,17 None at integer phase. Retry frames:
+        # t=15.5 misreads as a jump (false candidate); t=16.5 reverts to the old
+        # session, correctly cancelling that candidate per _scan_for_transition's
+        # existing reversion logic — last_old_t advances to 16.5. True new session
+        # is confirmed later at t=18.
+        path14 = "/tmp/frame_14.000.bmp"
+        path15h = "/tmp/frame_15.500.bmp"
+        path16h = "/tmp/frame_16.500.bmp"
+        path18 = "/tmp/frame_18.000.bmp"
+
+        def extract(v, t, c, d):
+            return {14: path14, 15.5: path15h, 16.5: path16h, 18: path18}.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0,
+            extract_side_effect=extract,
+            ocr_map={
+                path14: "5:00 PM\n 1/ 4/90",   # old confirmed, last_old_t=14
+                path15h: "5:10 PM\n 1/ 4/90",  # false-positive jump candidate=15.5
+                path16h: "5:01 PM\n 1/ 4/90",  # reverts: old confirmed, last_old_t=16.5
+                path18: "5:10 PM\n 1/ 4/90",   # real jump, first_new_t=18
+            },
+        )
+        # max(last_old_t+1, first_new_t-1) = max(17.5, 17) = 17.5.
+        # Without the half-phase probes this would be max(15, 17) = 17.
+        assert t == 17.5
+        assert method == "ocr"
+
+
+# ---------------------------------------------------------------------------
 # Content-aware gap placement: classify garbled gap frames as old/new/noise so
 # the cut keeps new-date content out of the outgoing clip (REQUIREMENTS L23) but
 # still keeps old-date / noise garble with it (ADR-0001). Strings below are real

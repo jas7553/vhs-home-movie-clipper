@@ -138,7 +138,7 @@ class Reading(NamedTuple):
     raw: str
 
 
-OcrFn = Callable[[list[int]], dict[int, Reading]]
+OcrFn = Callable[[list[float]], dict[float, Reading]]
 
 
 class PlacementPolicy(Protocol):
@@ -1374,10 +1374,10 @@ def fuse_boundaries(
 
 
 def _extract_and_ocr_window(
-    video: str, times: list[int], crop: str, tmpdir: str, workers: int,
-) -> tuple[dict[int, str | None], dict[str, str]]:
+    video: str, times: list[float], crop: str, tmpdir: str, workers: int,
+) -> tuple[dict[float, str | None], dict[str, str]]:
     """Extract frames for the given timestamps in parallel, OCR the valid ones."""
-    paths: dict[int, str | None] = {}
+    paths: dict[float, str | None] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_t = {
             executor.submit(extract_frame, video, float(t), crop, tmpdir): t
@@ -1390,8 +1390,8 @@ def _extract_and_ocr_window(
 
 
 def _scan_for_transition(
-    times: list[int],
-    readings: dict[int, Reading],
+    times: list[float],
+    readings: dict[float, Reading],
     prev_dt: datetime,
     prev_t: float,
     gap_s: int,
@@ -1453,6 +1453,39 @@ def _scan_for_transition(
     return any_ocr, last_old_t, candidate_new_t
 
 
+def _retry_gap_at_half_phase(
+    ocr_fn: OcrFn,
+    readings: dict[float, Reading],
+    window: list[float],
+    last_old_t: float,
+    first_new_t: float | None,
+) -> list[float] | None:
+    """Retry None-reading frames inside the critical gap at the other interlaced
+    field, t+0.5 (issue-027). VHS is interlaced: a timestamp can be cleanly
+    legible on one field and garbled/blank on the other, so an integer-second
+    frame reading None does not mean the content there is unreadable — only that
+    this field is. Retrying is restricted to the gap — between last_old_t and
+    first_new_t, or after last_old_t when no new-session frame was found at all —
+    so the cost stays a handful of extra extractions per boundary rather than
+    doubling the whole dense scan (dense-scan-theory memory).
+
+    Returns the merged, sorted time list (original window ints plus any inserted
+    half-second points) for a second _scan_for_transition pass, or None when
+    there was nothing to retry — callers must fall back to the original window
+    unchanged so behavior is byte-identical when no None frames exist in the gap.
+    """
+    hi = first_new_t if first_new_t is not None else float(window[-1]) + 1.0
+    gap_none_times = [
+        t for t in window
+        if last_old_t < t < hi and readings.get(t) is not None and readings[t].dt is None
+    ]
+    if not gap_none_times:
+        return None
+    half_times = [t + 0.5 for t in gap_none_times]
+    readings.update(ocr_fn(half_times))
+    return sorted(set(window) | set(half_times))
+
+
 # Lenient date-field extractors for garbled gap frames. The strict parser
 # (parse_timestamp) rejects these — missing/garbled month, doubled slash, etc. —
 # but the day immediately before the two-digit year and the leading month before
@@ -1502,8 +1535,8 @@ def _gap_date_class(raw: str, old_dt: datetime, new_dt: datetime) -> str:
 
 
 def _place_content_aware(
-    window: list[int],
-    readings: dict[int, Reading],
+    window: list[float],
+    readings: dict[float, Reading],
     last_old_t: float,
     first_new_t: float,
     old_dt: datetime,
@@ -1557,9 +1590,9 @@ def _place_content_aware(
 
 def make_ocr_fn(video: str, crop: str, tmpdir: str, workers: int) -> OcrFn:
     """Production OcrFn: extracts frames via ffmpeg, parses timestamps via OCR binary."""
-    def ocr_fn(times: list[int]) -> dict[int, Reading]:
+    def ocr_fn(times: list[float]) -> dict[float, Reading]:
         paths, raw = _extract_and_ocr_window(video, times, crop, tmpdir, workers)
-        out: dict[int, Reading] = {}
+        out: dict[float, Reading] = {}
         for t in times:
             text = raw.get(p, "") if (p := paths.get(t)) is not None else ""
             out[t] = Reading(parse_timestamp(text) if p is not None else None, text)
@@ -1595,16 +1628,16 @@ class LongDeadZonePolicy:
         expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
         floor = int(floor_t) + 1 if floor_t > 0.0 else 0
         window_start = max(0, int(prev_t) + 1 - REFINE_LOOKBACK_PAD_S, floor)
-        window = list(range(window_start, int(coarse_t) + self._interval))
+        window: list[float] = list(range(window_start, int(coarse_t) + self._interval))
         step = max(2, len(window) // 50)
         coarse_times = window[::step]
-        readings: dict[int, Reading] = dict(ocr_fn(coarse_times))
+        readings: dict[float, Reading] = dict(ocr_fn(coarse_times))
         any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
             coarse_times, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
         if first_new_c is not None:
             lo, hi = int(last_old_c), int(first_new_c)
-            dense_times = [t for t in range(lo, hi + 1) if t not in readings]
+            dense_times: list[float] = [t for t in range(lo, hi + 1) if t not in readings]
             if dense_times:
                 readings.update(ocr_fn(dense_times))
         elif any_ocr_c:
@@ -1616,8 +1649,19 @@ class LongDeadZonePolicy:
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
             window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
+        # Interlaced field-phase retry (issue-027): a None-reading integer-second
+        # frame inside the gap may be legible on the other field, t+0.5. Gated on
+        # any_ocr — an all-None window is a true Long Dead Zone (unreadable
+        # footage, not a field-phase miss) and must keep the coarse-only fast path.
+        if any_ocr:
+            merged = _retry_gap_at_half_phase(ocr_fn, readings, window, last_old_t, first_new_t)
+            if merged is not None:
+                window = merged
+                any_ocr, last_old_t, first_new_t = _scan_for_transition(
+                    window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+                )
         if first_new_t is not None:
-            new_dt = readings[int(first_new_t)].dt
+            new_dt = readings[first_new_t].dt
             cut = _place_content_aware(window, readings, last_old_t, first_new_t, prev_dt, new_dt)
             return RefinementResult(cut, "ocr", "")
         detail = f"LDZ {span:.0f}s" if not any_ocr else "all-old-in-window"
@@ -1654,14 +1698,25 @@ class ShortSpanPolicy:
         expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
         floor = int(floor_t) + 1 if floor_t > 0.0 else 0
         window_start = max(0, int(prev_t) + 1 - REFINE_LOOKBACK_PAD_S, floor)
-        window = list(range(window_start, int(coarse_t) + self._interval))
+        window: list[float] = list(range(window_start, int(coarse_t) + self._interval))
         readings = ocr_fn(window)
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
             window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
+        # Interlaced field-phase retry (issue-027): a None-reading integer-second
+        # frame inside the gap may be legible on the other field, t+0.5. Gated on
+        # any_ocr — an all-None window is a true Splice Dead Zone, not a
+        # field-phase miss, and falls through to the visual-anchor/coarse path.
+        if any_ocr:
+            merged = _retry_gap_at_half_phase(ocr_fn, readings, window, last_old_t, first_new_t)
+            if merged is not None:
+                window = merged
+                any_ocr, last_old_t, first_new_t = _scan_for_transition(
+                    window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+                )
 
         if first_new_t is not None:
-            new_dt = readings[int(first_new_t)].dt
+            new_dt = readings[first_new_t].dt
             cut = _place_content_aware(
                 window, readings, last_old_t, first_new_t, prev_dt, new_dt,
                 self._visual_times,
