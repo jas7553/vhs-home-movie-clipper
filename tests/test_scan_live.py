@@ -23,7 +23,11 @@ _TS = "5:01 PM\n 1/ 4/90"
 
 class TestScanLive:
     def _run(self, paths, ocr):
+        # extract_frame backs the targeted preprocessing fallback (phase 2); mocked to
+        # fail uniformly so tests that leave a window fully unsolved after phase 1 (no
+        # entry in `ocr`) don't trip the real-ffmpeg guard in conftest.py.
         with mock.patch("split_homevideo.extract_all_frames", return_value=paths), \
+             mock.patch("split_homevideo.extract_frame", return_value=None), \
              mock.patch("split_homevideo.ocr_batch", return_value=ocr):
             return scan("fake.mp4", _INTERVAL, _CROP, cache_path=None)
 

@@ -23,6 +23,7 @@ import os
 import re
 import resource
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -492,6 +493,119 @@ def fill_timeonly_dates(
     return result
 
 
+def _fallback_window_frame_times(t_last: float, interval: int) -> list[float]:
+    """Video timestamps of the FRAMES_PER_SAMPLE frames making up the window ending at t_last.
+
+    extract_all_frames samples at a fixed cadence of interval/FRAMES_PER_SAMPLE seconds
+    (its `fps=FRAMES_PER_SAMPLE/interval` filter), so a window's own frame times are fully
+    determined by its last-frame time alone — no dependency on the frame's original bucket
+    index. That lets the targeted fallback (and a resumed checkpoint, which only has the
+    cached t_last values to work from) re-target a window without ever having seen the
+    original whole-tape decode.
+    """
+    step = interval / FRAMES_PER_SAMPLE
+    return [t_last - k * step for k in range(FRAMES_PER_SAMPLE - 1, -1, -1)]
+
+
+# Windows per chunk in the targeted fallback pass. Each preprocessed frame is a ~3.5MB
+# bgr24 BMP (the _VF_PREPROCESS chain ends in eq, which promotes the gray frame back to
+# a format the BMP encoder writes as bgr24 — measured 3.49MB at the default crop's 4x
+# upscale, hwaccel and software decode identical), so a chunk's transient footprint is
+# ~ 256 windows x FRAMES_PER_SAMPLE x 3.5MB =~ 2.7GB, deleted before the next chunk
+# starts. This bounds fallback disk usage by CHUNK size, not unread-window count —
+# issue-028's original per-window estimate assumed ~1.2MB/frame and undershot 3x.
+_FALLBACK_CHUNK_WINDOWS = 256
+
+
+def _run_targeted_fallback(
+    video: str, crop: str, interval: int, window_ends: list[float], tmpdir: str, workers: int,
+) -> dict[float, tuple[datetime | None, str | None]]:
+    """Preprocessing fallback restricted to the given unread windows (issue-028).
+
+    The old fallback re-decoded the ENTIRE tape a second time through the heavier
+    _VF_PREPROCESS chain just to reach the few thousand windows crop-only couldn't read —
+    at --interval 1 that was ~75GB+ of transient frames and could exhaust the disk. This
+    instead seeks directly to each unread window's FRAMES_PER_SAMPLE timestamps via
+    extract_frame — the same single-frame primitive ocr_refinement's dense scan already
+    uses — in parallel, in chunks of _FALLBACK_CHUNK_WINDOWS windows whose frames are
+    deleted as soon as the chunk is OCR'd. Transient disk is therefore bounded by the
+    chunk size (~2.7GB), independent of both tape length and unread-window count.
+
+    Returns {t_last: (dt, text)} for every window in window_ends, with the same
+    (dt, text) shape _vote_bucket always returns — (None, None) for a window still
+    unreadable after the fallback, (None, text) for a time-only recovery.
+    """
+    results: dict[float, tuple[datetime | None, str | None]] = {}
+    for ci in range(0, len(window_ends), _FALLBACK_CHUNK_WINDOWS):
+        chunk = window_ends[ci:ci + _FALLBACK_CHUNK_WINDOWS]
+        chunk_dir = os.path.join(tmpdir, f"chunk_{ci}")
+        os.makedirs(chunk_dir)
+        jobs = [(t_last, t) for t_last in chunk
+                for t in _fallback_window_frame_times(t_last, interval)]
+
+        paths: dict[tuple[float, float], str | None] = {}
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            future_to_job = {
+                executor.submit(extract_frame, video, t, crop, chunk_dir, True): (t_last, t)
+                for t_last, t in jobs
+            }
+            for future in as_completed(future_to_job):
+                paths[future_to_job[future]] = future.result()
+        finally:
+            # cancel_futures: if we're unwinding because of an interrupt (SIGTERM ->
+            # KeyboardInterrupt mid-pass, see main()), drop everything not yet started
+            # instead of waiting out the rest of the chunk — only the (<=workers)
+            # already-running extractions finish before the caller's TemporaryDirectory
+            # cleans up, keeping the kill responsive.
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        buckets: dict[float, list[str]] = {}
+        for (t_last, _t), p in paths.items():
+            if p is not None:
+                buckets.setdefault(t_last, []).append(p)
+        valid_paths = [p for ps in buckets.values() for p in ps]
+        ocr = ocr_batch(valid_paths)
+        for t_last in chunk:
+            results[t_last] = _vote_bucket(buckets.get(t_last, []), ocr)
+        # Free this chunk's frames before extracting the next — this is what caps the
+        # pass's transient disk at one chunk's worth.
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+    return results
+
+
+def _write_scan_cache(
+    cache_path: str,
+    interval: int,
+    crop: str,
+    sorted_results: list[tuple[float, tuple[datetime | None, str | None]]],
+    fallback_done: bool,
+) -> None:
+    """Persist scan() results to cache_path.
+
+    fallback_done=False writes a CHECKPOINT: the crop-only (phase 1) pass has completed,
+    but the preprocessing fallback (phase 2) has not run yet. Its shape is identical to a
+    complete cache (same "samples" list, with still-unsolved windows recorded as null text)
+    — the flag is what stops scan() from treating it as a finished scan. fallback_done=True
+    writes a complete cache. A cache with no "fallback_done" key at all — every cache
+    written before issue-028 — is a complete scan by construction; scan() defaults a
+    missing key to True so existing caches for other tapes keep working unchanged.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump({
+            "cache_format": _CACHE_FORMAT,
+            "interval": interval,
+            "crop": crop,
+            "vf_preprocess": _VF_PREPROCESS,
+            "frames_per_sample": FRAMES_PER_SAMPLE,
+            "fallback_done": fallback_done,
+            "samples": [(t, text) for t, (_, text) in sorted_results],
+        }, f)
+    tag = "cached" if fallback_done else "checkpointed (fallback pending)"
+    print(f"  (scan {tag} to {cache_path})")
+
+
 def scan(
     video: str, interval: int, crop: str, cache_path: str | None = None
 ) -> list[tuple[float, datetime | None]]:
@@ -499,22 +613,75 @@ def scan(
 
     If cache_path is given, load from it when it exists (and matches interval+crop),
     otherwise scan and save results there for fast re-runs with different --gap values.
+
+    Checkpoint semantics (issue-028): the crop-only pass (phase 1 — the expensive,
+    whole-tape decode) is saved to cache_path with "fallback_done": false BEFORE the
+    preprocessing fallback (phase 2, now a targeted seek over only the unread windows —
+    see _run_targeted_fallback) runs, so a crash during phase 2 never loses phase 1's
+    work. Loading a cache with "fallback_done": false is NOT a cache hit: scan() resumes
+    by running phase 2 over just the still-unread windows (the samples whose text is
+    null) and rewrites the cache with "fallback_done": true when done. A cache with
+    fallback_done missing or true is a complete scan and is returned directly, exactly as
+    before this change.
+
+    Temp-directory hygiene: TemporaryDirectory(ignore_cleanup_errors=True) below is
+    defense-in-depth for issue-028's stranded-tempdir crash. Root cause: shutil.rmtree
+    (what TemporaryDirectory.cleanup() uses) can itself raise ENOSPC on APFS when the disk
+    is at absolute zero free space — deleting a file still needs a little scratch space for
+    the copy-on-write metadata update — so a disk-exhaustion crash could make cleanup fail
+    outright and strand the whole directory instead of shrinking it. The real fix is
+    _run_targeted_fallback bounding transient usage so the disk doesn't reach that state in
+    the first place; this flag is only a second line of defense so a best-effort delete
+    still happens if it ever does. Neither this flag nor anything else in userspace can
+    help against SIGKILL (or an unhandled SIGTERM — see main()'s signal.signal call): those
+    terminate the process before any cleanup code, including this context manager's
+    __exit__, gets a chance to run.
     """
+    cached = None
     if cache_path and os.path.exists(cache_path):
         with open(cache_path) as f:
-            cached = json.load(f)
-        if (cached.get("cache_format") == _CACHE_FORMAT
-                and cached.get("interval") == interval
-                and cached.get("crop") == crop
-                and cached.get("vf_preprocess") == _VF_PREPROCESS
-                and cached.get("frames_per_sample", 1) == FRAMES_PER_SAMPLE):
-            print(f"  (loaded from cache: {cache_path})")
-            return fill_timeonly_dates([
-                (float(t), parse_timestamp(text) if text else None, text or None)
-                for t, text in cached["samples"]
-            ])
+            loaded = json.load(f)
+        if (loaded.get("cache_format") == _CACHE_FORMAT
+                and loaded.get("interval") == interval
+                and loaded.get("crop") == crop
+                and loaded.get("vf_preprocess") == _VF_PREPROCESS
+                and loaded.get("frames_per_sample", 1) == FRAMES_PER_SAMPLE):
+            cached = loaded
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    if cached is not None and cached.get("fallback_done", True):
+        print(f"  (loaded from cache: {cache_path})")
+        return fill_timeonly_dates([
+            (float(t), parse_timestamp(text) if text else None, text or None)
+            for t, text in cached["samples"]
+        ])
+
+    workers = (os.cpu_count() or 4) * 2
+
+    if cached is not None:
+        # Resume: phase 1 already ran and was checkpointed to cache_path (guaranteed set —
+        # `cached` is only ever populated by loading it above). Skip straight to phase 2,
+        # restricted to the windows still unresolved.
+        assert cache_path is not None
+        print(f"  (resuming from checkpoint cache: {cache_path})")
+        results: dict[float, tuple[datetime | None, str | None]] = {
+            float(t): (parse_timestamp(text) if text else None, text)
+            for t, text in cached["samples"]
+        }
+        window_ends = [t for t, (dt, text) in results.items() if dt is None and text is None]
+        if window_ends:
+            print(f"  {len(window_ends)} windows unread; preprocessing fallback pass "
+                  f"(targeted seek, resumed)...", flush=True)
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                fallback = _run_targeted_fallback(video, crop, interval, window_ends, tmpdir, workers)
+            for t_last in window_ends:
+                dt, text = fallback[t_last]
+                if dt is not None or text is not None:
+                    results[t_last] = (dt, text)
+        sorted_results = sorted(results.items())
+        _write_scan_cache(cache_path, interval, crop, sorted_results, fallback_done=True)
+        return fill_timeonly_dates([(t, dt, text) for t, (dt, text) in sorted_results])
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         # Phase 1: crop-only extraction (PRIMARY — higher OCR yield than preprocessing; see _VF_PREPROCESS).
         crop_dir = os.path.join(tmpdir, "crop")
         os.makedirs(crop_dir)
@@ -523,6 +690,17 @@ def scan(
         print(f"  Extracted {len(crop_paths)} frames. Running OCR (batch)...", flush=True)
         crop_ocr = ocr_batch(crop_paths)
         crop_buckets = _bucket_frames(crop_paths)
+        bucket_t_last = {
+            bk: float(max(frame_index(p) for p in paths)) * interval / FRAMES_PER_SAMPLE
+            for bk, paths in crop_buckets.items()
+        }
+        # Free the crop frames now: everything downstream (_vote_bucket, assembly) only
+        # needs crop_ocr's already-extracted text and the path->bucket/time bookkeeping
+        # above, never the BMP bytes again. At --interval 1 this whole-tape crop pass is
+        # itself ~13GB; freeing it before phase 2 (targeted fallback) allocates its own
+        # space keeps the two phases' transient usage from stacking — peak stays close
+        # to whichever phase is larger, not their sum (issue-028's ~20GB budget).
+        shutil.rmtree(crop_dir, ignore_errors=True)
 
         # Per-window majority vote; remember which windows crop-only could not read.
         readings: dict[int, tuple[datetime, str | None]] = {}
@@ -537,54 +715,49 @@ def scan(
             else:
                 unsolved.append(bk)
 
-        # Phase 2: preprocessing FALLBACK — second pass, used only for windows crop-only failed on.
-        # Preprocessing hurts most frames but uniquely recovers some; restrict it to true gaps.
-        if unsolved:
-            pp_dir = os.path.join(tmpdir, "pp")
-            os.makedirs(pp_dir)
-            print(f"  {len(unsolved)} windows unread; preprocessing fallback pass...", flush=True)
-            pp_paths = extract_all_frames(video, interval, crop, pp_dir, preprocess=True)
-            # Index alignment between passes holds only if both yield the same frame count.
-            if len(pp_paths) == len(crop_paths):
-                pp_ocr = ocr_batch(pp_paths)
-                pp_buckets = _bucket_frames(pp_paths)
-                for bk in unsolved:
-                    dt, text = _vote_bucket(pp_buckets.get(bk, []), pp_ocr)
-                    if dt is not None:
-                        readings[bk] = (dt, text)
-                    elif text is not None:
-                        timeonly_map[bk] = text
-            else:
-                print(f"  (skipped fallback: frame-count mismatch "
-                      f"{len(pp_paths)} != {len(crop_paths)})", flush=True)
-
         # Assemble results keyed by t_last_frame of each window — the actual video time of the
         # last extracted frame in the window (a true upper bound on when any event was observed),
         # not the window-start label. raw_text is cached so parser fixes propagate without re-scan.
-        results: dict[float, tuple[datetime | None, str | None]] = {}
-        for bk, paths in crop_buckets.items():
-            t_last = float(max(frame_index(p) for p in paths)) * interval / FRAMES_PER_SAMPLE
-            if bk in readings:
-                results[t_last] = readings[bk]
-            elif bk in timeonly_map:
-                results[t_last] = (None, timeonly_map[bk])
-            else:
-                results[t_last] = (None, None)
+        def _assemble() -> list[tuple[float, tuple[datetime | None, str | None]]]:
+            results: dict[float, tuple[datetime | None, str | None]] = {}
+            for bk in crop_buckets:
+                t_last = bucket_t_last[bk]
+                if bk in readings:
+                    results[t_last] = readings[bk]
+                elif bk in timeonly_map:
+                    results[t_last] = (None, timeonly_map[bk])
+                else:
+                    results[t_last] = (None, None)
+            return sorted(results.items())
 
-    sorted_results = sorted(results.items())
+        # Checkpoint BEFORE phase 2: a crash in the (now much cheaper, but not free)
+        # fallback pass then costs only the fallback, never this whole-tape crop-only
+        # pass (issue-028).
+        if cache_path and unsolved:
+            _write_scan_cache(cache_path, interval, crop, _assemble(), fallback_done=False)
+
+        # Phase 2: preprocessing FALLBACK — targeted seek pass, used only for windows
+        # crop-only failed on. Preprocessing hurts most frames but uniquely recovers some;
+        # restrict it to true gaps (see _run_targeted_fallback for why this is now bounded
+        # rather than a second whole-tape decode).
+        if unsolved:
+            pp_dir = os.path.join(tmpdir, "pp")
+            os.makedirs(pp_dir)
+            print(f"  {len(unsolved)} windows unread; preprocessing fallback pass "
+                  f"(targeted seek, {len(unsolved)} windows)...", flush=True)
+            fallback = _run_targeted_fallback(video, crop, interval, [bucket_t_last[bk] for bk in unsolved],
+                                               pp_dir, workers)
+            for bk in unsolved:
+                dt, text = fallback[bucket_t_last[bk]]
+                if dt is not None:
+                    readings[bk] = (dt, text)
+                elif text is not None:
+                    timeonly_map[bk] = text
+
+        sorted_results = _assemble()
 
     if cache_path:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump({
-                "cache_format": _CACHE_FORMAT,
-                "interval": interval,
-                "crop": crop,
-                "vf_preprocess": _VF_PREPROCESS,
-                "frames_per_sample": FRAMES_PER_SAMPLE,
-                "samples": [(t, text) for t, (_, text) in sorted_results],
-            }, f)
-        print(f"  (scan cached to {cache_path})")
+        _write_scan_cache(cache_path, interval, crop, sorted_results, fallback_done=True)
 
     return fill_timeonly_dates([(t, dt, text) for t, (dt, text) in sorted_results])
 
@@ -2075,6 +2248,14 @@ def run(config: PipelineConfig) -> PipelineResult:
 # ------------------------------------------------------------------ #
 
 def main() -> None:
+    # SIGTERM's default disposition terminates the process immediately, bypassing every
+    # `with` block (TemporaryDirectory cleanup included) exactly like SIGKILL — so a plain
+    # `kill` during a long scan strands its temp dir. Route it through the same mechanism
+    # Python already uses for SIGINT (Ctrl-C): raise KeyboardInterrupt in the main thread so
+    # normal exception unwinding — and therefore cleanup — actually runs. This cannot help
+    # against SIGKILL, which no userspace code can intercept (see scan()'s docstring).
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="Input video file")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
