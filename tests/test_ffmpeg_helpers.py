@@ -13,8 +13,10 @@ class TestFfmpegCopySeg:
         m.assert_called_once()
         cmd = m.call_args[0][0]
         assert cmd[0] == "ffmpeg"
-        assert "10.000" in cmd
-        assert "40.000" in cmd  # duration = 50-10
+        # Seek nudged +2ms past seg_start (GOP-replay guard); duration shrinks
+        # by the same eps so the tail threshold stays at seg_end.
+        assert "10.002" in cmd
+        assert "39.998" in cmd  # duration = 50-10 - eps
         assert "-c" in cmd
         assert "copy" in cmd
         assert "/out/seg.mp4" in cmd

@@ -1914,12 +1914,20 @@ def snap_to_scene_cut(
     return t, None
 
 
+_COPY_SEEK_EPS = 0.002  # clears %.3f rounding error, well under one frame (~33ms)
+
+
 def _ffmpeg_copy_seg(video: str, seg_start: float, seg_end: float, out: str):
+    # Seek slightly PAST seg_start: input-seek with stream copy snaps to the
+    # keyframe <= target, and %.3f can round a keyframe's sub-ms pts DOWN past
+    # the target — landing the seek one full GOP (~0.5s) early and replaying
+    # the previous GOP at the clip head (stutter + old-session flash).
+    # Duration shrinks by the same eps so the tail threshold stays at seg_end.
     subprocess.run([
         "ffmpeg", "-loglevel", "error",
-        "-ss", f"{seg_start:.3f}",
+        "-ss", f"{seg_start + _COPY_SEEK_EPS:.3f}",
         "-i", video,
-        "-t", f"{seg_end - seg_start:.3f}",
+        "-t", f"{seg_end - seg_start - _COPY_SEEK_EPS:.3f}",
         "-map", "0:v:0", "-map", "0:a:0",
         "-c", "copy",
         "-video_track_timescale", str(VIDEO_TIMESCALE),
