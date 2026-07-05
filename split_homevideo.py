@@ -444,6 +444,24 @@ def get_duration(video: str) -> float:
     return float(r.stdout.strip())
 
 
+def _island_positions(
+    raw: list[tuple[float, datetime | None, str | None]],
+) -> set[int]:
+    """Indices into `raw` whose dated reading is a date island — its date differs
+    from both nearest dated neighbours (an OCR misread).
+
+    Mirrors drop_date_islands' interior test, but over the (t, dt, text) triples
+    fill operates on. Used by fill_timeonly_dates to avoid anchoring on a misread."""
+    dated = [(i, dt) for i, (_, dt, _) in enumerate(raw) if dt is not None]
+    islands: set[int] = set()
+    for j in range(1, len(dated) - 1):
+        idx, dt = dated[j]
+        d = dt.date()
+        if d != dated[j - 1][1].date() and d != dated[j + 1][1].date():
+            islands.add(idx)
+    return islands
+
+
 def fill_timeonly_dates(
     raw: list[tuple[float, datetime | None, str | None]],
 ) -> list[tuple[float, datetime | None]]:
@@ -460,10 +478,20 @@ def fill_timeonly_dates(
     result: list[tuple[float, datetime | None]] = [(t, dt) for t, dt, _ in raw]
     last_effective: datetime | None = None
 
+    # A date island (a dated reading whose date differs from both nearest dated
+    # neighbours) is an OCR misread that drop_date_islands will delete downstream.
+    # Filling must NOT propagate such a date to adjacent time-only reads: doing so
+    # converts a single-frame misread into a multi-reading run that no filter kills
+    # (issue-030). So islands are excluded as fill anchors — the surrounding
+    # time-only reads inherit the last GOOD dated reading instead, and the island
+    # itself stays a lone dated reading for drop_date_islands to remove.
+    islands = _island_positions(raw)
+
     for k in range(n):
         t_k, dt_k, text_k = raw[k]
         if dt_k is not None:
-            last_effective = dt_k
+            if k not in islands:
+                last_effective = dt_k
             continue
         if not text_k:
             continue
@@ -481,7 +509,7 @@ def fill_timeonly_dates(
         else:
             succ: datetime | None = None
             for j in range(k + 1, n):
-                if raw[j][1] is not None:
+                if raw[j][1] is not None and j not in islands:
                     succ = raw[j][1]
                     break
             if succ is None:
@@ -1010,7 +1038,7 @@ def drop_month_confusion_runs(
             continue
         outer = left_date
         if (
-            len(run_indices) <= _CONFUSION_RUN_MAX
+            _run_span_s(samples, run_indices) <= _CONFUSION_RUN_MAX_S
             and run_date.day == outer.day
             and run_date.year == outer.year
             and frozenset({run_date.month, outer.month}) in _MONTH_CONFUSABLES
@@ -1020,12 +1048,26 @@ def drop_month_confusion_runs(
     return [s for i, s in enumerate(samples) if i not in drop]
 
 
-_CONFUSION_RUN_MAX = 3  # max readings a droppable confusion run may have. Every observed
-                        # genuine misread run is 2 windows; a long run is a real session.
-                        # Without this cap the day/month filters mis-fire on A-B-A'-B
-                        # alternation: a REAL 160s 11-26 run between a real 11-25 session
-                        # and a 2-window 11-25 misread got dropped as "confused" (1992 tape
-                        # ~1139-1301s), swallowing 164s into a mislabeled clip.
+_CONFUSION_RUN_MAX_S = 10.0  # max PHYSICAL duration (video seconds) a droppable confusion
+                            # run may span. Denominated in seconds — NOT reading count — so
+                            # the cap is interval-independent: a genuine ~4-6s misread spans
+                            # 2 windows at interval 3 but 4+ windows at interval 1, and a
+                            # reading-count cap (the old _CONFUSION_RUN_MAX=3) let interval-1
+                            # misreads sail past (issue-030: 1992 NOV.26->NOV.28). Without any
+                            # cap the day/month filters mis-fire on A-B-A'-B alternation: a
+                            # REAL 160s 11-26 run between a real 11-25 session and a 2-window
+                            # 11-25 misread got dropped as "confused" (1992 tape ~1139-1301s),
+                            # swallowing 164s into a mislabeled clip. 160s >> 10s => protected.
+
+
+def _run_span_s(
+    samples: list[tuple[float, "datetime | None"]], run_indices: list[int]
+) -> float:
+    """Physical video duration spanned by a confusion run (last reading time − first).
+
+    Interval-independent measure of how long a misread persisted, used to gate the
+    confusion filters instead of a reading count (see _CONFUSION_RUN_MAX_S)."""
+    return samples[run_indices[-1]][0] - samples[run_indices[0]][0]
 
 _DAY_CONFUSABLES: frozenset[frozenset[int]] = frozenset({
     frozenset({6, 8}),  # 6 and 8 look alike on VHS overlay font (1990 tape: 26 read as 28)
@@ -1112,7 +1154,7 @@ def drop_day_confusion_runs(
             continue
         outer = left_date
         if (
-            len(run_indices) <= _CONFUSION_RUN_MAX
+            _run_span_s(samples, run_indices) <= _CONFUSION_RUN_MAX_S
             and run_date.month == outer.month
             and run_date.year == outer.year
             and _day_digits_confusable(run_date.day, outer.day)
@@ -1197,9 +1239,32 @@ def merge_short_clips(cuts: list[float], min_clip_s: float = DEFAULT_MIN_CLIP_S)
     return merged
 
 
+def _span_has_real_session(
+    dated_samples: list[tuple[float, "datetime"]] | None, lo: float, hi: float
+) -> bool:
+    """True if [lo, hi) holds >= 2 legible reads sharing one date.
+
+    That is the island filter's own definition of a real recording session, so a
+    span meeting it must never be suppressed as a garbled orphan (issue-029: at
+    interval 1 nearly every boundary gets the garbled tag, and the pair rule was
+    deleting real sessions that happen to sit < threshold apart). With no sample
+    evidence the gate is inert (returns False, legacy behaviour)."""
+    if not dated_samples:
+        return False
+    counts: dict[date, int] = {}
+    for st, dt in dated_samples:
+        if lo <= st < hi and dt is not None:
+            d = dt.date()
+            counts[d] = counts.get(d, 0) + 1
+            if counts[d] >= 2:
+                return True
+    return False
+
+
 def suppress_garbled_orphans(
     splits: list[float],
     garbled_cuts: set[float],
+    dated_samples: list[tuple[float, "datetime"]] | None = None,
     threshold: float = GARBLED_ORPHAN_MAX_S,
 ) -> tuple[list[float], int]:
     """Drop pairs of consecutive garbled-boundary cuts that enclose a span < threshold.
@@ -1207,6 +1272,11 @@ def suppress_garbled_orphans(
     Back-to-back garbled-boundary refinements can bracket a tiny span whose date
     label belongs to neither adjacent session. Since both bounding cuts are already
     flagged as garbled, dropping both merges the orphan into its neighbour.
+
+    A pair is NEVER suppressed when the span it encloses contains >= 2 legible reads
+    of a single date (`dated_samples`) — that span is a real session by the island
+    filter's definition, not an orphan (issue-029). True garbled orphans (0-1 legible
+    reads in the span, issue-024) are still suppressed.
 
     Applied iteratively so chains of 3+ garbled boundaries resolve correctly.
     Returns (new_splits, n_dropped).
@@ -1224,6 +1294,7 @@ def suppress_garbled_orphans(
                 and i + 1 < len(splits)
                 and splits[i + 1] in garbled_cuts
                 and splits[i + 1] - t < threshold
+                and not _span_has_real_session(dated_samples, t, splits[i + 1])
             ):
                 garbled_cuts.discard(t)
                 garbled_cuts.discard(splits[i + 1])
@@ -2277,7 +2348,7 @@ def run(config: PipelineConfig) -> PipelineResult:
     phase_times["refine"] = time.perf_counter() - t_refine
 
     if garbled_cuts:
-        splits, n_suppressed = suppress_garbled_orphans(splits, garbled_cuts)
+        splits, n_suppressed = suppress_garbled_orphans(splits, garbled_cuts, filtered)
         if n_suppressed:
             retained = set(splits)
             for dead in list(refined_boundary_map.keys()):

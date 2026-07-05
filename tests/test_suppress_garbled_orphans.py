@@ -6,6 +6,8 @@ Two consecutive garbled-boundary refinements can bracket a tiny span whose date
 label belongs to neither adjacent session. Dropping both cuts merges the orphan
 into its neighbour.
 """
+from datetime import datetime
+
 from split_homevideo import suppress_garbled_orphans
 
 
@@ -71,3 +73,45 @@ class TestSuppressGarbledOrphans:
         result, n = suppress_garbled_orphans(splits, garbled, threshold=30.0)
         assert result == [0.0]
         assert n == 0
+
+
+class TestRealSessionGate:
+    """issue-029: at interval 1 nearly every boundary is tagged garbled, so the
+    pair rule deleted real sessions sitting < threshold apart. A span holding >= 2
+    legible reads of one date is a real session and must be kept."""
+
+    def _dt(self, mo, day, h):
+        return datetime(1990, mo, day, h, 0)
+
+    def test_span_with_two_reads_of_one_date_kept(self):
+        # 20s orphan span, but the cache has three legible 1/7/90 reads inside it
+        splits = [0.0, 1000.0, 1020.0, 2000.0]
+        garbled = {1000.0, 1020.0}
+        dated = [
+            (500.0, self._dt(1, 6, 8)),
+            (1005.0, self._dt(1, 7, 8)),
+            (1010.0, self._dt(1, 7, 8)),
+            (1015.0, self._dt(1, 7, 8)),
+            (1500.0, self._dt(1, 8, 8)),
+        ]
+        result, n = suppress_garbled_orphans(splits, garbled, dated, threshold=30.0)
+        assert result == [0.0, 1000.0, 1020.0, 2000.0]
+        assert n == 0
+
+    def test_true_orphan_no_reads_still_suppressed(self):
+        # issue-024 behaviour preserved: span has no legible reads → suppress
+        splits = [0.0, 1304.0, 1310.0, 2000.0]
+        garbled = {1304.0, 1310.0}
+        dated = [(500.0, self._dt(1, 6, 8)), (1500.0, self._dt(1, 8, 8))]
+        result, n = suppress_garbled_orphans(splits, garbled, dated, threshold=30.0)
+        assert result == [0.0, 2000.0]
+        assert n == 2
+
+    def test_single_read_in_span_still_suppressed(self):
+        # one lone read is not a session (island definition needs >= 2) → suppress
+        splits = [0.0, 1304.0, 1310.0, 2000.0]
+        garbled = {1304.0, 1310.0}
+        dated = [(1306.0, self._dt(1, 7, 8))]
+        result, n = suppress_garbled_orphans(splits, garbled, dated, threshold=30.0)
+        assert result == [0.0, 2000.0]
+        assert n == 2

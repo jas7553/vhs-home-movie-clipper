@@ -397,6 +397,22 @@ class TestDropDayConfusionRuns:
         result = mdy(drop_day_confusion_runs(s))
         assert result == [(5,26,1990)] * 4
 
+    def test_interval1_multiwindow_misread_dropped(self):
+        # issue-030: at interval 1 a ~3s physical misread spans 4 readings and
+        # sailed past the OLD reading-count cap (_CONFUSION_RUN_MAX=3). The
+        # seconds-denominated cap (span 3s <= 10s) drops it. t spaced 1s.
+        seq = ([(5,26,1990)]*3 + [(5,28,1990)]*4 + [(5,26,1990)]*3)
+        s = [(float(i), datetime(y, m, d, 12, 0)) for i, (m, d, y) in enumerate(seq)]
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,26,1990)] * 6
+
+    def test_interval1_long_real_run_kept(self):
+        # Same 1s spacing, but a genuine 15-reading (14s > 10s) session is kept.
+        seq = ([(5,26,1990)]*3 + [(5,28,1990)]*15 + [(5,26,1990)]*3)
+        s = [(float(i), datetime(y, m, d, 12, 0)) for i, (m, d, y) in enumerate(seq)]
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == seq
+
     def test_single_digit_day_6_vs_8_confusion_dropped(self):
         # 1990-05-06 ×2, 1990-05-08 ×2, 1990-05-06 ×2 — same confusable pair, single digit
         s = mk_mo((5,6,1990),(5,6,1990),(5,8,1990),(5,8,1990),(5,6,1990),(5,6,1990))

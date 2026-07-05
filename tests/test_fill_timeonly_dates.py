@@ -122,6 +122,27 @@ class TestSuccessorFallback:
         assert result[1] == (200.0, None)
 
 
+class TestIslandNotPropagated:
+    """A date island (misread) must not be a fill anchor (issue-030 fix 2).
+
+    Otherwise a single-frame misread gets copied onto adjacent time-only reads,
+    becoming a multi-reading run that drop_date_islands can no longer catch.
+    """
+
+    def test_timeonly_after_island_inherits_good_date(self):
+        raw = [
+            (100.0, _d(1990, 9, 25, 10, 0), "10:00 AM\n9/25/90"),
+            (200.0, _d(1990, 9, 25, 10, 1), "10:01 AM\n9/25/90"),
+            (300.0, _d(1990, 3, 12, 10, 2), "10:02 AM\n3/12/90"),  # island misread
+            (400.0, None, "2:00 PM"),                              # must NOT get 3/12
+            (500.0, _d(1990, 9, 25, 14, 1), "2:01 PM\n9/25/90"),
+        ]
+        result = fill_timeonly_dates(raw)
+        assert result[3] == (400.0, _d(1990, 9, 25, 14, 0))
+        # the island's own dated entry is untouched — left for drop_date_islands
+        assert result[2] == (300.0, _d(1990, 3, 12, 10, 2))
+
+
 class TestEdgeCases:
     def test_empty_input(self):
         assert fill_timeonly_dates([]) == []
