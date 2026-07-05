@@ -31,7 +31,8 @@ def _write_cache(path: str, interval=_INTERVAL, crop=_CROP, samples=None, fallba
         "samples": samples,
     }
     # fallback_done omitted entirely by default, matching every cache written before
-    # issue-028 — scan() must treat that as a complete cache (see TestScanCheckpointCache).
+    # the checkpoint scheme existed — scan() must treat that as a complete cache
+    # (see TestScanCheckpointCache).
     if fallback_done is not None:
         payload["fallback_done"] = fallback_done
     with open(path, "w") as f:
@@ -192,8 +193,8 @@ class TestScanReturnsTLastFrame:
 
 class TestScanPreprocessingFallback:
     """Phase-2 preprocessing path: unsolved buckets get a targeted seek-based fallback
-    (issue-028) — extract_frame is called only for the unread windows' timestamps,
-    instead of re-decoding the whole tape a second time. See _run_targeted_fallback."""
+    — extract_frame is called only for the unread windows' timestamps, instead of
+    re-decoding the whole tape a second time. See _run_targeted_fallback."""
 
     def _make_frames(self, base_dir, count, subdir="."):
         import os
@@ -296,9 +297,9 @@ class TestScanPreprocessingFallback:
     def test_fallback_chunks_bound_transient_disk(self, tmp_path):
         # More windows than the chunk size: every window still gets its frames extracted
         # and voted, and each chunk's frame dir is deleted before the next chunk runs —
-        # the property that caps transient disk at one chunk's worth (issue-028; the
-        # preprocessed frames are ~3.5MB bgr24 BMPs, so an unchunked pass over thousands
-        # of unread windows would blow the disk budget).
+        # the property that caps transient disk at one chunk's worth (the preprocessed
+        # frames are ~3.5MB bgr24 BMPs, so an unchunked pass over thousands of unread
+        # windows would blow the disk budget).
         from split_homevideo import _run_targeted_fallback
 
         n_windows = 5
@@ -332,7 +333,7 @@ class TestScanPreprocessingFallback:
 
 
 class TestScanCheckpointCache:
-    """Cache checkpoint semantics (issue-028): the crop-only pass (phase 1) is written to
+    """Cache checkpoint semantics: the crop-only pass (phase 1) is written to
     cache_path with fallback_done=False BEFORE the fallback pass (phase 2) runs, so a
     crash during phase 2 never loses phase 1's (expensive, whole-tape) OCR work. Loading
     a fallback_done=False cache is not a hit: scan() resumes phase 2 over just the still-
@@ -442,7 +443,8 @@ class TestScanCheckpointCache:
         assert result[0] == (t_bucket0, datetime(1990, 1, 4, 17, 1))
 
     def test_cache_without_fallback_done_key_is_complete(self, tmp_path):
-        # No marker at all (every cache from before issue-028): treated as complete, not
+        # No marker at all (every cache from before the checkpoint scheme existed):
+        # treated as complete, not
         # a checkpoint needing resume — existing caches for other tapes must not break.
         cache_path = str(tmp_path / "cache.json")
         _write_cache(cache_path, samples=[(0.0, "5:01 PM 1/ 4/90")])  # fallback_done omitted

@@ -2,7 +2,7 @@
 
 **Status:** open (2026-06-21)
 **Scope:** 2 tapes digitized so far; ~10 tapes remaining to be downloaded.
-**Trigger:** Issue 008 — catalog overlay position + format across all available tapes.
+**Trigger:** catalog overlay position + format across all available tapes.
 
 ---
 
@@ -69,7 +69,7 @@ Separator between abbreviation and day varies: `.` (most common), `:` or `,`
   re-appearing after the numeric session). Not present on 1990 tape.
 
 **Parser status: NOT handled.** `parse_timestamp` requires a numeric `M/D/YY` date;
-word-month returns `None`. Issue 010 covers adding word-month parsing.
+word-month returns `None`. Adding word-month parsing is planned.
 
 ---
 
@@ -92,8 +92,8 @@ No date line present.
 - 1992 tape: brief windows at ~15 min and ~100 min. Not present on 1990 tape.
 
 **Parser status: NOT handled (two deficiencies).**
-1. `H:MM:SS` format not parsed (colon count mismatch, issue 011).
-2. No date present — even after parsing, daily-mode cannot assign to a clip (issue 012).
+1. `H:MM:SS` format not parsed (colon count mismatch).
+2. No date present — even after parsing, daily-mode cannot assign to a clip.
 
 ---
 
@@ -112,7 +112,7 @@ Styles B and C on the left, explaining the near-zero OCR yield on the 1992 tape
 in existing scans.
 
 A wide bottom-band crop — e.g., `560:130:40:350` (x=40+, covers 560 px) — captures
-all three styles. Issue 009 (widen default crop) is already closed with this fix.
+all three styles. Widening the default crop already closed this gap.
 
 ---
 

@@ -2,7 +2,7 @@
 run(): pipeline detection + refinement, no cutting.
 Tests call run(PipelineConfig(...)) directly — no sys.argv, no split_video mock.
 
-Scope: behavioral guards only — refined-cut placement (issue-018 tail leak),
+Scope: behavioral guards only — refined-cut placement (tail leak),
 merge_short / same_date_adjacent output, the no-prev-t edge, and the two CLI-flag
 contracts (--no-visual-anchor, --enable-visual-fusion). Pure "helper was called"
 wiring assertions are intentionally not tested here.
@@ -102,7 +102,7 @@ class TestRunFullRunEdgeCases:
     """Cover non-large_gap boundary pass-through and merge/warning in full-run path."""
 
     def test_gap_boundary_refined_when_has_prev_t(self, tmp_path):
-        # Gap boundaries with prev_t set are now refined (issue-018: tail leak fix).
+        # Gap boundaries with prev_t set are now refined (tail leak fix).
         # The strategy is called for all boundaries that have prev_t/prev_dt, regardless
         # of gap type.  The refined position replaces coarse_t in splits.
         video = tmp_path / "v.mp4"
@@ -159,8 +159,8 @@ class TestRunFullRunEdgeCases:
         assert "same_date_adjacent" in out
 
 
-class TestRunIssue018GapRefinement:
-    """Issue-018: gap-typed day-change boundaries must be refined, not cut at coarse_t.
+class TestRunGapRefinement:
+    """Gap-typed day-change boundaries must be refined, not cut at coarse_t.
 
     Without refinement a gap boundary uses coarse_t (the first new-date OCR sample,
     up to one interval ≈10s from the true transition), leaving new-date footage in
@@ -187,7 +187,7 @@ class TestRunIssue018GapRefinement:
             result = run(_config(video))
         # Strategy called: gap boundary is now refined
         fake_strategy.assert_called_once()
-        # Refined position used, not coarse_t (issue-018: tail leak ≤1s from true transition)
+        # Refined position used, not coarse_t (tail leak ≤1s from true transition)
         assert 194.0 in result.splits
         assert 200.0 not in result.splits
         # Error from true transition (195) is 1s — at the 1s floor

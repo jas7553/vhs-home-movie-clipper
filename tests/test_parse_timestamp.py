@@ -112,15 +112,15 @@ class TestWordMonthFormats:
     """Style B overlays: word month + separator + day + year."""
 
     @pytest.mark.parametrize("text,expected", [
-        # original separators (issue-010)
+        # original separators
         ("NOV. 25 1992",  (1992, 11, 25)),
         ("NOV- 26 1992",  (1992, 11, 26)),
         ("dec. 3 1990",   (1990, 12, 3)),
-        # no-space after separator (issue-016)
+        # no-space after separator
         ("DEC.24 1992",   (1992, 12, 24)),
-        # comma misread (issue-016)
+        # comma misread
         ("DEC,13 1992",   (1992, 12, 13)),
-        # colon misread (issue-016)
+        # colon misread
         ("DEC:24 1992",   (1992, 12, 24)),
     ])
     def test_parses(self, text: str, expected: tuple):

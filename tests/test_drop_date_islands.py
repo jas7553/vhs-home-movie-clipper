@@ -386,19 +386,19 @@ class TestDropMonthConfusionRuns:
 # ---------------------------------------------------------------------------
 # drop_day_confusion_runs — catches multi-window day-digit confusion misreads
 # where OCR swaps visually similar day digits (6↔8) for ≥2 consecutive
-# windows, forming a bounce run that survives drop_date_islands (issue-025:
-# Converse 1990 clip44, 5/26/90 misread as 5/28/90).
+# windows, forming a bounce run that survives drop_date_islands (Converse
+# 1990 clip44, 5/26/90 misread as 5/28/90).
 # ---------------------------------------------------------------------------
 
 class TestDropDayConfusionRuns:
     def test_day26_vs_day28_confusion_dropped(self):
-        # 1990-05-26 ×2, 1990-05-28 ×2, 1990-05-26 ×2 — issue-025 clip44 pattern
+        # 1990-05-26 ×2, 1990-05-28 ×2, 1990-05-26 ×2 — Converse 1990 clip44 pattern
         s = mk_mo((5,26,1990),(5,26,1990),(5,28,1990),(5,28,1990),(5,26,1990),(5,26,1990))
         result = mdy(drop_day_confusion_runs(s))
         assert result == [(5,26,1990)] * 4
 
     def test_interval1_multiwindow_misread_dropped(self):
-        # issue-030: at interval 1 a ~3s physical misread spans 4 readings and
+        # At interval 1 a ~3s physical misread spans 4 readings and
         # sailed past the OLD reading-count cap (_CONFUSION_RUN_MAX=3). The
         # seconds-denominated cap (span 3s <= 10s) drops it. t spaced 1s.
         seq = ([(5,26,1990)]*3 + [(5,28,1990)]*4 + [(5,26,1990)]*3)

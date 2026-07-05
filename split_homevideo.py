@@ -63,7 +63,7 @@ REFINE_LOOKBACK_PAD_S = 20     # seconds the dense refinement window looks BACK 
                                # can never re-examine it, so the true last-old frame is invisible and
                                # the cut lands late (tail leak). Empirically the worst observed drift
                                # on Converse 1990 was 11s (b42 05-25->05-26 boundary); 20s keeps
-                               # margin. See issue-018's 2026-07-03 tail-leak update.
+                               # margin. See the 2026-07-03 tail-leak update.
 
 # Scene-snap (ultra-refinement, pass 3): after OCR refinement places a cut, snap it onto a
 # precise shot-change frame. v2 anchor rule (finding 003):
@@ -482,7 +482,7 @@ def fill_timeonly_dates(
     # neighbours) is an OCR misread that drop_date_islands will delete downstream.
     # Filling must NOT propagate such a date to adjacent time-only reads: doing so
     # converts a single-frame misread into a multi-reading run that no filter kills
-    # (issue-030). So islands are excluded as fill anchors — the surrounding
+    # So islands are excluded as fill anchors — the surrounding
     # time-only reads inherit the last GOOD dated reading instead, and the island
     # itself stays a lone dated reading for drop_date_islands to remove.
     islands = _island_positions(raw)
@@ -541,14 +541,14 @@ def _fallback_window_frame_times(t_last: float, interval: int) -> list[float]:
 # upscale, hwaccel and software decode identical), so a chunk's transient footprint is
 # ~ 256 windows x FRAMES_PER_SAMPLE x 3.5MB =~ 2.7GB, deleted before the next chunk
 # starts. This bounds fallback disk usage by CHUNK size, not unread-window count —
-# issue-028's original per-window estimate assumed ~1.2MB/frame and undershot 3x.
+# the original per-window estimate assumed ~1.2MB/frame and undershot 3x.
 _FALLBACK_CHUNK_WINDOWS = 256
 
 
 def _run_targeted_fallback(
     video: str, crop: str, interval: int, window_ends: list[float], tmpdir: str, workers: int,
 ) -> dict[float, tuple[datetime | None, str | None]]:
-    """Preprocessing fallback restricted to the given unread windows (issue-028).
+    """Preprocessing fallback restricted to the given unread windows.
 
     The old fallback re-decoded the ENTIRE tape a second time through the heavier
     _VF_PREPROCESS chain just to reach the few thousand windows crop-only couldn't read —
@@ -616,7 +616,7 @@ def _write_scan_cache(
     complete cache (same "samples" list, with still-unsolved windows recorded as null text)
     — the flag is what stops scan() from treating it as a finished scan. fallback_done=True
     writes a complete cache. A cache with no "fallback_done" key at all — every cache
-    written before issue-028 — is a complete scan by construction; scan() defaults a
+    written before this checkpoint scheme existed — is a complete scan by construction; scan() defaults a
     missing key to True so existing caches for other tapes keep working unchanged.
     """
     os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
@@ -642,7 +642,7 @@ def scan(
     If cache_path is given, load from it when it exists (and matches interval+crop),
     otherwise scan and save results there for fast re-runs with different --gap values.
 
-    Checkpoint semantics (issue-028): the crop-only pass (phase 1 — the expensive,
+    Checkpoint semantics: the crop-only pass (phase 1 — the expensive,
     whole-tape decode) is saved to cache_path with "fallback_done": false BEFORE the
     preprocessing fallback (phase 2, now a targeted seek over only the unread windows —
     see _run_targeted_fallback) runs, so a crash during phase 2 never loses phase 1's
@@ -653,7 +653,7 @@ def scan(
     before this change.
 
     Temp-directory hygiene: TemporaryDirectory(ignore_cleanup_errors=True) below is
-    defense-in-depth for issue-028's stranded-tempdir crash. Root cause: shutil.rmtree
+    defense-in-depth for a previously observed stranded-tempdir crash. Root cause: shutil.rmtree
     (what TemporaryDirectory.cleanup() uses) can itself raise ENOSPC on APFS when the disk
     is at absolute zero free space — deleting a file still needs a little scratch space for
     the copy-on-write metadata update — so a disk-exhaustion crash could make cleanup fail
@@ -727,7 +727,7 @@ def scan(
         # above, never the BMP bytes again. At --interval 1 this whole-tape crop pass is
         # itself ~13GB; freeing it before phase 2 (targeted fallback) allocates its own
         # space keeps the two phases' transient usage from stacking — peak stays close
-        # to whichever phase is larger, not their sum (issue-028's ~20GB budget).
+        # to whichever phase is larger, not their sum (~20GB budget).
         shutil.rmtree(crop_dir, ignore_errors=True)
 
         # Per-window majority vote; remember which windows crop-only could not read.
@@ -760,7 +760,7 @@ def scan(
 
         # Checkpoint BEFORE phase 2: a crash in the (now much cheaper, but not free)
         # fallback pass then costs only the fallback, never this whole-tape crop-only
-        # pass (issue-028).
+        # pass.
         if cache_path and unsolved:
             _write_scan_cache(cache_path, interval, crop, _assemble(), fallback_done=False)
 
@@ -1053,7 +1053,7 @@ _CONFUSION_RUN_MAX_S = 10.0  # max PHYSICAL duration (video seconds) a droppable
                             # the cap is interval-independent: a genuine ~4-6s misread spans
                             # 2 windows at interval 3 but 4+ windows at interval 1, and a
                             # reading-count cap (the old _CONFUSION_RUN_MAX=3) let interval-1
-                            # misreads sail past (issue-030: 1992 NOV.26->NOV.28). Without any
+                            # misreads sail past (1992 NOV.26->NOV.28). Without any
                             # cap the day/month filters mis-fire on A-B-A'-B alternation: a
                             # REAL 160s 11-26 run between a real 11-25 session and a 2-window
                             # 11-25 misread got dropped as "confused" (1992 tape ~1139-1301s),
@@ -1117,7 +1117,7 @@ def drop_day_confusion_runs(
     VHS overlay OCR sometimes swaps visually similar day digits for ≥2 consecutive
     windows, forming a bounce run (A A A [B B] A A A) that looks like a genuine
     2-reading session and survives the island filter — e.g. 5/26/90 read as
-    5/28/90 for two windows (issue-025, Converse 1990 clip44).
+    5/28/90 for two windows (Converse 1990 clip44).
 
     Confirmed confusable pairs on this font: {6, 8}.
 
@@ -1264,7 +1264,7 @@ def _span_has_real_session(
     """True if [lo, hi) holds >= 2 legible reads sharing one date.
 
     That is the island filter's own definition of a real recording session, so a
-    span meeting it must never be suppressed as a garbled orphan (issue-029: at
+    span meeting it must never be suppressed as a garbled orphan (at
     interval 1 nearly every boundary gets the garbled tag, and the pair rule was
     deleting real sessions that happen to sit < threshold apart). With no sample
     evidence the gate is inert (returns False, legacy behaviour)."""
@@ -1294,8 +1294,8 @@ def suppress_garbled_orphans(
 
     A pair is NEVER suppressed when the span it encloses contains >= 2 legible reads
     of a single date (`dated_samples`) — that span is a real session by the island
-    filter's definition, not an orphan (issue-029). True garbled orphans (0-1 legible
-    reads in the span, issue-024) are still suppressed.
+    filter's definition, not an orphan. True garbled orphans (0-1 legible
+    reads in the span) are still suppressed.
 
     Applied iteratively so chains of 3+ garbled boundaries resolve correctly.
     Returns (new_splits, n_dropped).
@@ -1508,8 +1508,8 @@ def _scan_for_transition(
     new-session footage (e.g. a digit-confusion misread of the new date, '2/16'
     read as '2/18') rather than a genuine third session — it is ignored rather than
     cancelling the candidate and dragging last_old_t past real new-session content,
-    which would leak that content into the outgoing clip's tail (issue-018 tail-leak
-    update, 2026-07-03). A reading that matches the OLD session's own date still
+    which would leak that content into the outgoing clip's tail (2026-07-03 tail-leak
+    update). A reading that matches the OLD session's own date still
     cancels the candidate as before — that is a genuine reversion, not noise."""
     any_ocr = False
     last_old_t: float = prev_t
@@ -1551,7 +1551,7 @@ def _retry_gap_at_half_phase(
     first_new_t: float | None,
 ) -> list[float] | None:
     """Retry None-reading frames inside the critical gap at the other interlaced
-    field, t+0.5 (issue-027). VHS is interlaced: a timestamp can be cleanly
+    field, t+0.5. VHS is interlaced: a timestamp can be cleanly
     legible on one field and garbled/blank on the other, so an integer-second
     frame reading None does not mean the content there is unreadable — only that
     this field is. Retrying is restricted to the gap — between last_old_t and
@@ -1739,7 +1739,7 @@ class LongDeadZonePolicy:
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
             window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
-        # Interlaced field-phase retry (issue-027): a None-reading integer-second
+        # Interlaced field-phase retry: a None-reading integer-second
         # frame inside the gap may be legible on the other field, t+0.5. Gated on
         # any_ocr — an all-None window is a true Long Dead Zone (unreadable
         # footage, not a field-phase miss) and must keep the coarse-only fast path.
@@ -1793,7 +1793,7 @@ class ShortSpanPolicy:
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
             window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
         )
-        # Interlaced field-phase retry (issue-027): a None-reading integer-second
+        # Interlaced field-phase retry: a None-reading integer-second
         # frame inside the gap may be legible on the other field, t+0.5. Gated on
         # any_ocr — an all-None window is a true Splice Dead Zone, not a
         # field-phase miss, and falls through to the visual-anchor/coarse path.

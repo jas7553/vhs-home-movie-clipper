@@ -447,7 +447,7 @@ class TestRefineSplit:
         assert t == 20.0
         assert method == "ocr"
 
-    # --- tail-leak fixes (issue-018, 2026-07-03 update) ---
+    # --- tail-leak fixes (2026-07-03 update) ---
 
     def test_confirmed_candidate_not_cancelled_by_later_offdate_misread(self):
         # Mirrors the real 2/11->2/16 tail leak (b15, 2.6s leak): a genuine
@@ -716,7 +716,7 @@ class TestRefineSplitTwoPass:
 
 
 # ---------------------------------------------------------------------------
-# Field-phase retry (issue-027): interlaced VHS fields can differ, so a frame
+# Field-phase retry: interlaced VHS fields can differ, so a frame
 # that reads None at integer t may be legible at t+0.5 (the other field). The
 # retry is scoped to None frames inside the gap only — see
 # _retry_gap_at_half_phase.

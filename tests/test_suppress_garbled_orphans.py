@@ -76,7 +76,7 @@ class TestSuppressGarbledOrphans:
 
 
 class TestRealSessionGate:
-    """issue-029: at interval 1 nearly every boundary is tagged garbled, so the
+    """At interval 1 nearly every boundary is tagged garbled, so the
     pair rule deleted real sessions sitting < threshold apart. A span holding >= 2
     legible reads of one date is a real session and must be kept."""
 
@@ -99,7 +99,7 @@ class TestRealSessionGate:
         assert n == 0
 
     def test_true_orphan_no_reads_still_suppressed(self):
-        # issue-024 behaviour preserved: span has no legible reads → suppress
+        # True-orphan behaviour preserved: span has no legible reads → suppress
         splits = [0.0, 1304.0, 1310.0, 2000.0]
         garbled = {1304.0, 1310.0}
         dated = [(500.0, self._dt(1, 6, 8)), (1500.0, self._dt(1, 8, 8))]

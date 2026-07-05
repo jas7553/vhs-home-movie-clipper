@@ -123,7 +123,7 @@ class TestSuccessorFallback:
 
 
 class TestIslandNotPropagated:
-    """A date island (misread) must not be a fill anchor (issue-030 fix 2).
+    """A date island (misread) must not be a fill anchor.
 
     Otherwise a single-frame misread gets copied onto adjacent time-only reads,
     becoming a multi-reading run that drop_date_islands can no longer catch.

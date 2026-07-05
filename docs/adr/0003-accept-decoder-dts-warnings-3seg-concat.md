@@ -8,7 +8,7 @@ accepted
 
 Clips whose `exact_start` and `exact_end` are both present and both at least `MIN_BOUNDARY_SEG` from their respective keyframes go through a 3-segment concat path: a re-encoded lead + a stream-copied body + a re-encoded trail. These clips, and any other clip with a long stream-copied body, can emit non-monotonic DTS warnings from the H.264 decoder (`ffmpeg -v warning -f null -`).
 
-Issue-017 fixed the originally-reported cases (clip16, clip71, clip09) by adding `+igndts` to the copy and concat steps. Issue-020 investigated the residual and found warnings concentrated in a small number of clips with long stream-copied bodies.
+An earlier fix for the originally-reported cases (clip16, clip71, clip09) added `+igndts` to the copy and concat steps. A follow-up investigation into the residual found warnings concentrated in a small number of clips with long stream-copied bodies.
 
 **Root cause:** The stream-copied body inherits VFR source PTS values — some frames are very close together or have near-duplicate PTS from the original analog capture. The concat step uses `+igndts` to recompute DTS from PTS across the seam, but this propagates those irregular VFR PTS values into the DTS sequence. The H.264 decoder emits decoder-layer warnings wherever it encounters equal or near-equal DTS values throughout the body. The warnings are **not** confined to the seam region — on long clips the decoder warnings span the **entire clip**: e.g. clip04 (1990-01-06, ~32 min) shows up to 103 warnings with DTS values ranging from 241 to 57424, spaced ~561 ticks apart across the full clip duration. The container-level DTS remains strictly increasing — `ffprobe -show_entries packet=dts_time` finds zero backward or equal DTS events.
 

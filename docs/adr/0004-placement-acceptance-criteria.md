@@ -23,9 +23,9 @@ policy) — but no single per-class definition of done. The observable consequen
   is unsatisfiable by design (CONTEXT.md: "Frame-accurate Placement is unsatisfiable
   there") and the noise burst is *deliberately* left in the outgoing clip's tail —
   which looks exactly like a misplaced cut to a reviewer who hasn't read ADR 0001.
-- Each placement issue re-litigated what counts as a failure. Issue-006 ruled a 0.3s
-  tail residual "within spec"; issue-018 later found 2–4s leaks and had to re-derive
-  the pass/fail line from REQUIREMENTS line numbers; issue-021 invented its own
+- Each placement review re-litigated what counts as a failure. One review ruled a 0.3s
+  tail residual "within spec"; a later one found 2–4s leaks and had to re-derive
+  the pass/fail line from REQUIREMENTS line numbers; another invented its own
   acceptance list. Three documents, three ad-hoc rubrics.
 - The existing requirements *contradict each other* at the margin (see "Contradictions
   this ADR must resolve" below), so even a diligent reviewer cannot grade consistently.
@@ -43,19 +43,19 @@ Found while cross-checking the evidence base; each is resolved by a decision bel
 1. **REQUIREMENTS L17 vs L23.** L17: cross-date contamination "is a failure regardless
    of magnitude or duration." L23: "1-second resolution is the acceptable floor." A cut
    within the 1s floor can leave up to ~1s of adjacent-date footage at a clip edge
-   (issue-006 verified ~0.3s of next-date footage in a tail at integer-second
+   (verified ~0.3s of next-date footage in a tail at integer-second
    granularity), so L17 as written is unsatisfiable without the sub-second dense scan
-   L23 explicitly defers. Practice (issue-006, issue-018's "≤1s" acceptance lines) has
+   L23 explicitly defers. Practice ("≤1s" acceptance lines from prior reviews) has
    already resolved this toward L23. This ADR codifies that: purity is judged at the
    1-second measurement floor.
 2. **ADR 0001 vs the SDZ seconds-guardrails.** ADR 0001: splice quality "is measured by
    clip-content (date-purity) audit, not a labeled boundary set" — a per-second error
-   at an Ambiguity Window is meaningless. Yet issues 018/021 gate changes on
+   at an Ambiguity Window is meaningless. Yet prior reviews gate changes on
    `measure_placement.py` SDZ median/max seconds. Resolution: the seconds numbers are a
    *relative regression guardrail* (did a change move splice cuts the wrong way), never
    an *acceptance criterion*. Acceptance at an SDZ is purity-only.
-3. **SDZ guardrail numbers disagree.** Issue-007 (2026-06-21) measured SDZ median
-   1.0s / max 12s on the hand-labeled set; issue-018 later reports "SDZ median 2.0s,
+3. **SDZ guardrail numbers disagree.** A 2026-06-21 review measured SDZ median
+   1.0s / max 12s on the hand-labeled set; a later review reports "SDZ median 2.0s,
    max 4s — not worse than baseline" *after* fixing `measure_placement.py`'s crop
    (`250:110:385:370` → `560:130:40:350`) and its stale `group_clips` call. The two
    figures come from different script versions and are not comparable. The guardrail
@@ -110,7 +110,7 @@ Classes are decided per placed cut `t_c`, from two machine-derivable inputs:
   If the non-legible run through `t_c` reaches the window edge, extend symmetrically
   until the run is bracketed by legible reads or 120s per side is reached.
   Each sample is one of: **legible** (strict parse succeeds), **garble-attributable**
-  (parse fails but `_gap_date_class` assigns old/new from raw text — issue-007), or
+  (parse fails but `_gap_date_class` assigns old/new from raw text), or
   **noise** (no date evidence).
 - **Scene cuts `S`**: PySceneDetect `AdaptiveDetector` output over
   `[t_c − 20s, t_c + 2s]` (the finding-003 v2 window; fixed-threshold detectors fire
@@ -132,7 +132,7 @@ Notes:
 - Garble-attributable samples count as *non-legible* for classification but remain
   *date-attributable* for the purity judgments below. This is deliberate: a 5s run of
   garbled new-date frames classifies the boundary as SDZ, but those frames still
-  belong to the incoming clip (issue-007's garbled-new fix, issue-018's re-scope).
+  belong to the incoming clip (a prior garbled-new fix and re-scope).
 - The class is decided around the *placed* cut. A cut so misplaced that the true
   change is outside the (extended) window is a gross failure caught by the whole-clip
   purity backstop, not by this classifier.
@@ -144,9 +144,9 @@ Notes:
 
 | Class | Acceptance criterion | Basis |
 |---|---|---|
-| **CLEAN** | No date-attributable frame of the *previous* session's date at `t ≥ t_c + 1.0s`, and no date-attributable frame of the *next* session's date at `t ≤ t_c − 1.0s`. Equivalently: cut within ≤ 1.0s of the true change; up to 1.0s of adjacent-date footage at a clip edge is **in spec**. | REQUIREMENTS L23 (1s floor); issue-006 (integer-second dense scan; ~0.3s residual achievable; sub-second requires ~10× OCR per the dense-scan analysis); issue-018 graded 2–4s leaks as real defects and ≤1s as pass. |
+| **CLEAN** | No date-attributable frame of the *previous* session's date at `t ≥ t_c + 1.0s`, and no date-attributable frame of the *next* session's date at `t ≤ t_c − 1.0s`. Equivalently: cut within ≤ 1.0s of the true change; up to 1.0s of adjacent-date footage at a clip edge is **in spec**. | REQUIREMENTS L23 (1s floor); integer-second dense scan, ~0.3s residual achievable, sub-second requires ~10× OCR per the dense-scan analysis; prior reviews graded 2–4s leaks as real defects and ≤1s as pass. |
 | **VISIBLE SHOT CHANGE** | CLEAN criterion, tightened to **≤ 0.5s**: the cut lands within 0.5s of the shot-change frame. | Finding 005's two audited clean snaps (−0.49s → ~0.3s residual; −0.25s → on the transition); v3 `SCENE_SNAP_ACCEPT_S = 0.5` bounds the snap move. **Thin evidence — two audited boundaries**; ratify or demote to ≤1.0s. |
-| **SPLICE DEAD ZONE** | Judged by **content purity only**; a per-second error number is not an acceptance measure here (ADR 0001). Three conditions: (a) the incoming clip contains **zero** date-attributable wrong-date frames — legible *or* garble-attributable — at its head; (b) the outgoing clip's tail contains no date-attributable *new*-date frames (legible or garble-attributable); (c) the outgoing tail **may and normally will** carry the non-attributable noise burst — up to `len(R)` seconds of static/garble at the tail is correct behavior, not a defect. | ADR 0001 (objective: no wrong-date footage; burst belongs to the tail); REQUIREMENTS L29; issue-007 (garbled-new belongs to the incoming clip); issue-018 re-scope (legible next-date frames inside the burst belong to the new clip). |
+| **SPLICE DEAD ZONE** | Judged by **content purity only**; a per-second error number is not an acceptance measure here (ADR 0001). Three conditions: (a) the incoming clip contains **zero** date-attributable wrong-date frames — legible *or* garble-attributable — at its head; (b) the outgoing clip's tail contains no date-attributable *new*-date frames (legible or garble-attributable); (c) the outgoing tail **may and normally will** carry the non-attributable noise burst — up to `len(R)` seconds of static/garble at the tail is correct behavior, not a defect. | ADR 0001 (objective: no wrong-date footage; burst belongs to the tail); REQUIREMENTS L29; garbled-new belongs to the incoming clip; legible next-date frames inside the burst belong to the new clip (later re-scope). |
 | **LONG DEAD ZONE** | **No acceptance criterion — explicitly out of scope** (ADR 0001, CONTEXT.md). Only obligations: the classifier must not treat a >120s run as an SDZ (no end-of-burst placement), and the run's occurrence should be logged for the owner. A spot-check finding a bad cut inside an LDZ is *recorded, not graded*. | ADR 0001 scope clause; CONTEXT.md Long Dead Zone entry. |
 
 The seconds-based SDZ statistics from `measure_placement.py` (median/max over the
@@ -196,7 +196,7 @@ frame-perfection:
 - **At a CLEAN boundary**: the outgoing clip may show up to ~1 second of the next
   day's footage at its very end, or the incoming clip up to ~1 second of the previous
   day at its start. **Within one second this is in spec** — the dense scan is
-  integer-second (issue-006). More than ~1s of wrong-date content at an edge is a
+  integer-second. More than ~1s of wrong-date content at an edge is a
   defect: file it citing this ADR and the measured leak length.
 - **At a VISIBLE SHOT CHANGE**: the clip edge should sit essentially on the shot
   change — half a second of slop at most. If you can see a clearly leaked shot
@@ -241,7 +241,7 @@ contradiction 1 stands.
 
 1. **CLEAN ≤1s: kept, but restated two-sidedly and operationally** (no old-date
    attributable frame ≥1s after the cut; no new-date attributable frame ≥1s before
-   it). The one-number form hides which side leaked; issue-018 showed head and tail
+   it). The one-number form hides which side leaked; a prior review showed head and tail
    leaks have different root causes and must be separately visible in a report.
 2. **VISIBLE SHOT CHANGE ≤0.5s: kept, but the class is defined by the detector
    signature (adaptive cut within ±0.5s), not by "a scene cut exists somewhere near
@@ -254,7 +254,7 @@ contradiction 1 stands.
    (−0.59 to −0.96s, all into old-session content) that the tight window exists to
    block. Owner may override (open question 4).
 3. **SDZ purity: strengthened.** The brief said "outgoing tail may carry the
-   unwatchable noise burst." Correct, but insufficient: issue-007 and issue-018 both
+   unwatchable noise burst." Correct, but insufficient: prior reviews
    show the gap is often *garbled-attributable*, not pure noise, and garbled
    *new*-date frames dragged into the tail were a real, fixed bug. The criterion
    therefore distinguishes noise (tail is fine) from date-attributable garble (must
@@ -331,8 +331,8 @@ Only the owner can decide these; the ADR stays "proposed" until they are answere
 - Spot-checks gain a decidable rubric: static at an outgoing tail before a splice is
   graded PASS, not filed as a misplaced cut; a 2s leak at a CLEAN boundary is a
   defect without needing a new REQUIREMENTS exegesis per issue.
-- Issues 006/018/021's ad-hoc acceptance lines are superseded by the class table once
-  this ADR is accepted; future placement issues cite a class and a criterion.
+- Prior reviews' ad-hoc acceptance lines are superseded by the class table once
+  this ADR is accepted; future placement reviews cite a class and a criterion.
 - A placement report tool (measurement procedure above) becomes the acceptance
   instrument; `date_purity.py` is demoted to backstop and needs its crop fixed;
   `measure_placement.py` is demoted to relative guardrail pending re-baseline.
