@@ -457,11 +457,48 @@ class TestDropDayConfusionRuns:
         result = mdy(drop_day_confusion_runs(s))
         assert result == [(5,16,1990),(5,16,1990),(5,28,1990),(5,28,1990),(5,16,1990),(5,16,1990)]
 
-    def test_digit_count_mismatch_kept(self):
-        # day 6 (1 digit) vs day 18 (2 digits): different length, must not drop
-        s = mk_mo((5,6,1990),(5,6,1990),(5,18,1990),(5,18,1990),(5,6,1990),(5,6,1990))
+    def test_digit_count_mismatch_not_confusable_pair_kept(self):
+        # day 6 (1 digit) vs day 19 (2 digits): 9 vs 6 not a confusable pair and
+        # ones-digit != outer, so not a space-insertion match either — keep.
+        s = mk_mo((5,6,1990),(5,6,1990),(5,19,1990),(5,19,1990),(5,6,1990),(5,6,1990))
         result = mdy(drop_day_confusion_runs(s))
-        assert result == [(5,6,1990),(5,6,1990),(5,18,1990),(5,18,1990),(5,6,1990),(5,6,1990)]
+        assert result == [(5,6,1990),(5,6,1990),(5,19,1990),(5,19,1990),(5,6,1990),(5,6,1990)]
+
+    def test_space_insertion_exact_ones_match_dropped(self):
+        # outer day 6 (rendered "1/ 6"), run day 16 — pure space misread as
+        # tens-digit '1', ones digit matches outer exactly.
+        s = mk_mo((1,6,1990),(1,6,1990),(1,16,1990),(1,16,1990),(1,6,1990),(1,6,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(1,6,1990)] * 4
+
+    def test_space_insertion_plus_confusable_ones_dropped(self):
+        # outer day 6, run day 18 — space->'1' tens digit PLUS 6<->8
+        # ones-digit confusion (Converse 1990 clip05 phantom).
+        s = mk_mo((1,6,1990),(1,6,1990),(1,18,1990),(1,18,1990),(1,6,1990),(1,6,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(1,6,1990)] * 4
+
+    def test_space_insertion_interval1_span_cap_repro(self):
+        # 1s spacing: 2-reading 1/18 misread bracketed by 1/6 runs, spans
+        # ~1s <= 10s cap -> dropped.
+        seq = ([(1,6,1990)]*3 + [(1,18,1990)]*2 + [(1,6,1990)]*3)
+        s = [(float(i), datetime(y, m, d, 12, 0)) for i, (m, d, y) in enumerate(seq)]
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(1,6,1990)] * 6
+
+    def test_space_insertion_long_real_session_kept(self):
+        # A genuine long 01-18 session bracketed by 01-06 sessions must survive
+        # the span cap exactly like real confusion-run neighbours do.
+        seq = ([(1,6,1990)]*3 + [(1,18,1990)]*15 + [(1,6,1990)]*3)
+        s = [(float(i), datetime(y, m, d, 12, 0)) for i, (m, d, y) in enumerate(seq)]
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == seq
+
+    def test_space_insertion_outer_day_out_of_range_kept(self):
+        # outer day 16 is not a single space-rendered digit (1-9) -> no match
+        s = mk_mo((5,16,1990),(5,16,1990),(5,26,1990),(5,26,1990),(5,16,1990),(5,16,1990))
+        result = mdy(drop_day_confusion_runs(s))
+        assert result == [(5,16,1990),(5,16,1990),(5,26,1990),(5,26,1990),(5,16,1990),(5,16,1990)]
 
     def test_single_reading_island_does_not_crash(self):
         # A lone differing reading (drop_date_islands' job, not this filter's) —

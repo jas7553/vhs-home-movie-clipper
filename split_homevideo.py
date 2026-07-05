@@ -1095,6 +1095,20 @@ def _day_digits_confusable(a: int, b: int) -> bool:
     return frozenset({int(da), int(db)}) in _DAY_CONFUSABLES
 
 
+def _day_space_insertion(run_day: int, outer_day: int) -> bool:
+    """True if run_day is outer_day with a leading-space misread as a '1' tens
+    digit (M/ D → M/1D), optionally compounded with a ones-digit confusion.
+
+    e.g. outer 6 -> run 16 (space->1) or run 18 (space->1 AND 6<->8).
+    """
+    if not (1 <= outer_day <= 9):
+        return False
+    if not (10 <= run_day <= 19):
+        return False
+    ones = run_day - 10
+    return ones == outer_day or frozenset({ones, outer_day}) in _DAY_CONFUSABLES
+
+
 def drop_day_confusion_runs(
     samples: list[tuple[float, "datetime | None"]],
 ) -> list[tuple[float, "datetime | None"]]:
@@ -1112,7 +1126,9 @@ def drop_day_confusion_runs(
       2. The run's date has the same month and year as the outer date.
       3. run_date.day and outer.day are equal-length numbers differing in
          exactly one digit position, and that digit pair is in _DAY_CONFUSABLES
-         (see `_day_digits_confusable`).
+         (see `_day_digits_confusable`) -- OR run_date.day is a leading-space
+         misread as a '1' tens digit of outer.day (see `_day_space_insertion`,
+         e.g. outer 1/ 6 read as run 1/18).
 
     Genuine out-of-order sessions (different month, different year, or a day
     pair not matching the confusable-digit shape) are never dropped.
@@ -1157,7 +1173,10 @@ def drop_day_confusion_runs(
             _run_span_s(samples, run_indices) <= _CONFUSION_RUN_MAX_S
             and run_date.month == outer.month
             and run_date.year == outer.year
-            and _day_digits_confusable(run_date.day, outer.day)
+            and (
+                _day_digits_confusable(run_date.day, outer.day)
+                or _day_space_insertion(run_date.day, outer.day)
+            )
         ):
             drop.update(run_indices)
 
