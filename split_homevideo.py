@@ -2004,7 +2004,7 @@ def snap_to_scene_cut(
     )
     scenes = detect(video, det, start_time=lo, end_time=hi)
     # Each scene's start (after the first) is a detected shot-change frame.
-    cuts = [s[0].get_seconds() for s in scenes[1:]]
+    cuts = [s[0].seconds for s in scenes[1:]]
 
     # Burst detection: wide before-window, any after-cut within (t, hi].
     burst_lo = max(lo, t - burst_accept_s)
