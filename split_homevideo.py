@@ -95,6 +95,11 @@ VIDEO_TIMESCALE = 29970  # matches source tbn; same on all segs/concat to preven
 MIN_BOUNDARY_SEG = 0.05  # s; boundary re-encodes shorter than ~1 frame (29.97fps≈0.033s)
                          # produce zero video frames and corrupt the concat — skip them.
 
+
+def _sidecar_path(video: str, suffix: str) -> str:
+    """Sidecar file next to the video, not CWD-relative."""
+    return str(Path(video).with_name(Path(video).stem + suffix))
+
 # OCR preprocessing filter chain — FALLBACK ONLY, not primary.
 # yadif: deinterlaces VHS comb artifacts; format=gray: removes color noise Vision ignores anyway;
 # scale 4×: more glyph detail than 3×; unsharp: crisp edges post-scale; eq: harden contrast.
@@ -2466,8 +2471,8 @@ def main() -> None:
 
     out_dir = args.out_dir or (Path(video).stem + "_clips")
     out_dir = os.path.abspath(out_dir)
-    cache = Path(video).stem + "_ocr_cache.json"
-    visual_cache = Path(video).stem + "_visual_cache.json"
+    cache = _sidecar_path(video, "_ocr_cache.json")
+    visual_cache = _sidecar_path(video, "_visual_cache.json")
 
     if args.crop is not None:
         crop = args.crop
