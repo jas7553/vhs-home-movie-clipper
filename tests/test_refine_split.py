@@ -842,6 +842,28 @@ class TestGapDateClass:
         old = new = datetime(1990, 1, 4)
         assert _gap_date_class("5:03 PM 4/90", old, new) == "noise"
 
+    def test_clip32_time_line_disambiguates_old(self):
+        # issue-035: date digits garbled beyond recognition ('8790'), but the
+        # legible time line (7:42 AM) matches old (7:42) not new (8:07).
+        old, new = datetime(1990, 4, 8, 7, 42), datetime(1990, 4, 11, 8, 7)
+        assert _gap_date_class("7:42 AM 8790", old, new) == "old"
+        assert _gap_date_class("7 42 AM 47 8/90", old, new) == "old"
+
+    def test_time_line_disambiguates_new(self):
+        old, new = datetime(1990, 4, 8, 7, 42), datetime(1990, 4, 11, 8, 7)
+        assert _gap_date_class("8:07 AM garbled", old, new) == "new"
+
+    def test_time_line_ignored_when_sessions_share_time(self):
+        # old/new times coincide (within tolerance): time line non-discriminating,
+        # date-only behavior unchanged even though the frame has a legible time.
+        old = datetime(1990, 4, 8, 7, 42)
+        new = datetime(1990, 4, 11, 7, 44)
+        assert _gap_date_class("7:42 AM garbled", old, new) == "noise"
+
+    def test_time_line_not_close_to_either_stays_noise(self):
+        old, new = datetime(1990, 4, 8, 7, 42), datetime(1990, 4, 11, 8, 7)
+        assert _gap_date_class("3:15 PM garbled", old, new) == "noise"
+
 
 class TestPlaceContentAware:
     def _readings(self, mapping):

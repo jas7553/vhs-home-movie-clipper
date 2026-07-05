@@ -1607,10 +1607,19 @@ def _lenient_months(raw: str) -> set[int]:
     return out
 
 
+_GAP_TIME_TOLERANCE_MIN = 5
+
+
 def _gap_date_class(raw: str, old_dt: datetime, new_dt: datetime) -> str:
     """Classify a garbled gap frame as 'old', 'new', or 'noise' by which session's
     date its recoverable digits match. Only fields that *differ* between the two
-    sessions discriminate; a field shared by both (e.g. same day) is ignored."""
+    sessions discriminate; a field shared by both (e.g. same day) is ignored.
+
+    When the date digits are too garbled to discriminate, fall back to the time
+    line: a frame reading close to old_dt's H:MM (and not new_dt's) is 'old', and
+    vice versa. Only used when old_dt/new_dt's own times actually differ by more
+    than the drift tolerance — a same-time gap (pure date/day jump) gives the
+    time line nothing to discriminate on, so behavior there is unchanged."""
     days = _lenient_days(raw)
     months = _lenient_months(raw)
     new_hit = (new_dt.day in days and new_dt.day != old_dt.day) \
@@ -1621,6 +1630,19 @@ def _gap_date_class(raw: str, old_dt: datetime, new_dt: datetime) -> str:
         return "new"
     if old_hit and not new_hit:
         return "old"
+    if not new_hit and not old_hit:
+        old_hm = old_dt.hour * 60 + old_dt.minute
+        new_hm = new_dt.hour * 60 + new_dt.minute
+        if abs(old_hm - new_hm) > _GAP_TIME_TOLERANCE_MIN:
+            time_hm = _parse_time_only(raw)
+            if time_hm is not None:
+                hm = time_hm[0] * 60 + time_hm[1]
+                old_close = abs(hm - old_hm) <= _GAP_TIME_TOLERANCE_MIN
+                new_close = abs(hm - new_hm) <= _GAP_TIME_TOLERANCE_MIN
+                if old_close and not new_close:
+                    return "old"
+                if new_close and not old_close:
+                    return "new"
     return "noise"
 
 
