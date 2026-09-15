@@ -25,15 +25,9 @@ python3 split_homevideo.py "YourFile.mp4"
 python3 split_homevideo.py "YourFile.mp4" --gap 3600
 ```
 
-Key flags: `--interval N` (OCR sample rate, default 10s), `--gap N` (camera-time jump threshold, default 3600s), `--mode {scene,session,daily}` (default daily), `--crop W:H:X:Y` (timestamp region), `--out-dir DIR`.
-
 ## Architecture
 
-Two-file project:
-
-**`ocr_timestamp.swift`** — compiled to `ocr_timestamp` binary. Takes image paths as args, runs Apple Vision `VNRecognizeTextRequest` on each, prints `<path>\t<text>` to stdout. Called in batch by the Python script.
-
-**`split_homevideo.py`** — main pipeline, six stages:
+**`split_homevideo.py`** — main pipeline (`ocr_timestamp.swift` is the OCR binary it shells out to), six stages:
 
 1. **Scan** (`scan()`): Decodes at `FRAMES_PER_SAMPLE/N` fps, **crop-only** (no preprocessing — it has the higher OCR yield, ~67% vs ~45% per single frame), 3 frames per interval. `ocr_batch()` runs the binary over all frames; majority vote within each interval window. Windows that read nothing get a second **preprocessing fallback** pass (`_VF_PREPROCESS`, which uniquely recovers a few %). Results cached to `<stem>_ocr_cache.json` as raw OCR text (re-parsed at load so parser fixes don't require re-scan).
 
@@ -55,11 +49,10 @@ Two-file project:
 - **Default crop** `560:130:40:350` covers the full bottom overlay band on 640×480 source. Captures left/center/right overlays. Old right-anchored default `250:110:385:370` clipped off-center overlays.
 - **Default mode is `daily`**: one clip per calendar date, no date split across clips. Use `--mode session` for intra-day splits.
 - **Date islands (replaces phantom collapse)**: a single isolated reading whose date differs from both neighbours is an OCR misread (wrong day/month/year). `drop_date_islands()` removes these before boundary detection, so they never create spurious boundaries — including a misread sitting *exactly* on a real session change, which the former `_collapse_revert_phantoms` mis-handled by merging the two real sessions. A real session is a contiguous run of ≥2 same-date readings and is never dropped, so genuine short / out-of-order sessions survive (e.g. a 9/01 run physically between 3/25 and 4/08 on a re-recorded tape). Validated on Converse 1990.mp4 — 3 merged-session bugs → 0.
-- Split output filenames: `<stem>_clipNN_YYYY-MM-DD.mp4` (daily mode) or `<stem>_clipNN_YYYY-MM-DD_HHMM.mp4` (session/scene mode)
 - **Detection vs Placement** (do not conflate): *Detection* = does a boundary exist near t. *Placement* = how many seconds the cut lands from the true session change. Independent metrics — defined in `CONTEXT.md`, measurement framed in ADR 0001 (placement judged by clip-content audit, not per-boundary human labels).
 - **Splice Dead Zone** (≲120s all-`None` at a tape splice) vs **Long Dead Zone** (≳120s, up to 2160s of unreadable footage). The end-of-noise-burst placement policy applies *only* to Splice Dead Zones; Long Dead Zone handling is unsolved/out of scope.
-- **Decoder DTS warnings on long-body stream-copied clips are expected and benign** — container DTS stays strictly increasing, no frozen/dropped frames, media players unaffected. Fixing would require re-encoding the whole body, defeating the stream-copy design. Full root-cause + evidence: `docs/adr/0003-accept-decoder-dts-warnings-3seg-concat.md`.
-- **Visual signals: anchor always-on, drop-filter opt-in.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates for splice placement. `fuse_boundaries` (drops OCR boundaries lacking visual corroboration) stays behind `--enable-visual-fusion`, default **off** — VHS pause/resume often has no visual discontinuity, so the filter would delete real boundaries. Separately, **scene-snap (pass 3, PySceneDetect `AdaptiveDetector`) is default ON** (`--no-enable-scene-snap` to disable): sub-second snap of each refined cut — backward ≤0.5s onto a clean shot change, forward to burst-end at a noise splice (findings 003/005).
+- **Decoder DTS warnings on long-body stream-copied clips are expected and benign** — container DTS stays strictly increasing, no frozen/dropped frames, media players unaffected. Fixing would require re-encoding the whole body, defeating the stream-copy design. Do not chase them.
+- **Visual signals anchor, never filter.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates for splice placement. A visual-corroboration drop-filter was tried and removed — VHS pause/resume often has no visual discontinuity, so it deleted real boundaries. Separately, **scene-snap (pass 3, PySceneDetect `AdaptiveDetector`) is default ON** (`--no-enable-scene-snap` to disable): sub-second snap of each refined cut — backward ≤0.5s onto a clean shot change, forward to burst-end at a noise splice (findings 003/005).
 - **Reconstruction tenet (fundamental):** concatenating the clips in order must effectively recreate the original video — nothing discarded, nothing reordered. Rules out any footage-dropping cut policy. Seams currently overlap ~±0.3s (keyframe snap), within tolerance. See REQUIREMENTS.md.
 - **Placement definition of done: ADR 0004 (ratified 2026-07-03).** CLEAN boundary ≤1s (sub-second residuals are NOT bugs); visible shot change ≤0.5s; Splice Dead Zone judged by purity only (static in outgoing tail = correct); Long Dead Zone no requirement. Measure with `.scratch/placement_report.py` (per-boundary ruler; run before/after ANY placement change) — not `date_purity.py` (edge-blind backstop).
 
@@ -75,6 +68,4 @@ Canonical label strings: `needs-triage`, `needs-info`, `ready-for-agent`, `ready
 
 ### Domain docs
 
-Single-context layout: `CONTEXT.md` (vocabulary) + `docs/REQUIREMENTS.md` (goals/constraints) + `docs/adr/` (decisions) + `docs/findings/` (dated evidence).
-
-Dated empirical discoveries go in `docs/findings/NNN-slug.md` (evidence, not goals/decisions) — see `docs/findings/README.md` for how it relates to specs/ADRs/requirements.
+`CONTEXT.md` (vocabulary) + `docs/REQUIREMENTS.md` (goals/constraints) + `docs/adr/` (decisions) + `docs/findings/` (dated evidence, `NNN-slug.md`; refer to tapes by year, never by filename).

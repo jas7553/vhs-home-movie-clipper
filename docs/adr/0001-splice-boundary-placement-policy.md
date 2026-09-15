@@ -19,7 +19,7 @@ This produced a long churn of fixes that kept moving the error from one side to 
 - **Objective: no wrong-date footage.** The (unwatchable) noise burst belongs to the outgoing clip's tail, so the new-day clip starts clean.
 - **Anchor rule:** cut at the **last** visual event within the all-`None` span of the dense refine scan. Fallback when the span has no visual event: cut at the **end of the None-span** (just before the first clean new-date frame). Never `coarse_t` for a confirmed splice.
 - **Scope:** policy applies only to **Splice Dead Zones** (≲120s of `None`). **Long Dead Zones** (up to 2160s of genuinely unreadable footage) are a separate, out-of-scope concept.
-- **Visual anchoring is always-on; the drop-filter is opt-in.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates during refinement. `fuse_boundaries` — which *drops* OCR boundaries lacking visual corroboration — stays behind `--enable-visual-fusion`, default **off**, because VHS pause/resume frequently has no visual discontinuity and the filter would delete real boundaries.
+- **Visual signals anchor, never filter.** `detect_visual_boundaries` runs automatically (cached) to supply anchor candidates during refinement. A visual-corroboration drop-filter was tried and removed: VHS pause/resume frequently has no visual discontinuity, so it deleted real boundaries.
 - **Quality is measured by clip-content (date-purity) audit, not a labeled boundary set.** Sampling frame content vs. filename date directly answers "is the content correct?" — the real objective. The former AI-labeled Detection golden set (`Converse 1990_golden_labels.jsonl`, once cited at F1=0.920) was **abandoned**: machine-generated verdicts gave false confidence and never reconciled with hand spot-checks. Per-boundary ground-truth labeling is deprecated.
 
 ## Considered options
@@ -28,10 +28,9 @@ This produced a long churn of fixes that kept moving the error from one side to 
 - **Earliest visual event (`anchors[0]`, as shipped in dbca807):** start-of-burst → cuts ~13–15s *early*; verified to overcorrect on both test boundaries. Superseded.
 - **Drop the noise burst (double-cut, discard span):** cleanest clips but loses footage and complicates the cut model. Rejected.
 - **Midpoint of the window:** arbitrary; leaves wrong-date footage on whichever side the true change sat. Rejected.
-- **Chase a finer signal (audio transient, OCR-confidence, perceptual hash):** rejected as a class — all signals saturate inside the burst, so more signals cannot resolve the window. See `docs/SPEC_rejected_signals.md`.
+- **Chase a finer signal (audio transient, OCR-confidence, perceptual hash):** rejected as a class — all signals saturate inside the burst, so more signals cannot resolve the window.
 
 ## Consequences
 
-- `dbca807` is corrected fix-forward (not reverted): anchor flipped to last-in-None-span, fusion drop-filter decoupled back to opt-in.
 - `REQUIREMENTS.md` frame-accuracy requirement is narrowed to "where OCR-recoverable"; splice boundaries follow the window policy.
 - Long Dead Zone handling remains an open problem.

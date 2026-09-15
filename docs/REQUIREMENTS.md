@@ -38,9 +38,9 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **The pipeline must tolerate consecutive OCR misreads without creating phantom clip boundaries.** A run of 2–3 frames reading a wrong date should be filtered out, not treated as a real date change.
 
-**Gap thresholds must be empirically tuned, not guessed.** The `--gap` default (currently 3600s camera-time) was derived from a labeled boundary set (detection regression guard; see ADR 0001). Any change to the default requires evidence from labeled data.
+**Gap thresholds must be empirically tuned, not guessed.** The `--gap` default (currently 3600s camera-time) was validated by date-purity audit of the resulting clips (ADR 0001). Any change to the default requires the same evidence.
 
-**Re-tuning must not require re-scanning.** Changing `--gap`, `--mode`, or `--min-clip` should hit the OCR cache and return results in seconds. Only changes to the preprocessing filter chain or OCR engine require a new scan.
+**Re-tuning must not require re-scanning.** Changing `--gap` or `--mode` should hit the OCR cache and return results in seconds. Only changes to the preprocessing filter chain or OCR engine require a new scan.
 
 ---
 
@@ -68,9 +68,9 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 ## Signal quality
 
-**The primary boundary signal is OCR timestamps.** Other signals (scene score, silence, freeze) have been evaluated and rejected as standalone proposers; see `docs/SPEC_rejected_signals.md`.
+**The primary boundary signal is OCR timestamps.** Other signals (scene score, silence, freeze) have been evaluated and rejected as standalone proposers — they all saturate inside a splice noise burst (ADR 0001).
 
-**Visual corroboration is opt-in, not default.** The existing `detect_visual_boundaries` / `fuse_boundaries` path may be used to corroborate OCR-detected boundaries but must not propose new ones independently.
+**Visual signals anchor placement; they never propose or veto boundaries.** `detect_visual_boundaries` supplies anchor candidates for splice placement only. A corroboration drop-filter was removed because VHS pause/resume often has no visual discontinuity.
 
 **VHS static/noise in the frame before a boundary is a reliable real-splice indicator** and should be usable as a positive signal if a second-signal path is added.
 
