@@ -18,10 +18,6 @@ def _boundary(video_t, btype="large_gap", cam_before=None, cam_after=None, cam_j
 
 
 class TestModeFiltering:
-    def test_scene_includes_all_types(self):
-        boundaries = [_boundary(100, "gap"), _boundary(200, "large_gap")]
-        assert group_clips(boundaries, "scene") == [0.0, 100, 200]
-
     def test_session_only_large_gap(self):
         boundaries = [_boundary(100, "gap"), _boundary(200, "large_gap")]
         assert group_clips(boundaries, "session") == [0.0, 200]

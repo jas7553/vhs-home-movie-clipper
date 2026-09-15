@@ -49,19 +49,6 @@ class TestRunFlagContracts:
             run(_config(video, no_visual_anchor=True))
         m_vis.assert_not_called()
 
-    def test_enable_visual_fusion_calls_fuse_boundaries(self, tmp_path):
-        video = tmp_path / "v.mp4"
-        video.touch()
-        with mock.patch("split_homevideo.scan", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.filter_ocr_outliers", return_value=[(0.0, _DT)]), \
-             mock.patch("split_homevideo.find_all_boundaries", return_value=[]), \
-             mock.patch("split_homevideo.group_clips", return_value=[0.0]), \
-             mock.patch("split_homevideo.get_duration", return_value=200.0), \
-             mock.patch("split_homevideo.detect_visual_boundaries", return_value=([], [])), \
-             mock.patch("split_homevideo.fuse_boundaries", return_value=[]) as m_fuse:
-            run(_config(video, enable_visual_fusion=True))
-        m_fuse.assert_called_once()
-
 
 class TestRunDryRunMergeAndWarnings:
     """Cover merge_short print and same_date_adjacent warning in dry-run path."""

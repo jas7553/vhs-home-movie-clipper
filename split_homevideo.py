@@ -7,7 +7,7 @@ Usage:
 
 Arguments:
     --gap       Camera timestamp gap (seconds) that triggers a new clip (default: 3600)
-    --mode      Clip grouping mode: scene, session, or daily (default)
+    --mode      Clip grouping mode: session or daily (default)
     --interval  Seconds between sampled frames (default: 10)
     --out-dir   Output directory for clips (default: <input>_clips/)
     --crop      ffmpeg crop "w:h:x:y" for timestamp region
@@ -45,8 +45,7 @@ DEFAULT_CROP = "560:130:40:350"   # w:h:x:y; full bottom band, 640x480 source
 DEFAULT_MODE = "daily"
 DEFAULT_SCENE_THRESHOLD = 0.4
 DEFAULT_BLACK_MIN_DURATION = 0.1
-DEFAULT_FUSE_WINDOW = 5.0      # seconds within which a visual signal corroborates an OCR boundary
-DEFAULT_MIN_CLIP_S = 120.0     # merge clips shorter than this (session/scene modes; daily ignores it)
+DEFAULT_MIN_CLIP_S = 120.0     # merge clips shorter than this (session mode; daily uses ARTIFACT_MIN_S)
 ARTIFACT_MIN_S = 3.0           # hard floor applied in all modes; catches refinement-collision slivers
 GARBLED_ORPHAN_MAX_S = 30.0    # two consecutive garbled-boundary cuts boxing in a span shorter than
                                # this are suppressed: the span is a mis-labeled orphan, not a real clip
@@ -161,7 +160,6 @@ class PipelineConfig:
     mode: str = DEFAULT_MODE
     cache: str | None = None
     visual_cache: str | None = None
-    enable_visual_fusion: bool = False
     enable_scene_snap: bool = False
     no_visual_anchor: bool = False
     dry_run: bool = False
@@ -1337,7 +1335,6 @@ def group_clips(boundaries: list["Boundary"], mode: str) -> list[float]:
     Stage 4: decide which boundaries become cut points based on mode.
 
     Returns list[float] of video_t values with 0.0 prepended.
-      scene   — all boundaries (gap + large_gap)
       session — large_gap only
       daily   — only confirmed date changes; unknown-date boundaries are skipped
                 (avoids splitting same-day footage; backward jumps are cut only
@@ -1351,9 +1348,7 @@ def group_clips(boundaries: list["Boundary"], mode: str) -> list[float]:
     """
     cuts = [0.0]
     for b in boundaries:
-        if mode == "scene":
-            cuts.append(b.video_t)
-        elif mode == "session":
+        if mode == "session":
             if b.type == "large_gap":
                 cuts.append(b.video_t)
         elif mode == "daily":
@@ -1379,9 +1374,8 @@ def detect_visual_boundaries(
     """
     Single ffmpeg decode pass: detect scene cuts and black frames independent of OCR.
 
-    These are corroborating signals for fuse_boundaries() — an OCR-detected jump that
-    coincides with a real scene cut or black frame (camera off/on) is far more likely
-    to be a genuine boundary than an isolated OCR misread.
+    Supplies anchor candidates for splice-boundary placement (ShortSpanPolicy):
+    the cut is snapped to the last visual event inside an all-None OCR span.
 
     Returns (scene_cut_times, black_frame_times), both sorted lists of video_t.
     """
@@ -1439,33 +1433,6 @@ def detect_visual_boundaries(
             }, f)
 
     return scene_cuts, black_frames
-
-
-def fuse_boundaries(
-    boundaries: list["Boundary"],
-    scene_cuts: list[float],
-    black_frames: list[float],
-    window_s: float = DEFAULT_FUSE_WINDOW,
-) -> list["Boundary"]:
-    """
-    Two-of-three voting: an OCR-detected boundary is kept only if corroborated by an
-    independent visual signal (scene cut or black frame) somewhere in the actual
-    transition window. OCR-only boundaries with no visual corroboration are dropped
-    as likely misreads.
-
-    b.video_t is the first OCR sample AFTER the jump, not the transition point itself
-    — with OCR success well under 100%, the true cut can sit anywhere back to b.prev_t
-    (the last confirmed sample before the jump). Search [prev_t, video_t] padded by
-    window_s on both ends, rather than a fixed window around video_t alone.
-    """
-    visual_times = sorted(scene_cuts + black_frames)
-    confirmed = []
-    for b in boundaries:
-        lo = (b.prev_t if b.prev_t is not None else b.video_t - window_s) - window_s
-        hi = b.video_t + window_s
-        if any(lo <= vt <= hi for vt in visual_times):
-            confirmed.append(b)
-    return confirmed
 
 
 def _extract_and_ocr_window(
@@ -2170,7 +2137,7 @@ def cut_clip_with_boundary_encode(
         # Root cause: VFR source PTS irregularities in the stream-copied body propagate
         # through +igndts into the decoder's DTS sequence at the lead→body seam.
         # Container DTS is clean (ffprobe finds 0 non-monotonic events); players are
-        # unaffected. Accepted as benign — see docs/adr/0003.
+        # unaffected. Accepted as benign; do not chase.
         subprocess.run([
             "ffmpeg", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
@@ -2311,10 +2278,6 @@ def run(config: PipelineConfig) -> PipelineResult:
         visual_times = sorted(scene_cuts + black_frames)
         phase_times["visual"] = time.perf_counter() - t_vis
         print(f"visual scene_cuts={len(scene_cuts)} black_frames={len(black_frames)}")
-        if config.enable_visual_fusion:
-            before = len(boundaries)
-            boundaries = fuse_boundaries(boundaries, scene_cuts, black_frames, DEFAULT_FUSE_WINDOW)
-            print(f"visual_fusion confirmed={len(boundaries)} total={before} window={DEFAULT_FUSE_WINDOW:.0f}")
 
     cut_ts = group_clips(boundaries, config.mode)
     boundary_map: dict[float, Boundary] = {b.video_t: b for b in boundaries}
@@ -2441,16 +2404,12 @@ def main() -> None:
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
     ap.add_argument("--gap", type=int, default=DEFAULT_GAP,
                     help="Camera timestamp gap (seconds) that triggers a new clip")
-    ap.add_argument("--mode", choices=["scene", "session", "daily"], default=DEFAULT_MODE,
+    ap.add_argument("--mode", choices=["session", "daily"], default=DEFAULT_MODE,
                     help="Clip grouping mode (default: daily)")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--crop", default=None,
                     help="ffmpeg crop 'w:h:x:y' for timestamp region "
                          "(default: auto-detected via calibration pass)")
-    ap.add_argument("--enable-visual-fusion", action="store_true", default=False,
-                    help="Drop OCR boundaries lacking visual corroboration (scene cut or black frame). "
-                         "Off by default — VHS pause/resume often has no visual discontinuity so "
-                         "this filter would delete real boundaries.")
     ap.add_argument("--enable-scene-snap", action=argparse.BooleanOptionalAction, default=True,
                     help="Ultra-refinement (pass 3): snap each OCR-refined cut onto a precise "
                          "shot-change frame. Handles both clean cuts (backward snap ≤0.5s) and "
@@ -2487,7 +2446,6 @@ def main() -> None:
         crop=crop,
         cache=cache,
         visual_cache=visual_cache,
-        enable_visual_fusion=args.enable_visual_fusion,
         enable_scene_snap=args.enable_scene_snap,
         no_visual_anchor=args.no_visual_anchor,
         dry_run=args.dry_run,
