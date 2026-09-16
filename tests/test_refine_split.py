@@ -912,6 +912,42 @@ class TestPlaceContentAware:
         cut = _place_content_aware(window, self._readings(raws), 5.0, 10.0, old, new)
         assert cut == 9.0  # max(5+1, 10-1)
 
+    def test_unreadable_head_of_new_session_anchors_to_visual_event(self):
+        # 1992 tape b71: last clean 8/23 at 5, shot change at 5.45, then 16s of
+        # None (new session, overlay unreadable), garbled 8/25 from 22, clean at 26.
+        # OCR alone cuts at 22 and leaks the hole into the 8/23 clip; the visual
+        # event inside the unclassifiable span is the transition.
+        old, new = datetime(1992, 8, 23), datetime(1992, 8, 25)
+        raws = {5: "8/23/92", **{t: "" for t in range(6, 22)},
+                22: "25/92", 23: "25/92", 24: "/25/92", 25: "25792", 26: "8/25/92"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 26.0, old, new,
+                                   visual_times=[3.0, 5.45, 23.0, 28.0])
+        assert cut == 5.45
+
+    def test_garbled_new_without_unclassified_span_ignores_visual_event(self):
+        # New-date garble starts right after the last old frame: no ambiguity window,
+        # so a visual event inside the garbled-new run does not move the cut.
+        old, new = datetime(1990, 9, 29), datetime(1990, 10, 4)
+        raws = {5: "9/29/90", 6: "4/90", 7: "074/90", 8: "07 4/90", 9: "0/ 4/90",
+                10: "10/ 4/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 10.0, old, new,
+                                   visual_times=[7.5])
+        assert cut == 6.0
+
+    def test_old_garble_then_hole_then_new_anchors_after_old_garble(self):
+        # Old garble through 7, unreadable 8..11, garbled-new from 12: the
+        # ambiguity window starts after the old garble, so an event at 6.5 is
+        # ignored and the one at 9.5 is used.
+        old, new = datetime(1990, 8, 4), datetime(1990, 8, 9)
+        raws = {5: "38 PM 8/ 4 /90", 6: "87-4790", 7: "·4790", 8: "", 9: "", 10: "", 11: "",
+                12: "8/ 34 PM 9/90", 15: "84 PM 8/ 9/90"}
+        window = list(range(2, 30))
+        cut = _place_content_aware(window, self._readings(raws), 5.0, 15.0, old, new,
+                                   visual_times=[6.5, 9.5])
+        assert cut == 9.5
+
     def test_pure_noise_gap_cuts_at_last_old_plus_one(self):
         # Gap [6..14] all empty strings → all "noise" → no old/new garble detected.
         # Old fallback would be max(6, 14)=14; new L23 rule: last_old_t+1=6.

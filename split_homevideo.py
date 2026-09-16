@@ -2126,7 +2126,10 @@ def _place_content_aware(
                                      cut at last_old_t+1 when no signal exists (L23).
     Classify each gap frame by its recoverable date digits. Old content extends the
     confirmed-old run through the last 'old'-classified frame; the cut lands on the
-    first 'new'-classified frame after that. When no date content is visible in the
+    first 'new'-classified frame after that — or, when unclassifiable frames sit
+    between the two and a visual event falls among them, on the last such event
+    (ADR-0001 anchor rule; the hole may be the new session's own unreadable head).
+    When no date content is visible in the
     gap (pure noise), apply visual-anchor or last_old_t+1 rather than the
     end-of-gap placement — the end-of-gap heuristic causes tail leaks when OCR misses
     the early new-session frames at the start of a noise burst."""
@@ -2148,7 +2151,25 @@ def _place_content_aware(
         if (last_old_garble is None or t > last_old_garble) and classes.get(t) == "new"
     ]
     if new_frames:
-        return float(min(new_frames))
+        first_new_frame = float(min(new_frames))
+        # Unclassifiable frames between the last old-date evidence and the first
+        # new-date frame are an Ambiguity Window (ADR-0001): a readability hole at
+        # the START of the new session looks exactly like a noise burst AHEAD of it,
+        # so cutting at the first new-date frame leaks the whole hole into the
+        # outgoing clip (17s of 8/25 left in an 8/23 clip on the 1992 tape, where a
+        # shot change marked the real transition 0.5s after the last old frame).
+        # Apply the ADR anchor rule: last visual event inside the window, else its
+        # end.
+        span_start = last_old_t if last_old_garble is None else last_old_garble
+        unclassified = [
+            t for t in gap
+            if span_start < t < first_new_frame and classes.get(t, "noise") == "noise"
+        ]
+        if visual_times and unclassified:
+            anchors = [vt for vt in visual_times if span_start < vt < first_new_frame]
+            if anchors:
+                return max(anchors)
+        return first_new_frame
     if last_old_garble is not None:
         # Confirmed old garble in gap: keep the whole ambiguous span with the old
         # clip (ADR-0001), so new clip starts just before the first confirmed new frame.

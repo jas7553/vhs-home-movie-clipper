@@ -115,6 +115,28 @@ session; the cut landed 7s late. A strict read whose recoverable digits match th
 expected new session and not the old one (`_gap_date_class` == new) is now a
 new-session candidate.
 
+## An unreadable head on the new session
+
+1992 tape #1 b71 (`8/23` → `8/25`): the new session's overlay is unreadable for its
+first 16s (a readability hole, not a splice burst), then garbled `25/92` frames
+appear. `_place_content_aware` put the cut on the first garbled-new frame, leaving
+17s of 8/25 in the 8/23 clip — the only tail leak left across the five tapes. A hole
+at the *start* of the new session and a noise burst *ahead* of it are
+indistinguishable by OCR, so it is an Ambiguity Window and ADR-0001's anchor rule
+applies: the cut lands on the last visual event between the last old-date evidence
+and the first new-date frame (here a shot change 0.45s after the last 8/23 frame),
+falling back to the first new-date frame when no event exists.
+
+The ruler only saw b71, because it needs a legible date on both sides of the cut.
+Contact sheets across every cut the rule moved on tape #1 show the same shape
+was leaking 5–26s at five more boundaries the ruler classed ONE-SIDED or
+NO-SIGNAL (8/07→8/08: 26s of garbage-bag footage whose `8/ 8/92` overlay OCR
+cannot read against the busy background; 4/18→4/19: 13s after a splice burst;
+three more at ~5–8s). Every moved cut lands on the visible transition. On the
+other four tapes the rule moved a handful of SDZ cuts 1–5s earlier inside their
+ambiguity windows and changed no leak count; the ruler is clean (0 leaks, 0
+off-interval) on all five tapes.
+
 ## Also fixed on the way
 
 A late-1990 tape's prior output had 43 clips, 18 of them alternating `12-22` /
