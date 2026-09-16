@@ -12,10 +12,13 @@ a misread surrounded only by None gaps is still detectable as an island.
 from datetime import datetime
 
 from split_homevideo import (
+    drop_bounce_runs,
     drop_date_islands,
     drop_day_confusion_runs,
     drop_digit_drop_runs,
     drop_month_confusion_runs,
+    drop_out_of_order_twin_runs,
+    drop_short_bracketed_runs,
     drop_year_misread_runs,
 )
 
@@ -531,3 +534,164 @@ class TestDropDayConfusionRuns:
         result = mdy(drop_day_confusion_runs(s))
         # the 2-window 11-25 misread drops; the 8-reading real 11-26 run stays
         assert result == [(11,25,1992)]*3 + [(11,26,1992)]*8 + [(11,26,1992)]*4
+
+
+class TestMonthDigitDropRuns:
+    """Numeric overlays drop the leading '1' of a two-digit month for >= 2 windows."""
+
+    def test_12_to_2_run_dropped(self):
+        # 12/22 12/22 [2/22 2/22] 12/22 12/22
+        s = mk((12, 22), (12, 22), (2, 22), (2, 22), (12, 22), (12, 22))
+        assert days(drop_digit_drop_runs(s)) == [(12, 22)] * 4
+
+    def test_11_to_1_run_dropped(self):
+        s = mk((11, 3), (11, 3), (1, 3), (1, 3), (11, 3), (11, 3))
+        assert days(drop_digit_drop_runs(s)) == [(11, 3)] * 4
+
+    def test_alternation_resolves_to_full_month(self):
+        # A B A B A: each 2/22 run is bracketed by 12/22 -> dropped; 12/22 never is.
+        s = mk((12, 22), (12, 22), (2, 22), (2, 22), (12, 22), (2, 22), (2, 22), (12, 22))
+        assert days(drop_digit_drop_runs(s)) == [(12, 22)] * 4
+
+    def test_added_digit_direction_not_dropped(self):
+        # 2/22 2/22 [12/22 12/22] 2/22 2/22 — 12 is not a digit-drop of 2.
+        s = mk((2, 22), (2, 22), (12, 22), (12, 22), (2, 22), (2, 22))
+        assert days(drop_digit_drop_runs(s)) == days(s)
+
+    def test_different_day_not_dropped(self):
+        # 12/22 [2/23 2/23] 12/22 — both fields differ: a genuine other date.
+        s = mk((12, 22), (12, 22), (2, 23), (2, 23), (12, 22), (12, 22))
+        assert days(drop_digit_drop_runs(s)) == days(s)
+
+    def test_day_rule_unchanged(self):
+        s = mk((11, 26), (11, 26), (11, 6), (11, 6), (11, 26), (11, 26))
+        assert days(drop_digit_drop_runs(s)) == [(11, 26)] * 4
+
+
+def _with_hole(s, idx, reads=()):
+    """Surround samples[idx] with 1s None probes (+/-4s) as island verification
+    would, plus optional legible probes {offset: (month, day)}."""
+    t = s[idx][0]
+    extra = [(t + k, None) for k in (-4, -3, -2, -1, 1, 2, 3, 4)]
+    for off, (m, d) in dict(reads).items():
+        extra.append((t + off, datetime(1990, m, d, 12, 0)))
+    return sorted(s + extra, key=lambda x: x[0])
+
+
+class TestDeadZoneIsland:
+    """A lone reading inside a probed-but-unreadable span, chronologically between
+    two DIFFERENT non-island neighbour dates, is a faint-overlay session."""
+
+    def test_between_differing_neighbours_in_none_hole_kept(self):
+        s = _with_hole(mk((9, 25), (9, 25), (9, 27), (10, 4), (10, 4)), 2)
+        assert days(drop_date_islands(s)) == [(9, 25), (9, 25), (9, 27), (10, 4), (10, 4)]
+
+    def test_same_neighbours_dropped_even_in_hole(self):
+        s = _with_hole(mk((9, 25), (9, 25), (9, 27), (9, 25), (9, 25)), 2)
+        assert days(drop_date_islands(s)) == [(9, 25)] * 4
+
+    def test_not_chronological_dropped(self):
+        s = _with_hole(mk((9, 25), (9, 25), (9, 28), (9, 27), (9, 27)), 2)
+        assert days(drop_date_islands(s)) == [(9, 25), (9, 25), (9, 27), (9, 27)]
+
+    def test_legible_neighbour_within_hole_drops(self):
+        s = _with_hole(mk((9, 25), (9, 25), (9, 27), (10, 4), (10, 4)), 2, {-3: (9, 25)})
+        assert (9, 27) not in days(drop_date_islands(s))
+
+    def test_no_probe_evidence_drops(self):
+        # never probed (no None entries within 5s): the plain island rule applies
+        s = mk((1, 5), (1, 5), (1, 19), (1, 25), (1, 25))
+        assert days(drop_date_islands(s)) == [5, 5, 25, 25]
+
+    def test_adjacent_island_cannot_vouch(self):
+        # 3/06 | 3/03 3/05 | 3/07: 3/05 is "between" its island neighbour 3/03 and
+        # 3/07, but not between the real neighbours 3/06 and 3/07 -> both dropped
+        s = mk((3, 6), (3, 6), (3, 3), (3, 5), (3, 7), (3, 7))
+        s = _with_hole(s, 3)
+        assert days(drop_date_islands(s)) == [(3, 6), (3, 6), (3, 7), (3, 7)]
+
+
+class TestBounceRuns:
+    """X Y X Y alternation between single-field twin dates is resolved by which of
+    the two lies between the dates on either side of the bounce."""
+
+    def test_persistent_month_misread_dropped_by_chronology(self):
+        # 4/27 | 1/28 4/28 1/28 1/28 4/28 | 4/29 -> 4/28 fits [4/27, 4/29], 1/28 does not
+        s = mk((4, 27), (4, 27), (1, 28), (1, 28), (4, 28), (4, 28), (1, 28), (1, 28), (1, 28),
+               (4, 28), (4, 28), (4, 29), (4, 29))
+        out = days(drop_bounce_runs(s))
+        assert (1, 28) not in out
+        assert out.count((4, 28)) == 4
+
+    def test_bracketed_single_run_resolved(self):
+        # 3/06 | 3/07 8/07 3/07 | 3/08 : 8/07 is out of range even though 16s long
+        s = mk((3, 6), (3, 6), (3, 7), (3, 7), (8, 7), (8, 7), (8, 7), (3, 7), (3, 7), (3, 8), (3, 8))
+        assert (8, 7) not in days(drop_bounce_runs(s))
+
+    def test_both_in_range_undecided(self):
+        # real adjacent-day sessions with a misread bounce: 11/25 11/26 11/25 11/26 between 11/24 and 11/27
+        s = mk((11, 24), (11, 24), (11, 25), (11, 25), (11, 26), (11, 26), (11, 25), (11, 25),
+               (11, 26), (11, 26), (11, 27), (11, 27))
+        assert drop_bounce_runs(s) == s
+
+    def test_two_runs_is_a_boundary_not_a_bounce(self):
+        s = mk((5, 25), (5, 25), (5, 26), (5, 26), (5, 28), (5, 28), (5, 30), (5, 30))
+        assert drop_bounce_runs(s) == s
+
+    def test_non_twin_alternation_untouched(self):
+        # 3/25 9/01 3/25 is a genuine re-recording, not a one-glyph misread
+        s = mk((3, 24), (3, 24), (3, 25), (3, 25), (9, 1), (9, 1), (3, 25), (3, 25), (4, 8), (4, 8))
+        assert drop_bounce_runs(s) == s
+
+    def test_out_of_order_neighbours_undecided(self):
+        s = mk((4, 29), (4, 29), (4, 23), (4, 23), (1, 23), (1, 23), (4, 23), (4, 23), (4, 22), (4, 22))
+        assert drop_bounce_runs(s) == s
+
+    def test_tape_edge_undecided(self):
+        s = mk((4, 23), (4, 23), (1, 23), (1, 23), (4, 23), (4, 23), (4, 26), (4, 26))
+        assert drop_bounce_runs(s) == s
+
+
+class TestOutOfOrderTwinRuns:
+    def test_twin_run_outside_neighbour_range_dropped(self):
+        # 3/06 | 3/03 3/03 | 3/07 : 3/03 is a day-twin of 3/06 and not in [3/06, 3/07]
+        s = mk((3, 6), (3, 6), (3, 3), (3, 3), (3, 7), (3, 7))
+        assert days(drop_out_of_order_twin_runs(s)) == [(3, 6), (3, 6), (3, 7), (3, 7)]
+
+    def test_accomplice_misreads_judged_against_anchors(self):
+        # 3/06 (long) | 3/03 3/05 | 3/07 (long): both short runs are outside [3/06, 3/07]
+        long6 = [(float(t), datetime(1990, 3, 6, 12, 0)) for t in range(0, 80, 10)]
+        long7 = [(float(t), datetime(1990, 3, 7, 12, 0)) for t in range(200, 280, 10)]
+        s = long6 + [(100.0, datetime(1990, 3, 3, 12, 0)), (110.0, datetime(1990, 3, 3, 12, 0)),
+                     (120.0, datetime(1990, 3, 5, 12, 0)), (130.0, datetime(1990, 3, 5, 12, 0))] + long7
+        assert set(days(drop_out_of_order_twin_runs(s))) == {(3, 6), (3, 7)}
+
+    def test_in_range_run_kept(self):
+        s = mk((3, 6), (3, 6), (3, 7), (3, 7), (3, 8), (3, 8))
+        assert drop_out_of_order_twin_runs(s) == s
+
+    def test_non_twin_out_of_order_kept(self):
+        # genuine 9/01 re-recording between 3/25 and 4/08
+        s = mk((3, 25), (3, 25), (9, 1), (9, 1), (4, 8), (4, 8))
+        assert drop_out_of_order_twin_runs(s) == s
+
+    def test_long_run_kept(self):
+        # a 100s run is a real session however odd its date
+        s = mk((3, 6), (3, 6)) + [(float(t), datetime(1990, 3, 3, 12, 0)) for t in range(20, 130, 10)] \
+            + [(140.0, datetime(1990, 3, 7, 12, 0)), (150.0, datetime(1990, 3, 7, 12, 0))]
+        assert drop_out_of_order_twin_runs(s) == s
+
+
+
+class TestShortBracketedRuns:
+    def test_short_third_date_inside_one_session_dropped(self):
+        s = mk((8, 8), (8, 8), (3, 18), (3, 18), (8, 8), (8, 8))  # 10s span
+        assert (3, 18) not in days(drop_short_bracketed_runs(s))
+
+    def test_long_run_kept(self):
+        s = mk((8, 8), (8, 8), (3, 18), (3, 18), (3, 18), (8, 8), (8, 8))  # 20s span
+        assert drop_short_bracketed_runs(s) == s
+
+    def test_different_brackets_kept(self):
+        s = mk((8, 8), (8, 8), (3, 18), (3, 18), (8, 9), (8, 9))
+        assert drop_short_bracketed_runs(s) == s

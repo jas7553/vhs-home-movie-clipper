@@ -73,6 +73,12 @@ REFINE_LOOKBACK_PAD_S = 20     # seconds the dense refinement window looks BACK 
 #   - Single cut within tight before-window (ACCEPT_S=0.5s) → clean content change; snap backward.
 #     0.5s separates real content-change cuts (≤0.28s from t) from mid-old-session decoys (0.59-0.96s).
 #   - Neither → no-op (VHS pause/resume often has no visual discontinuity).
+REFINE_BISECT_MIN_S = 0.25     # sub-second bisection stops once the last-old / first-new frames
+                               # are this close (~7 frames at 29.97fps). Two extra single-frame
+                               # reads per CLEAN boundary bring the integer-second dense scan's
+                               # <=1s placement error down to <=0.25s. Bisection halts early on
+                               # an unreadable or off-date frame; the 1s bracket then stands.
+
 SCENE_SNAP_CONTEXT_S = 20.0    # decode this much before t so AdaptiveDetector has rolling context
 SCENE_SNAP_ACCEPT_S = 0.5      # tight before-window for clean cuts; blocks mid-old-session decoys
 SCENE_SNAP_BURST_ACCEPT_S = 3.0  # wide before-window for burst detection (burst-start up to 3s before t)
@@ -637,10 +643,13 @@ def _write_scan_cache(
     print(f"  (scan {tag} to {cache_path})")
 
 
-def scan(
+def scan_raw(
     video: str, interval: int, crop: str, cache_path: str | None = None
-) -> list[tuple[float, datetime | None]]:
-    """Sample frames every `interval` seconds; return (t, parsed_dt) list.
+) -> list[tuple[float, datetime | None, str | None]]:
+    """Sample frames every `interval` seconds; return raw (t, parsed_dt, text) triples.
+
+    This is the coarse whole-tape pass only. scan() wraps it with island
+    verification (see verify_date_islands) and time-only date filling.
 
     If cache_path is given, load from it when it exists (and matches interval+crop),
     otherwise scan and save results there for fast re-runs with different --gap values.
@@ -681,10 +690,10 @@ def scan(
 
     if cached is not None and cached.get("fallback_done", True):
         print(f"  (loaded from cache: {cache_path})")
-        return fill_timeonly_dates([
+        return [
             (float(t), parse_timestamp(text) if text else None, text or None)
             for t, text in cached["samples"]
-        ])
+        ]
 
     workers = (os.cpu_count() or 4) * 2
 
@@ -710,7 +719,7 @@ def scan(
                     results[t_last] = (dt, text)
         sorted_results = sorted(results.items())
         _write_scan_cache(cache_path, interval, crop, sorted_results, fallback_done=True)
-        return fill_timeonly_dates([(t, dt, text) for t, (dt, text) in sorted_results])
+        return [(t, dt, text) for t, (dt, text) in sorted_results]
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         # Phase 1: crop-only extraction (PRIMARY — higher OCR yield than preprocessing; see _VF_PREPROCESS).
@@ -790,7 +799,217 @@ def scan(
     if cache_path:
         _write_scan_cache(cache_path, interval, crop, sorted_results, fallback_done=True)
 
-    return fill_timeonly_dates([(t, dt, text) for t, (dt, text) in sorted_results])
+    return [(t, dt, text) for t, (dt, text) in sorted_results]
+
+
+ProbeFn = Callable[[list[float]], dict[float, str]]
+"""Dense-probe OCR: video times -> raw OCR text ("" when unreadable)."""
+
+ISLAND_PROBE_STEP_S = 1.0  # spacing of the dense probes laid around a date island
+_PROBE_CACHE_KEY = "island_probes_v2"  # v2: probes carry the preprocessing fallback
+ISLAND_MIN_PROBE_HITS = 3  # probes that must read the island's date CONTIGUOUSLY with it
+                           # (no neighbour-date read in between) for the island to count
+                           # as a real short session. Lower values let a sporadic misread
+                           # that recurs on one adjacent probe (8<->3 on the 1990 tape:
+                           # 08-27 read as 03-27 twice in 20s) survive as a 2-run.
+
+
+def _cache_probes_load(cache_path: str | None) -> dict[float, list[tuple[float, str]]]:
+    """Cached island probes: {island_t: [(probe_t, raw_text), ...]} (empty if none)."""
+    if not cache_path or not os.path.exists(cache_path):
+        return {}
+    with open(cache_path) as f:
+        loaded = json.load(f)
+    return {
+        float(k): [(float(t), text or "") for t, text in v]
+        for k, v in loaded.get(_PROBE_CACHE_KEY, {}).items()
+    }
+
+
+def _cache_probes_save(cache_path: str | None, probes: dict[float, list[tuple[float, str]]]) -> None:
+    """Merge island probes into the existing scan cache file (no-op without a cache)."""
+    if not cache_path or not os.path.exists(cache_path):
+        return
+    with open(cache_path) as f:
+        loaded = json.load(f)
+    loaded[_PROBE_CACHE_KEY] = {repr(k): v for k, v in probes.items()}
+    with open(cache_path, "w") as f:
+        json.dump(loaded, f)
+
+
+def _dated_islands(
+    raw: list[tuple[float, datetime | None, str | None]],
+) -> list[tuple[int, date, date, date]]:
+    """(index, island_date, prev_date, next_date) for every date island in raw
+    (same test as drop_date_islands / _island_positions)."""
+    dated = [(i, dt) for i, (_, dt, _) in enumerate(raw) if dt is not None]
+    out: list[tuple[int, date, date, date]] = []
+    for j in range(1, len(dated) - 1):
+        idx, dt = dated[j]
+        d = dt.date()
+        pd, nd = dated[j - 1][1].date(), dated[j + 1][1].date()
+        if d != pd and d != nd:
+            out.append((idx, d, pd, nd))
+    return out
+
+
+def verify_date_islands(
+    raw: list[tuple[float, datetime | None, str | None]],
+    interval: int,
+    probe_fn: ProbeFn,
+    cache_path: str | None = None,
+) -> list[tuple[float, datetime | None, str | None]]:
+    """Densely re-OCR around every date island so a genuine SHORT session survives.
+
+    drop_date_islands treats a single isolated dated reading as a misread. At the
+    coarse sampling cadence that rule is interval-dependent: a real session shorter
+    than ~2 x interval seconds yields exactly one coarse reading and is indistinguishable
+    from a misread, so it was silently merged into the preceding clip's tail (whole
+    seconds of the wrong date in a clip — a correctness failure, not a placement one).
+
+    For each island at t with date D (neighbours A before, B after) this lays 1s probes
+    over [t - interval, t + interval]. Probes reading A or B are always inserted back
+    into the sample list (they only tighten the neighbouring boundaries). Probes reading
+    D are inserted only when >= ISLAND_MIN_PROBE_HITS of them form one contiguous block
+    with the island — a real short session is a solid block of D reads, whereas a
+    sporadic misread that recurs on a probe is interleaved with A/B reads. A supported
+    island thus becomes a run of >= 4 D readings and passes the island filter unchanged;
+    an unsupported one stays a lone reading and drop_date_islands removes it as before.
+    Probes reading any other date are discarded so a stray probe misread cannot seed a
+    new phantom run.
+
+    Probes are cached in the scan cache ("island_probes"), so re-tuning and dry runs
+    stay fast; only coarse-sample islands are ever probed (never a probe itself), so
+    the set of probes converges on the first run.
+    """
+    probes = _cache_probes_load(cache_path)
+    coarse_ts = {t for t, _, _ in raw}
+    islands = [(i, d, pd, nd) for i, d, pd, nd in _dated_islands(raw) if raw[i][0] in coarse_ts]
+    todo = [raw[i][0] for i, *_ in islands if raw[i][0] not in probes]
+    if todo:
+        step = ISLAND_PROBE_STEP_S
+        n = int(round(interval / step))
+        times: set[float] = set()
+        for t in todo:
+            times.update(round(t + k * step, 3) for k in range(-n, n + 1) if k != 0)
+        want = sorted(x for x in times if x >= 0.0 and x not in coarse_ts)
+        print(f"island_probe islands={len(todo)} frames={len(want)}", flush=True)
+        texts = probe_fn(want) if want else {}
+        for t in todo:
+            probes[t] = [
+                (pt, texts.get(pt, "") or "")
+                for pt in sorted(x for x in times if abs(x - t) <= interval + 1e-6 and x in texts)
+            ]
+        _cache_probes_save(cache_path, probes)
+
+    extra: dict[float, tuple[float, datetime | None, str | None]] = {}
+    n_confirmed = 0
+    for i, d, pd, nd in islands:
+        t = raw[i][0]
+        accept = {d, pd, nd}
+        # Dated reads in the probe window, coarse and probe alike, in time order.
+        # Only the island's own date and its two neighbours' dates are considered;
+        # any other date is an unrelated probe misread and neither counts nor
+        # breaks a run.
+        reads: list[tuple[float, date, datetime, str | None, bool]] = [
+            (ct, cdt.date(), cdt, ctext, False)
+            for ct, cdt, ctext in raw
+            if cdt is not None and abs(ct - t) <= interval + 1e-6 and cdt.date() in accept
+        ]
+        for pt, text in probes.get(t, []):
+            if pt in coarse_ts:
+                continue
+            pdt = parse_timestamp(text) if text else None
+            if pdt is not None and pdt.date() in accept:
+                reads.append((pt, pdt.date(), pdt, text, True))
+        reads.sort(key=lambda r: r[0])
+        # The maximal run of consecutive D reads containing the island itself. A
+        # genuine short session is a solid block of D; a sporadic misread that
+        # recurs on a probe or two is interleaved with A/B reads and never forms one.
+        k = next(j for j, r in enumerate(reads) if r[0] == t and not r[4])
+        lo = k
+        while lo > 0 and reads[lo - 1][1] == d:
+            lo -= 1
+        hi = k
+        while hi + 1 < len(reads) and reads[hi + 1][1] == d:
+            hi += 1
+        run_probe_hits = sum(1 for r in reads[lo:hi + 1] if r[4])
+        supported = run_probe_hits >= ISLAND_MIN_PROBE_HITS
+        if supported:
+            n_confirmed += 1
+        for j, (pt, pdate, pdt, ptext, is_probe) in enumerate(reads):
+            if not is_probe:
+                continue
+            if pdate == d and not (supported and lo <= j <= hi):
+                continue  # D read outside a supported block: a stray misread, discard
+            extra[pt] = (pt, pdt, ptext)
+        # Unreadable probes go in as None entries: they are the evidence that the
+        # island sits in a readability hole (see _dead_zone_island), and downstream
+        # every filter already skips None samples.
+        for pt, text in probes.get(t, []):
+            if pt not in coarse_ts and pt not in extra and parse_timestamp(text or "") is None:
+                extra[pt] = (pt, None, None)
+    if islands:
+        n_legible = sum(1 for v in extra.values() if v[1] is not None)
+        print(f"island_verify islands={len(islands)} supported={n_confirmed} probes_kept={n_legible}")
+    if not extra:
+        return raw
+    merged = raw + [v for pt, v in extra.items() if pt not in coarse_ts]
+    merged.sort(key=lambda x: x[0])
+    return merged
+
+
+def make_probe_fn(video: str, crop: str) -> ProbeFn:
+    """Production ProbeFn: parallel single-frame extraction + batch OCR, crop-only
+    first, then the _VF_PREPROCESS fallback on every frame that yielded no parseable
+    date — the same two-pass design as scan(). The fallback matters here: a short
+    session in a readability hole is exactly the footage crop-only cannot read (a
+    1992 tape's 30s 4/19 session read on 1 crop-only probe and 6 preprocessed ones)."""
+    def probe(times: list[float]) -> dict[float, str]:
+        workers = (os.cpu_count() or 4) * 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths, ocr = _extract_and_ocr_window(video, times, crop, tmpdir, workers)
+            out = {
+                t: (ocr.get(p, "") if (p := paths.get(t)) is not None else "")
+                for t in times
+            }
+            retry = [t for t in times if parse_timestamp(out[t] or "") is None]
+            if retry:
+                pp_dir = os.path.join(tmpdir, "pp")
+                os.makedirs(pp_dir)
+                pp_paths: dict[float, str | None] = {}
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(extract_frame, video, float(t), crop, pp_dir, True): t
+                            for t in retry}
+                    for fut in as_completed(futs):
+                        pp_paths[futs[fut]] = fut.result()
+                pp_ocr = ocr_batch([p for p in pp_paths.values() if p])
+                for t in retry:
+                    p2 = pp_paths.get(t)
+                    text = pp_ocr.get(p2, "") if p2 else ""
+                    if parse_timestamp(text) is not None:
+                        out[t] = text
+            return out
+    return probe
+
+
+def scan(
+    video: str,
+    interval: int,
+    crop: str,
+    cache_path: str | None = None,
+    probe_fn: ProbeFn | None = None,
+) -> list[tuple[float, datetime | None]]:
+    """Coarse scan (scan_raw) + island verification + time-only date fill.
+
+    probe_fn=None skips verification (unit tests / callers without video access).
+    Verification runs BEFORE fill_timeonly_dates so time-only reads next to a
+    recovered short session inherit that session's date, not the previous one's.
+    """
+    raw = scan_raw(video, interval, crop, cache_path)
+    if probe_fn is not None:
+        raw = verify_date_islands(raw, interval, probe_fn, cache_path)
+    return fill_timeonly_dates(raw)
 
 
 def filter_ocr_outliers(
@@ -915,13 +1134,74 @@ def drop_date_islands(
     dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
     if len(dated) < 3:
         return samples
+    island_js = [
+        j for j in range(1, len(dated) - 1)
+        if dated[j][1].date() != dated[j - 1][1].date()
+        and dated[j][1].date() != dated[j + 1][1].date()
+    ]
+    island_set = set(island_js)
     drop: set[int] = set()
-    for j in range(1, len(dated) - 1):
+    for j in island_js:
         idx, dt = dated[j]
-        d = dt.date()
-        if d != dated[j - 1][1].date() and d != dated[j + 1][1].date():
-            drop.add(idx)
+        # Chronology is judged against the nearest neighbours that are not islands
+        # themselves — an adjacent misread must not vouch for another.
+        pj = next((k for k in range(j - 1, -1, -1) if k not in island_set), None)
+        nj = next((k for k in range(j + 1, len(dated)) if k not in island_set), None)
+        if pj is not None and nj is not None and _dead_zone_island(
+            samples, idx, dt.date(), dated[pj][1].date(), dated[nj][1].date()
+        ):
+            continue
+        drop.add(idx)
     return [s for i, s in enumerate(samples) if i not in drop]
+
+
+def _dead_zone_island(
+    samples: list[tuple[float, datetime | None]], idx: int, d: date, pd: date, nd: date
+) -> bool:
+    """A lone dated reading that is nevertheless kept: it sits inside an unreadable
+    span (no legible reading, coarse or dense probe, within DEAD_ZONE_HOLE_S on either
+    side contradicts it) and its date falls strictly between two DIFFERENT
+    neighbour dates in tape order. That is the signature of a faint-overlay session
+    that OCR can read only once (1992 tape: ~60s of 9/27 between 9/25 and 10/4,
+    every other frame unreadable even with preprocessing), not of a misread: a
+    misread of the flanking footage is normally surrounded by legible reads of that
+    footage, and when both neighbours share a date the island cannot be "between"
+    them at all — that shape is always dropped."""
+    if not (pd < d < nd):
+        return False
+    t = samples[idx][0]
+    evidence = [False, False]  # a None entry seen within the hole, before / after
+    for side, rng in enumerate((range(idx - 1, -1, -1), range(idx + 1, len(samples)))):
+        for k in rng:
+            if abs(samples[k][0] - t) > DEAD_ZONE_HOLE_S:
+                break
+            if samples[k][1] is not None:
+                return False
+            evidence[side] = True
+    return all(evidence)
+
+
+DEAD_ZONE_HOLE_S = 5.0  # a dead-zone island must have NO legible reading within this
+                        # many seconds on either side, and at least one None sample on
+                        # each side as evidence the hole was actually probed. Island
+                        # verification lays 1s probes over +/-interval and records the
+                        # unreadable ones as None, so for a coarse island this window
+                        # always holds ~10 probe results: a misread of readable flanking
+                        # footage is contradicted by them, a session in a readability
+                        # hole is not. A date that fill_timeonly_dates inferred for a
+                        # time-only read was never probed, has no None neighbours within
+                        # the hole, and so can never claim the exception.
+                        # (A 1992 tape read a real 10s 1/19 session on one coarse window,
+                        # with the 1/25 session legible 10s later and every probe between
+                        # unreadable; a second digitisation of the same footage put the
+                        # window 10s earlier and read the same shape with None either side.)
+
+
+def _is_digit_drop(outer: int, run: int) -> bool:
+    """True if `run` is `outer` with one digit dropped (26 → 6 or 2; 12 → 2 or 1)."""
+    if outer < 10 or run >= outer:
+        return False
+    return run in (outer % 10, outer // 10) and run > 0
 
 
 def drop_digit_drop_runs(
@@ -930,19 +1210,26 @@ def drop_digit_drop_runs(
     """Drop multi-window digit-drop misreads that survive drop_date_islands.
 
     Word-month OCR (Style B, e.g. NOV. 26 1992) sometimes drops the tens digit
-    of the day: NOV. 26 → NOV 6, NOV. 27 → NOV 2. When such a misread spans
-    ≥2 consecutive windows it looks like a genuine session (the ≥2 rule in
-    drop_date_islands) and survives the island filter.
+    of the day: NOV. 26 → NOV 6, NOV. 27 → NOV 2. Numeric overlays drop the
+    leading '1' of a two-digit MONTH the same way: 11/ 3/90 → 1/ 3/90,
+    12/22/90 → 2/22/90 (a late-1990 tape produced 18 alternating 12-22 / 02-22
+    clips from this). When such a misread spans ≥2 consecutive windows it looks
+    like a genuine session (the ≥2 rule in drop_date_islands) and survives the
+    island filter.
 
     A run is flagged as a digit-drop misread when all three hold:
       1. The run is bracketed on both sides by the same outer date.
-      2. The run's date has the same month and year as the outer date.
-      3. The outer day is ≥10 and either its ones-digit or its tens-digit
-         equals the run's day (e.g. outer=26 → ones=6 ✓; outer=27 → tens=2 ✓).
+      2. Exactly one of day / month differs from the outer date (year equal).
+      3. The differing outer field is ≥10 and either its ones-digit or its
+         tens-digit equals the run's field (outer=26 → ones=6 ✓; outer=27 →
+         tens=2 ✓; outer month 12 → 2 ✓ or 1 ✓).
 
-    Genuine out-of-order sessions (different month, different year, or ones-digit
-    mismatch) are not dropped — the 9/01-between-3/25-and-4/08 case survives.
-    None entries are skipped when forming runs, matching drop_date_islands semantics.
+    The relation is asymmetric (a dropped digit, never an added one), so an
+    A B A B alternation resolves to A without a run-length cap: only the
+    short-field runs are ever dropped. Genuine out-of-order sessions (different
+    year, both fields differing, or no digit relation) are not dropped — the
+    9/01-between-3/25-and-4/08 case survives. None entries are skipped when
+    forming runs, matching drop_date_islands semantics.
     """
     dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
     if len(dated) < 3:
@@ -973,16 +1260,14 @@ def drop_digit_drop_runs(
         if left_date != right_date:
             continue
         outer = left_date
-        if (
-            run_date.month == outer.month
-            and run_date.year == outer.year
-            and outer.day >= 10
-            and (
-                outer.day % 10 == run_date.day  # drop tens digit: 26 → 6
-                or outer.day // 10 == run_date.day  # drop ones digit: 27 → 2
-            )
-        ):
-            drop.update(run_indices)
+        if run_date.year != outer.year:
+            continue
+        if run_date.month == outer.month:
+            if _is_digit_drop(outer.day, run_date.day):
+                drop.update(run_indices)
+        elif run_date.day == outer.day:
+            if _is_digit_drop(outer.month, run_date.month):
+                drop.update(run_indices)
 
     return [s for i, s in enumerate(samples) if i not in drop]
 
@@ -990,6 +1275,7 @@ def drop_digit_drop_runs(
 _MONTH_CONFUSABLES: frozenset[frozenset[int]] = frozenset({
     frozenset({1, 5}),  # 1 and 5 look alike on VHS overlay font
     frozenset({8, 9}),  # 8 and 9 look alike on VHS overlay font
+    frozenset({3, 8}),  # 3 and 8 too (1990 tape: 8/27 read as 3/27 on scattered frames)
 })
 
 
@@ -1076,6 +1362,7 @@ _DAY_CONFUSABLES: frozenset[frozenset[int]] = frozenset({
     frozenset({6, 8}),  # 6 and 8 look alike on VHS overlay font (1990 tape: 26 read as 28)
     frozenset({5, 6}),  # 5 and 6 too (1992 tape: 26 read as 25 for 2 windows at ~1301s,
                         # creating a phantom 11-25 boundary pair boxing 11-26 content)
+    frozenset({3, 8}),  # 3 and 8 (1990 tape: 10/13 read as 10/18 on scattered frames)
 })
 
 
@@ -1183,6 +1470,158 @@ def drop_day_confusion_runs(
         ):
             drop.update(run_indices)
 
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
+def _date_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[date, list[int]]]:
+    """Group consecutive dated readings (None gaps invisible) into same-date runs."""
+    dated = [(i, dt) for i, (_, dt) in enumerate(samples) if dt is not None]
+    runs: list[tuple[date, list[int]]] = []
+    for idx, dt in dated:
+        d = dt.date()
+        if runs and runs[-1][0] == d:
+            runs[-1][1].append(idx)
+        else:
+            runs.append((d, [idx]))
+    return runs
+
+
+def _single_field_twins(a: date, b: date) -> bool:
+    """True if a and b differ in exactly one of (month, day) with the same year —
+    the shape of a one-glyph OCR misread (4/23 vs 1/23, 5/26 vs 5/28)."""
+    if a == b or a.year != b.year:
+        return False
+    return (a.month == b.month) != (a.day == b.day)
+
+
+BOUNCE_MIN_RUNS = 3  # X Y X at least — a plain X Y is just a boundary, never a bounce
+
+
+def drop_bounce_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[float, "datetime | None"]]:
+    """Resolve a BOUNCE — >= BOUNCE_MIN_RUNS consecutive runs alternating between two
+    single-field twin dates X and Y — by tape chronology.
+
+    OCR can misread one glyph of the date persistently for tens of seconds (a
+    1992 tape read 4/28 as 1/28 for 35s, 4/23 as 1/23 for 20s, 3/ 7 as 8/ 7 for
+    16s), producing X Y X Y ... where neither the ">= 2 readings" rule, the
+    per-run confusion filters (capped at _CONFUSION_RUN_MAX_S so they cannot eat a
+    real session), nor a majority vote can say which of X and Y is real — both are
+    bracketed by the other. The dates on either side of the bounce can: with L
+    before it and R after it (L < R, i.e. a chronological neighbourhood), a real
+    date lies within [L, R] and a one-glyph misread of it almost never does
+    (4/28 in [4/27, 4/29]; 1/28 not). When exactly one of X, Y fits, every run
+    of the other is dropped, whatever its length. When both or neither fit (a
+    genuine pair of adjacent-day sessions, an out-of-order region, tape start or
+    end) nothing is decided here and the existing filters apply unchanged.
+
+    Requires a twin relation so a genuine X Y X re-recording (3/25, 9/01, 3/25)
+    is never touched, and >= 3 runs so a plain boundary between twin dates is
+    not a bounce.
+    """
+    runs = _date_runs(samples)
+    if len(runs) < BOUNCE_MIN_RUNS:
+        return samples
+    drop: set[int] = set()
+    i = 0
+    while i + 1 < len(runs):
+        x, y = runs[i][0], runs[i + 1][0]
+        if not _single_field_twins(x, y):
+            i += 1
+            continue
+        k = i + 1
+        while k + 1 < len(runs) and runs[k + 1][0] in (x, y):
+            k += 1
+        if k - i + 1 >= BOUNCE_MIN_RUNS:
+            left = runs[i - 1][0] if i > 0 else None
+            right = runs[k + 1][0] if k + 1 < len(runs) else None
+            if left is not None and right is not None and left < right:
+                in_x = left <= x <= right
+                in_y = left <= y <= right
+                if in_x != in_y:
+                    bad = y if in_x else x
+                    for r in range(i, k + 1):
+                        if runs[r][0] == bad:
+                            drop.update(runs[r][1])
+            i = k + 1
+        else:
+            i += 1
+    if not drop:
+        return samples
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
+TWIN_RUN_MAX_S = 60.0  # longest physical span an out-of-chronology twin run may have and
+                       # still be dropped; a longer run is a real session whatever its date
+
+
+def drop_out_of_order_twin_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[float, "datetime | None"]]:
+    """Drop a short run whose date is a one-field twin of an anchoring neighbour and
+    lies OUTSIDE the chronological range of the long runs around it.
+
+    A persistent one-glyph misread can survive everything upstream once dense probes
+    give it >= 2 readings: a 1992 tape read 12s of a 3/06 session as `3/ 3` and the
+    next 30s as `3/ 5` (garbled time line, so no clock evidence). Each is bracketed
+    by long, in-order sessions (3/06 ... 3/07) that it does not fit between, and
+    differs from one of them in exactly one field. A real out-of-order re-recording
+    is neither that short nor a twin of what surrounds it.
+
+    Anchors are the runs longer than TWIN_RUN_MAX_S (plus the tape's first and last
+    run); every short run between two consecutive anchors is judged against those
+    anchors, not against its immediate neighbours — two misreads next to each other
+    would otherwise vouch for one another (3/05 sits "between" 3/03 and 3/07).
+    """
+    runs = _date_runs(samples)
+    if len(runs) < 3:
+        return samples
+    anchors = [
+        r for r in range(len(runs))
+        if r == 0 or r == len(runs) - 1 or _run_span_s(samples, runs[r][1]) > TWIN_RUN_MAX_S
+    ]
+    drop: set[int] = set()
+    for a, b in zip(anchors[:-1], anchors[1:], strict=True):
+        left, right = runs[a][0], runs[b][0]
+        if left > right:
+            continue
+        for r in range(a + 1, b):
+            d, idx = runs[r]
+            if left <= d <= right:
+                continue
+            if _single_field_twins(d, left) or _single_field_twins(d, right):
+                drop.update(idx)
+    if not drop:
+        return samples
+    return [s for i, s in enumerate(samples) if i not in drop]
+
+
+def drop_short_bracketed_runs(
+    samples: list[tuple[float, "datetime | None"]],
+) -> list[tuple[float, "datetime | None"]]:
+    """Drop any run spanning <= _CONFUSION_RUN_MAX_S that is bracketed by the SAME
+    date on both sides, whatever its own date.
+
+    The digit-confusion filters below do this for known glyph pairs; dense probes
+    (with the preprocessing fallback) can also stabilise a misread with no simple
+    digit relation for a few seconds (a 1992 tape: 6s of 8/ 8 read as 3/18).
+    Ten seconds of a third date sandwiched inside one same-date session is a misread,
+    not a recording — the island filter already treats a single such reading that
+    way; this is the same judgement for a run too short to be a session.
+    """
+    runs = _date_runs(samples)
+    if len(runs) < 3:
+        return samples
+    drop: set[int] = set()
+    for r in range(1, len(runs) - 1):
+        d, idx = runs[r]
+        if runs[r - 1][0] == runs[r + 1][0] != d and _run_span_s(samples, idx) <= _CONFUSION_RUN_MAX_S:
+            drop.update(idx)
+    if not drop:
+        return samples
     return [s for i, s in enumerate(samples) if i not in drop]
 
 
@@ -1458,9 +1897,18 @@ def _scan_for_transition(
     prev_t: float,
     gap_s: int,
     expected_new_date: date | None = None,
+    expected_new_dt: datetime | None = None,
 ) -> tuple[bool, float, float | None]:
     """Walk frame timestamps in order. Return (any_ocr, last_old_t, first_new_t).
     first_new_t is None if no new-session frame was found.
+
+    expected_new_dt (the coarse boundary's cam_after): an off-date reading that
+    strict-parses but whose recoverable digits match the expected NEW session and
+    not the old one (`_gap_date_class` == "new", e.g. '1/23/90' where 9/23 is
+    expected after 9/ 8) is a one-glyph misread of the new session, not an
+    intermediate date — it counts as a new-session candidate. Treating it as
+    intermediate advanced last_old_t into the new session and left 7s of it in
+    the outgoing clip (1990 tape, 09-08 -> 09-23).
 
     Scans all frames rather than stopping at the first apparent jump, so that a
     single garbled frame misread as the new date (a false positive) is rejected
@@ -1496,7 +1944,9 @@ def _scan_for_transition(
         video_advance = float(t) - prev_t
         is_new = cam_advance > video_advance + gap_s or cam_advance < -1800
         if is_new:
-            if expected_new_date is not None and dt.date() != expected_new_date:
+            if (expected_new_date is not None and dt.date() != expected_new_date
+                    and not (expected_new_dt is not None and reading is not None
+                             and _gap_date_class(reading.raw, prev_dt, expected_new_dt) == "new")):
                 if candidate_new_t is not None and dt.date() != prev_dt.date():
                     # Confirmed new-session candidate already exists, and this
                     # reading is neither old nor expected-new: noise, not a real
@@ -1546,6 +1996,45 @@ def _retry_gap_at_half_phase(
     half_times = [t + 0.5 for t in gap_none_times]
     readings.update(ocr_fn(half_times))
     return sorted(set(window) | set(half_times))
+
+
+def _bisect_transition(
+    ocr_fn: OcrFn,
+    readings: dict[float, Reading],
+    last_old_t: float,
+    first_new_t: float,
+    prev_dt: datetime,
+    prev_t: float,
+    gap_s: int,
+    expected_new_date: date | None,
+) -> tuple[float, float]:
+    """Narrow an ADJACENT (<= 1s apart) last-old / first-new bracket to
+    REFINE_BISECT_MIN_S by reading the midpoint frame repeatedly.
+
+    Only runs when the two bracketing frames are legible and adjacent in the dense
+    scan — the case where the cut's whole error is the 1s sampling grid. A midpoint
+    that reads the old session moves the lower edge; one that reads the expected new
+    session moves the upper edge; anything else (unreadable, garbled, off-date) stops
+    the bisection and the current bracket stands, so a noise frame can never widen or
+    mis-place the bracket. New readings are added to `readings` for the caller.
+    Returns the refined (last_old_t, first_new_t)."""
+    lo, hi = last_old_t, first_new_t
+    while hi - lo > REFINE_BISECT_MIN_S + 1e-6:
+        mid = round((lo + hi) / 2.0, 3)
+        readings.update(ocr_fn([mid]))
+        dt = readings[mid].dt if mid in readings else None
+        if dt is None:
+            break
+        cam_advance = (dt - prev_dt).total_seconds()
+        video_advance = mid - prev_t
+        is_new = cam_advance > video_advance + gap_s or cam_advance < -1800
+        if not is_new and dt.date() == prev_dt.date():
+            lo = mid
+        elif is_new and (expected_new_date is None or dt.date() == expected_new_date):
+            hi = mid
+        else:
+            break
+    return lo, hi
 
 
 # Lenient date-field extractors for garbled gap frames. The strict parser
@@ -1641,7 +2130,9 @@ def _place_content_aware(
     gap (pure noise), apply visual-anchor or last_old_t+1 rather than the
     end-of-gap placement — the end-of-gap heuristic causes tail leaks when OCR misses
     the early new-session frames at the start of a noise burst."""
-    same_date_fallback = max(last_old_t + 1.0, first_new_t - 1.0)
+    # A bisected bracket can be narrower than the 1s dense grid; no fallback may
+    # ever place the cut past the first confirmed new-session frame.
+    same_date_fallback = min(max(last_old_t + 1.0, first_new_t - 1.0), first_new_t)
     if new_dt is None or new_dt.date() == old_dt.date():
         return same_date_fallback
     gap = [t for t in window if last_old_t < t < first_new_t]
@@ -1661,7 +2152,7 @@ def _place_content_aware(
     if last_old_garble is not None:
         # Confirmed old garble in gap: keep the whole ambiguous span with the old
         # clip (ADR-0001), so new clip starts just before the first confirmed new frame.
-        return max(last_old_t + 1.0, first_new_t - 1.0)
+        return same_date_fallback
     # Pure noise: no date digits recoverable from any gap frame.  Visual anchor marks
     # the end of a head-switch noise burst (ADR-0001); absent that, cut at
     # last_old_t+1 so no unclassified content leaks into the outgoing clip (L23).
@@ -1669,7 +2160,7 @@ def _place_content_aware(
         anchors = [vt for vt in visual_times if last_old_t < vt < first_new_t]
         if anchors:
             return max(anchors)
-    return last_old_t + 1.0
+    return min(last_old_t + 1.0, first_new_t)
 
 
 def make_ocr_fn(video: str, crop: str, tmpdir: str, workers: int) -> OcrFn:
@@ -1710,6 +2201,7 @@ class LongDeadZonePolicy:
         span = coarse_t - prev_t
 
         expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
+        expected_new_dt = boundary.cam_after
         floor = int(floor_t) + 1 if floor_t > 0.0 else 0
         window_start = max(0, int(prev_t) + 1 - REFINE_LOOKBACK_PAD_S, floor)
         window: list[float] = list(range(window_start, int(coarse_t) + self._interval))
@@ -1717,7 +2209,7 @@ class LongDeadZonePolicy:
         coarse_times = window[::step]
         readings: dict[float, Reading] = dict(ocr_fn(coarse_times))
         any_ocr_c, last_old_c, first_new_c = _scan_for_transition(
-            coarse_times, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+            coarse_times, readings, prev_dt, prev_t, self._gap_s, expected_new_date, expected_new_dt,
         )
         if first_new_c is not None:
             lo, hi = int(last_old_c), int(first_new_c)
@@ -1731,7 +2223,7 @@ class LongDeadZonePolicy:
         # else: all-None coarse → true LDZ; fall through to coarse_t fallback
 
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
-            window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+            window, readings, prev_dt, prev_t, self._gap_s, expected_new_date, expected_new_dt,
         )
         # Interlaced field-phase retry: a None-reading integer-second
         # frame inside the gap may be legible on the other field, t+0.5. Gated on
@@ -1742,10 +2234,17 @@ class LongDeadZonePolicy:
             if merged is not None:
                 window = merged
                 any_ocr, last_old_t, first_new_t = _scan_for_transition(
-                    window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+                    window, readings, prev_dt, prev_t, self._gap_s, expected_new_date, expected_new_dt,
                 )
         if first_new_t is not None:
             new_dt = readings[first_new_t].dt
+            if expected_new_dt is not None and new_dt is not None and new_dt.date() != expected_new_date:
+                new_dt = expected_new_dt  # candidate came from a lenient (off-date) match
+            if first_new_t - last_old_t <= 1.0 + 1e-6:
+                last_old_t, first_new_t = _bisect_transition(
+                    ocr_fn, readings, last_old_t, first_new_t, prev_dt, prev_t,
+                    self._gap_s, expected_new_date,
+                )
             cut = _place_content_aware(window, readings, last_old_t, first_new_t, prev_dt, new_dt)
             return RefinementResult(cut, "ocr", "")
         detail = f"LDZ {span:.0f}s" if not any_ocr else "all-old-in-window"
@@ -1780,12 +2279,13 @@ class ShortSpanPolicy:
         span = coarse_t - prev_t
 
         expected_new_date = boundary.cam_after.date() if boundary.cam_after else None
+        expected_new_dt = boundary.cam_after
         floor = int(floor_t) + 1 if floor_t > 0.0 else 0
         window_start = max(0, int(prev_t) + 1 - REFINE_LOOKBACK_PAD_S, floor)
         window: list[float] = list(range(window_start, int(coarse_t) + self._interval))
         readings = ocr_fn(window)
         any_ocr, last_old_t, first_new_t = _scan_for_transition(
-            window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+            window, readings, prev_dt, prev_t, self._gap_s, expected_new_date, expected_new_dt,
         )
         # Interlaced field-phase retry: a None-reading integer-second
         # frame inside the gap may be legible on the other field, t+0.5. Gated on
@@ -1796,11 +2296,18 @@ class ShortSpanPolicy:
             if merged is not None:
                 window = merged
                 any_ocr, last_old_t, first_new_t = _scan_for_transition(
-                    window, readings, prev_dt, prev_t, self._gap_s, expected_new_date,
+                    window, readings, prev_dt, prev_t, self._gap_s, expected_new_date, expected_new_dt,
                 )
 
         if first_new_t is not None:
             new_dt = readings[first_new_t].dt
+            if expected_new_dt is not None and new_dt is not None and new_dt.date() != expected_new_date:
+                new_dt = expected_new_dt  # candidate came from a lenient (off-date) match
+            if first_new_t - last_old_t <= 1.0 + 1e-6:
+                last_old_t, first_new_t = _bisect_transition(
+                    ocr_fn, readings, last_old_t, first_new_t, prev_dt, prev_t,
+                    self._gap_s, expected_new_date,
+                )
             cut = _place_content_aware(
                 window, readings, last_old_t, first_new_t, prev_dt, new_dt,
                 self._visual_times,
@@ -2253,7 +2760,8 @@ def run(config: PipelineConfig) -> PipelineResult:
     phase_times: dict[str, float] = {}
 
     print(f"scan file={config.video} interval={config.interval} gap={config.gap} mode={config.mode} crop={config.crop}")
-    samples = scan(config.video, config.interval, config.crop, cache_path=config.cache)
+    samples = scan(config.video, config.interval, config.crop, cache_path=config.cache,
+                   probe_fn=make_probe_fn(config.video, config.crop))
     phase_times["scan"] = time.perf_counter() - t0
 
     valid = [(t, dt) for t, dt in samples if dt]
@@ -2262,6 +2770,9 @@ def run(config: PipelineConfig) -> PipelineResult:
 
     samples = drop_date_islands(samples)
     samples = drop_year_misread_runs(samples)
+    samples = drop_bounce_runs(samples)
+    samples = drop_out_of_order_twin_runs(samples)
+    samples = drop_short_bracketed_runs(samples)
     samples = drop_digit_drop_runs(samples)
     samples = drop_month_confusion_runs(samples)
     samples = drop_day_confusion_runs(samples)

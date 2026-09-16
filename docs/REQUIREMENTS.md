@@ -38,6 +38,8 @@ Expressed goals and constraints for the VHS home movie clipper pipeline. Derived
 
 **The pipeline must tolerate consecutive OCR misreads without creating phantom clip boundaries.** A run of 2–3 frames reading a wrong date should be filtered out, not treated as a real date change.
 
+**A genuine recording session must not be lost because it is shorter than the sampling interval.** The coarse scan samples every `--interval` seconds, so a 10–40s session may produce a single reading that is structurally identical to a single-frame misread. Detection must resolve that ambiguity by looking closer (dense probes around the reading), not by assuming the shorter explanation — a dropped short session is cross-date contamination of the neighbouring clip (see finding 006).
+
 **Gap thresholds must be empirically tuned, not guessed.** The `--gap` default (currently 3600s camera-time) was validated by date-purity audit of the resulting clips (ADR 0001). Any change to the default requires the same evidence.
 
 **Re-tuning must not require re-scanning.** Changing `--gap` or `--mode` should hit the OCR cache and return results in seconds. Only changes to the preprocessing filter chain or OCR engine require a new scan.

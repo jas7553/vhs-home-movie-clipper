@@ -653,7 +653,10 @@ class TestRefineSplitTwoPass:
             extract_side_effect=extract,
             ocr_map={path0: _NEW},
         )
-        assert t == 1.0  # max(prev_t+1, t-1) = max(1, -1) = 1
+        # The bracket is degenerate (prev_t == first_new_t == 0); no fallback may
+        # place the cut past the first confirmed new frame, so the cut is 0.0 (run()'s
+        # monotonic backstop keeps it after the previous cut).
+        assert t == 0.0
         assert method == "ocr"
         assert calls <= 53  # coarse only (t=0 is first coarse sample, dense = empty)
 
@@ -771,7 +774,10 @@ class TestFieldPhaseRetry:
         )
         assert t == 15.0  # max(14+1, 15-1) = max(15, 14) = 15
         assert method == "ocr"
-        assert all(c == int(c) for c in calls)  # never probed a half-second t
+        # The field-phase retry never fires (no None gap frames). The only
+        # fractional probe is the sub-second bisection's midpoint, which is
+        # unreadable here and so leaves the 1s bracket in place.
+        assert all(c == int(c) or c == 14.5 for c in calls)
 
     def test_half_phase_reversion_to_old_session_handled(self):
         # t=14 old confirmed. t=15,16,17 None at integer phase. Retry frames:
@@ -1040,3 +1046,92 @@ class TestFloorClampsLookback:
                  mock.patch("split_homevideo.ocr_batch", return_value={}):
                 strategy("vid.mp4", b)
         assert seen and min(seen) == 101 - REFINE_LOOKBACK_PAD_S
+
+
+class TestSubSecondBisect:
+    """Adjacent legible old/new frames (1s apart) are bisected down to
+    REFINE_BISECT_MIN_S so the cut is no longer bound to the 1s dense grid."""
+
+    _OLD = "5:00 PM\n 1/ 4/90"
+    _NEW = "9:00 AM\n 1/ 5/90"
+
+    def _paths(self):
+        return {t: f"/tmp/frame_{t:.3f}.bmp" for t in (14, 15, 14.5, 14.25, 14.75)}
+
+    def test_bisects_to_quarter_second(self):
+        p = self._paths()
+        calls: list[float] = []
+
+        def extract(v, t, c, d):
+            calls.append(t)
+            return p.get(t)
+
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0, extract_side_effect=extract,
+            ocr_map={p[14]: self._OLD, p[15]: self._NEW, p[14.5]: self._OLD, p[14.75]: self._NEW},
+            cam_after=datetime(1990, 1, 5, 9, 0),
+        )
+        assert t == 14.75
+        assert method == "ocr"
+        assert 14.5 in calls and 14.75 in calls and 14.25 not in calls
+
+    def test_unreadable_midpoint_keeps_grid_bracket(self):
+        p = self._paths()
+        t, _ = _run(
+            coarse_t=20.0, prev_t=10.0, extract_side_effect=lambda v, t, c, d: p.get(t),
+            ocr_map={p[14]: self._OLD, p[15]: self._NEW},  # 14.5 extracted but unreadable
+            cam_after=datetime(1990, 1, 5, 9, 0),
+        )
+        assert t == 15.0
+
+    def test_no_bisect_when_bracket_wider_than_1s(self):
+        p = {t: f"/tmp/frame_{t:.3f}.bmp" for t in (13, 15)}
+        calls: list[float] = []
+
+        def extract(v, t, c, d):
+            calls.append(t)
+            return p.get(t)
+
+        _run(
+            coarse_t=20.0, prev_t=10.0, extract_side_effect=extract,
+            ocr_map={p[13]: self._OLD, p[15]: self._NEW},
+            cam_after=datetime(1990, 1, 5, 9, 0),
+        )
+        assert not any(c % 1 not in (0.0, 0.5) for c in calls)
+
+    def test_same_date_session_boundary_bisected(self):
+        # Session-mode style boundary: same date, 10-minute camera jump.
+        p = self._paths()
+        new = "5:10 PM\n 1/ 4/90"
+        t, _ = _run(
+            coarse_t=20.0, prev_t=10.0, extract_side_effect=lambda v, t, c, d: p.get(t),
+            ocr_map={p[14]: self._OLD, p[15]: new, p[14.5]: new, p[14.25]: self._OLD},
+        )
+        assert t == 14.5
+
+
+class TestOffDateMisreadOfNewSession:
+    def test_strict_offdate_read_matching_new_day_is_candidate(self):
+        # old 9/ 8, expected new 9/23. Frame 15 reads '1/23/90' (month glyph wrong,
+        # day matches the new session) -> new candidate, not an intermediate date.
+        old = "9/ 8/90"
+        p = {t: f"/tmp/frame_{t:.3f}.bmp" for t in (14, 15, 16, 14.5)}
+        prev_dt = datetime(1990, 9, 8, 0, 0)
+        t, method = _run(
+            coarse_t=20.0, prev_t=10.0, extract_side_effect=lambda v, t, c, d: p.get(t),
+            ocr_map={p[14]: old, p[15]: "1/23/90", p[16]: "9/23/90"},
+            prev_dt=prev_dt, cam_after=datetime(1990, 9, 23, 0, 0),
+        )
+        assert t == 15.0
+        assert method == "ocr"
+
+    def test_true_intermediate_date_still_kept_with_outgoing(self):
+        # 5/12 between 5/09 and 5/19: day 12 matches neither -> intermediate, as before
+        p = {t: f"/tmp/frame_{t:.3f}.bmp" for t in (14, 15, 16, 15.5)}
+        prev_dt = datetime(1990, 5, 9, 0, 0)
+        t, _ = _run(
+            coarse_t=20.0, prev_t=10.0, extract_side_effect=lambda v, t, c, d: p.get(t),
+            ocr_map={p[14]: "5/ 9/90", p[15]: "5/12/90", p[16]: "5/19/90"},
+            prev_dt=prev_dt, cam_after=datetime(1990, 5, 19, 0, 0),
+        )
+        assert t == 16.0
